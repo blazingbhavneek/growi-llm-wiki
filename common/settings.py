@@ -63,7 +63,7 @@ def load_settings(project: str = "", *, overrides: dict[str, Any] | None = None)
     for key, value in (overrides or {}).items():
         if not hasattr(settings, key):
             log.error(
-                "override is not a known project setting setting=%s value=%r project=%s",
+                "存在しない設定項目が指定されています: 設定=%s、値=%r、プロジェクト=%s",
                 key,
                 value,
                 selector or "(not selected)",
@@ -71,7 +71,7 @@ def load_settings(project: str = "", *, overrides: dict[str, Any] | None = None)
             raise ValueError(f"unknown setting: {key}")
         setattr(settings, key, value)
     log.info(
-        "project settings loaded project=%s target_name=%s data_root=%s",
+        "プロジェクト設定を読み込みました: 設定=%s、プロジェクト名=%s、データ保存先=%s",
         selector or "(not selected)",
         getattr(settings, "target_name", ""),
         getattr(settings, "data_root", ""),
@@ -87,7 +87,7 @@ def _number(cast: type[int] | type[float], settings: Any, name: str, default: An
         return cast(value)
     except (TypeError, ValueError) as exc:
         log.error(
-            "project setting is not a number setting=%s value=%r error=%s: %s",
+            "設定値を数値に変換できません: 設定=%s、値=%r、エラー=%s: %s",
             name,
             value,
             type(exc).__name__,
@@ -112,7 +112,7 @@ def settings_for_root(settings: Any, root: Path) -> Any:
         (root / "mount").mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         log.error(
-            "mount folder could not be created path=%s error=%s: %s (disk full, read-only, or the volume is not mounted?)",
+            "入力フォルダーを作成できません: パス=%s、エラー=%s: %s（容量・書き込み権限・接続状態を確認してください）",
             root / "mount",
             type(exc).__name__,
             exc,
@@ -120,7 +120,7 @@ def settings_for_root(settings: Any, root: Path) -> Any:
         )
         raise
     log.info(
-        "project root redirected for this run target_name=%s data_root=%s mount_path=%s",
+        "今回の保存先を変更しました: プロジェクト名=%s、データ保存先=%s、入力フォルダー=%s",
         root.name,
         root.parent,
         root / "mount",

@@ -21,7 +21,7 @@ def main() -> int:
     args = parser.parse_args()
     settings = load_settings(args.config)
     log.info(
-        "index phase started config=%s project=%s out=%s scope=%d publish=%s",
+        "目次処理を開始します: 設定=%s、プロジェクト=%s、出力先=%s、対象数=%d、公開有無=%s",
         args.config,
         getattr(settings, "target_name", ""),
         args.out,
@@ -31,7 +31,7 @@ def main() -> int:
     result = run(Config.from_settings(settings, publish=not args.no_publish), Input(Path(args.out), tuple(args.scope)), Path(args.out))
     print(json.dumps(result.__dict__, ensure_ascii=False, default=str))
     log.info(
-        "index result documents=%d failures=%d scope=%d out=%s",
+        "目次処理の結果: 文書数=%d、失敗数=%d、対象数=%d、出力先=%s",
         len(result.done),
         len(result.failures),
         len(result.scope),
@@ -40,7 +40,7 @@ def main() -> int:
     if result.failures:
         # One ERROR for the exit-1 path; publisher/index.py already logs each failing document.
         log.error(
-            "index run finished with %d failures out=%s failures=%s",
+            "目次処理が%d件の失敗を伴って終了しました: 出力先=%s、失敗内容=%s",
             len(result.failures),
             args.out,
             "; ".join(str(item)[:120] for item in result.failures[:5]),

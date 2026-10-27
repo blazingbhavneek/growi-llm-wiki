@@ -34,7 +34,7 @@ def hash_of(value: Any) -> str:
     try:
         payload = json.dumps(_jsonable(value), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError) as exc:
-        log.error("value could not be converted to json for hashing error=%s: %s", type(exc).__name__, exc, exc_info=True)
+        log.error("ハッシュ計算用のJSONを作成できません: エラー=%s: %s", type(exc).__name__, exc, exc_info=True)
         raise
     return sha256_text(payload)
 
@@ -54,12 +54,12 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             try:
                 Path(temporary).unlink(missing_ok=True)
             except OSError as cleanup_exc:
-                log.error("temp file left behind path=%s temp=%s error=%s: %s (the failed write below is the real error)",
+                log.error("一時ファイルが残っています。元の書き込みエラーは後続のログを確認してください: パス=%s、一時ファイル=%s、エラー=%s: %s",
                           path, temporary, type(cleanup_exc).__name__, cleanup_exc, exc_info=True)
                 raise
         code = getattr(exc, "errno", None)
         reason = type(exc).__name__ if code is None else f"{type(exc).__name__} errno={code} ({os.strerror(code)})"
-        log.error("atomic write failed path=%s error=%s: %s (disk full, permissions, or file locked?)",
+        log.error("ファイルを安全に書き込めません: パス=%s、エラー=%s: %s（容量・権限・ファイルの使用状況を確認してください）",
                   path, reason, exc, exc_info=True)
         raise
 
@@ -75,7 +75,7 @@ def write_json_atomic(path: Path | str, value: Any) -> Path:
     try:
         payload = json.dumps(_jsonable(value), indent=2, ensure_ascii=False)
     except (TypeError, ValueError) as exc:
-        log.error("json serialize failed path=%s error=%s: %s", target, type(exc).__name__, exc, exc_info=True)
+        log.error("JSONに変換できません: パス=%s、エラー=%s: %s", target, type(exc).__name__, exc, exc_info=True)
         raise
     _atomic_write(target, (payload + "\n").encode("utf-8"))
     return target
@@ -99,20 +99,20 @@ def read_json(path: Path | str, default: Any = None) -> Any:
         if default is None:
             # A missing file with no default is the documented cache-miss contract: the
             # caller that REQUIRES this file logs its own ERROR with that context.
-            log.debug("json file is absent file=%s reason=%s", target, reason)
+            log.debug("JSONファイルがありません: ファイル=%s、理由=%s", target, reason)
             raise FileNotFoundError(str(target))
         if reason != "not found":
-            log.error("json file could not be read file=%s reason=%s; the default value was used instead", target, reason)
+            log.error("JSONファイルを読めないため既定値を使います: ファイル=%s、理由=%s", target, reason)
         return default
     try:
         text = target.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        log.error("json file could not be read file=%s error=%s: %s", target, type(exc).__name__, exc, exc_info=True)
+        log.error("JSONファイルを読み込めません: ファイル=%s、エラー=%s: %s", target, type(exc).__name__, exc, exc_info=True)
         raise
     try:
         return json.loads(text)
     except ValueError as exc:
-        log.error("json file is corrupt, not missing file=%s error=%s: %s", target, type(exc).__name__, exc, exc_info=True)
+        log.error("JSONファイルが破損しています: ファイル=%s、エラー=%s: %s", target, type(exc).__name__, exc, exc_info=True)
         raise
 
 
@@ -121,12 +121,12 @@ def read_text(path: Path | str, default: str = "") -> str:
     if not target.exists():
         reason = _missing_reason(target)
         if reason != "not found":
-            log.error("text file could not be read file=%s reason=%s; the default value was used instead", target, reason)
+            log.error("テキストファイルを読めないため既定値を使います: ファイル=%s、理由=%s", target, reason)
         return default
     try:
         return target.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        log.error("text file could not be read file=%s error=%s: %s", target, type(exc).__name__, exc, exc_info=True)
+        log.error("テキストファイルを読み込めません: ファイル=%s、エラー=%s: %s", target, type(exc).__name__, exc, exc_info=True)
         raise
 
 
@@ -136,13 +136,13 @@ def clean_workdir(path: Path | str) -> Path:
         try:
             shutil.rmtree(target)
         except OSError as exc:
-            log.error("workdir delete failed path=%s error=%s: %s (the directory may be half-deleted)",
+            log.error("作業フォルダーを削除できません。一部だけ削除されている場合があります: パス=%s、エラー=%s: %s",
                       target, type(exc).__name__, exc, exc_info=True)
             raise
     try:
         target.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        log.error("workdir create failed path=%s error=%s: %s (the old contents are already deleted: half-deleted state)",
+        log.error("作業フォルダーを作成できません。以前の内容は削除済みです: パス=%s、エラー=%s: %s",
                   target, type(exc).__name__, exc, exc_info=True)
         raise
     return target

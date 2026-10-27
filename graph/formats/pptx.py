@@ -125,7 +125,7 @@ async def judge_sections(
             feedback = f"{type(exc).__name__}: {exc}"
             last_error = feedback
     if not starts or starts[0][0] != min(numbers):
-        log.error("slide section planning failed; the deck is cut at the heuristic divider slides instead deck=%s slides=%d attempts=%d fallback_sections=%d last_error=%s", deck, len(slides), max(1, attempts), len(candidates), last_error or feedback)
+        log.error("スライドの構成作成に失敗したため、区切り候補のスライドで分割します: 資料=%s、スライド数=%d、試行回数=%d、分割数=%d、最後のエラー=%s", deck, len(slides), max(1, attempts), len(candidates), last_error or feedback)
         starts = [(n, next(s.title or s.first_text for s in slides if s.number == n)) for n in (candidates or [min(numbers)])]
         if starts[0][0] != min(numbers):
             starts.insert(0, (min(numbers), slides[0].title or slides[0].first_text or "はじめに"))
@@ -136,7 +136,7 @@ async def plan(lines: Sequence[str], *, config: Any, model: Any, on_progress=Non
     slides = split_slides(lines, delimiter=config.slide_delimiter, title=config.slide_title)
     if len(slides) < 2:
         return None
-    log.info("slide deck plan started slides=%d", len(slides))
+    log.info("スライドの構成作成を開始します: スライド数=%d", len(slides))
     sections = await judge_sections(
         slides,
         model=model,
@@ -145,7 +145,7 @@ async def plan(lines: Sequence[str], *, config: Any, model: Any, on_progress=Non
         retry_temperature=config.retry_temperature,
         stop_check=stop_check,
     )
-    log.info("slide deck sections chosen slides=%d sections=%d", len(slides), len(sections))
+    log.info("スライドの節を決定しました: スライド数=%d、節数=%d", len(slides), len(sections))
     starts = [s.start_slide for s in sections]
     groups = []
     for index, section in enumerate(sections):

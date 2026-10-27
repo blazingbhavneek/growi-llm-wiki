@@ -55,7 +55,7 @@ async def summarize_hierarchy(
         cached = read_json(checkpoint, default={}) if checkpoint.exists() else {}
     except (OSError, ValueError):
         # graph/wiki/storage logs the file error (path + errno, or corrupt-vs-missing) on the line above.
-        log.error("hierarchy checkpoint could not be read document=%s file=%s", document, checkpoint, exc_info=True)
+        log.error("階層の保存情報を読み込めません: 文書=%s、ファイル=%s", document, checkpoint, exc_info=True)
         raise
     if cached.get("policy"):
         cached = {}  # written without the model by another policy; never reuse it as model output
@@ -74,7 +74,7 @@ async def summarize_hierarchy(
             result = await model.structured(ParentSummary, [HumanMessage(content=_prompt(chain, group, lines, config.output_language))])
             by_number = {int(item.number): item.summary.strip() for item in result.pages}
         except Exception as exc:
-            log.error("hierarchy summary model call failed; the section summary falls back to a plain source lead document=%s section=%s page=%s error=%s: %s", document, key, group[0].title, type(exc).__name__, exc, exc_info=True)
+            log.error("節の要約生成に失敗したため、元のテキストの冒頭を使います: 文書=%s、節=%s、ページ=%s、エラー=%s: %s", document, key, group[0].title, type(exc).__name__, exc, exc_info=True)
             result, by_number = ParentSummary(), {}
         parents[key] = result.parent_summary.strip() or lead(lines, group[0].owner_ranges[0][0], group[-1].owner_ranges[-1][1], limit=400)
         for page in group:
@@ -82,11 +82,11 @@ async def summarize_hierarchy(
         try:
             write_json_atomic(checkpoint, {"parents": parents, "pages": summaries})
         except OSError:
-            log.error("hierarchy checkpoint write failed, the summaries are lost and recomputed next run document=%s file=%s", document, checkpoint, exc_info=True)
+            log.error("階層の要約を保存できません。次回もう一度計算します: 文書=%s、ファイル=%s", document, checkpoint, exc_info=True)
             raise
     for page in pages:
         page.summary = summaries.get(str(page.number), page.summary)
-    log.info("hierarchy summaries ready document=%s parents=%d pages=%d file=%s", document, len(parents), len(summaries), checkpoint)
+    log.info("階層ごとの要約を作成しました: 文書=%s、親階層数=%d、ページ数=%d、ファイル=%s", document, len(parents), len(summaries), checkpoint)
     return parents
 
 

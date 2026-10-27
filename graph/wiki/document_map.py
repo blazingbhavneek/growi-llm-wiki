@@ -422,19 +422,19 @@ async def _build_regions(
                     result = candidate
                     cached = True
                 else:
-                    log.error("stored regional plan is not a usable regional plan, this region is planned again from scratch document=%s region=%d lines=%d-%d file=%s reason=%.300s",
+                    log.error("領域の保存済み構成を使えないため、作り直します: 文書=%s、領域=%d、行範囲=%d-%d、ファイル=%s、理由=%.300s",
                               observations.document_id, ordinal, source_start, source_end, result_path, error)
             except OSError as exc:
-                log.error("stored regional plan exists but could not be read, this region is planned again from scratch document=%s region=%d lines=%d-%d file=%s error=%s: %s",
+                log.error("領域の保存済み構成を読めないため、作り直します: 文書=%s、領域=%d、行範囲=%d-%d、ファイル=%s、エラー=%s: %s",
                           observations.document_id, ordinal, source_start, source_end, result_path, type(exc).__name__, exc, exc_info=True)
             except (TypeError, ValueError) as exc:
-                log.error("stored regional plan is corrupt, not missing, this region is planned again from scratch document=%s region=%d lines=%d-%d file=%s error=%s: %s",
+                log.error("領域の保存済み構成が破損しているため、作り直します: 文書=%s、領域=%d、行範囲=%d-%d、ファイル=%s、エラー=%s: %s",
                           observations.document_id, ordinal, source_start, source_end, result_path, type(exc).__name__, exc, exc_info=True)
         if task_root:
             try:
                 task_root.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
-                log.error("regional checkpoint directory could not be created, this document cannot be planned document=%s region=%d stage=region dir=%s error=%s: %s",
+                log.error("領域の保存フォルダーを作成できないため、構成を作成できません: 文書=%s、領域=%d、フォルダー=%s、エラー=%s: %s",
                           observations.document_id, ordinal, task_root, type(exc).__name__, exc, exc_info=True)
                 raise
 
@@ -484,7 +484,7 @@ async def _build_regions(
                     write_text_atomic(task_root / f"attempt-{attempt:02d}-error.txt", last_error + "\n")
 
         if result is None:
-            log.error("every regional planning attempt failed, this region keeps the raw overlapping observations document=%s region=%d lines=%d-%d windows=%d attempts=%d last_error=%.300s",
+            log.error("領域の構成作成がすべて失敗しました。重複を含む解析結果をそのまま使います: 文書=%s、領域=%d、行範囲=%d-%d、解析範囲数=%d、試行回数=%d、最後のエラー=%.300s",
                       observations.document_id, ordinal, source_start, source_end, len(reports), max(1, config.planner_attempts), last_error)
             result = _regional_fallback(reports, ordinal=ordinal)
         if result_path:
@@ -548,18 +548,18 @@ async def _build_semantic_plan(
                 if on_progress:
                     on_progress({"stage": "plan", "step": "semantic", "cached": True})
                 return cached
-            log.error("stored semantic plan is empty, the semantic plan is computed again source_lines=%d file=%s", source_line_count, result_path)
+            log.error("保存済みの意味構成が空のため、作り直します: 元行数=%d、ファイル=%s", source_line_count, result_path)
         except OSError as exc:
-            log.error("stored semantic plan exists but could not be read, the semantic plan is computed again source_lines=%d file=%s error=%s: %s",
+            log.error("保存済みの意味構成を読めないため、作り直します: 元行数=%d、ファイル=%s、エラー=%s: %s",
                       source_line_count, result_path, type(exc).__name__, exc, exc_info=True)
         except (TypeError, ValueError) as exc:
-            log.error("stored semantic plan is corrupt, not missing, the semantic plan is computed again source_lines=%d file=%s error=%s: %s",
+            log.error("保存済みの意味構成が破損しているため、作り直します: 元行数=%d、ファイル=%s、エラー=%s: %s",
                       source_line_count, result_path, type(exc).__name__, exc, exc_info=True)
     if task_root:
         try:
             task_root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            log.error("semantic checkpoint directory could not be created, this document cannot be planned stage=semantic dir=%s error=%s: %s",
+            log.error("意味構成の保存フォルダーを作成できないため、この文書の構成を作成できません: フォルダー=%s、エラー=%s: %s",
                       task_root, type(exc).__name__, exc, exc_info=True)
             raise
     last_error = ""
@@ -599,7 +599,7 @@ async def _build_semantic_plan(
         if task_root:
             write_text_atomic(task_root / f"attempt-{attempt:02d}-error.txt", last_error + "\n")
     result = _fallback_semantic_plan(regions)
-    log.error("every semantic planning attempt failed, the semantic plan is a mechanical listing of the regional candidates source_lines=%d regions=%d attempts=%d last_error=%.300s",
+    log.error("意味に基づく構成作成がすべて失敗しました。領域ごとの候補をそのまま並べます: 元行数=%d、領域数=%d、試行回数=%d、最後のエラー=%.300s",
               source_line_count, len(regions), max(1, config.planner_attempts), last_error)
     if result_path:
         write_json_atomic(result_path, result)
@@ -656,13 +656,13 @@ async def _compile_seed_plan(
                         }
                     )
                 return checked
-            log.error("stored seed plan cache entry is not a usable seed plan, this document is compiled again from scratch source_lines=%d file=%s reason=%.300s",
+            log.error("保存済みの基本構成を使えないため、最初から作り直します: 元行数=%d、ファイル=%s、理由=%.300s",
                       source_line_count, result_path, error)
         except OSError as exc:
-            log.error("stored seed plan cache entry exists but could not be read, this document is compiled again from scratch source_lines=%d file=%s error=%s: %s",
+            log.error("保存済みの基本構成を読めないため、最初から作り直します: 元行数=%d、ファイル=%s、エラー=%s: %s",
                       source_line_count, result_path, type(exc).__name__, exc, exc_info=True)
         except (TypeError, ValueError) as exc:
-            log.error("stored seed plan cache entry is corrupt, not missing, this document is compiled again from scratch source_lines=%d file=%s error=%s: %s",
+            log.error("保存済みの基本構成が破損しているため、最初から作り直します: 元行数=%d、ファイル=%s、エラー=%s: %s",
                       source_line_count, result_path, type(exc).__name__, exc, exc_info=True)
     if task_root:
         # A failed compile is one resumable stage, not a conversation to continue
@@ -761,7 +761,7 @@ async def _compile_seed_plan(
                     "response": response_path,
                 }
             )
-    log.error("seed plan compilation gave up, no seed plan exists for this document source_lines=%d attempts=%d last_error=%.300s",
+    log.error("基本構成を作成できませんでした: 元行数=%d、試行回数=%d、最後のエラー=%.300s",
               source_line_count, attempt, last_error)
     raise SeedPlanningError(last_error or "seed plan compilation failed")
 
@@ -785,7 +785,7 @@ async def build_seed_plan(
         try:
             checkpoint_root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            log.error("planning checkpoint directory could not be created, this document cannot be planned stage=plan dir=%s error=%s: %s",
+            log.error("構成の保存フォルダーを作成できないため、この文書の構成を作成できません: フォルダー=%s、エラー=%s: %s",
                       checkpoint_root, type(exc).__name__, exc, exc_info=True)
             raise
     regions = await _build_regions(

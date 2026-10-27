@@ -41,7 +41,7 @@ def load(settings: Any, meta_version: str, hashes: Iterable[str]) -> dict[str, C
                 unreadable.append(f"{type(exc).__name__}: {exc}")
                 continue
     if unreadable:
-        log.warning("chunk metadata cache entries unreadable root=%s count=%d first=%s (the cache rots: those chunks cost another model call)",
+        log.warning("分割部分の保存情報を読めません。該当部分はモデルで再解析します: 保存先=%s、件数=%d、最初の1件=%s",
                     root, len(unreadable), unreadable[0][:120])
     return found
 
@@ -55,6 +55,6 @@ def store(settings: Any, meta_version: str, metas: dict[str, ChunkMeta]) -> None
         try:
             write_json_atomic(path, meta.model_dump(mode="json"))
         except Exception as exc:
-            log.error("chunk metadata cache write failed path=%s error=%s: %s (the link-ahead worker dies on this error)",
+            log.error("分割部分の情報を保存できません。先行リンクの作業スレッドが終了します: パス=%s、エラー=%s: %s",
                       path, type(exc).__name__, exc, exc_info=True)
             raise

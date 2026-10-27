@@ -61,12 +61,12 @@ def reset_failure_summaries(settings: Any) -> None:
         try:
             path.unlink(missing_ok=True)
         except OSError as exc:
-            log.error("failed to remove legacy failure summary %s: %s: %s", path, type(exc).__name__, exc)
+            log.error("古い形式の失敗一覧を削除できません: ファイル=%s、エラー=%s: %s", path, type(exc).__name__, exc)
     path = root / "failed_docs.md"
     try:
         path.write_text("", encoding="utf-8")  # Also clear the previous run after success.
     except OSError as exc:
-        log.error("failed to reset failure summary %s: %s: %s", path, type(exc).__name__, exc)
+        log.error("失敗一覧を初期化できません: ファイル=%s、エラー=%s: %s", path, type(exc).__name__, exc)
 
 
 class _FailureCapture(logging.Handler):
@@ -152,10 +152,10 @@ def _write_summary(settings: Any, failures: list[str], warnings: list[str],
         if not marker:
             return failure
         # Older conversion results can already contain a formatted traceback.
-        log.debug("failure details: %s", failure)
+        log.debug("失敗の詳細: %s", failure)
         reason = next((line.strip() for line in reversed(trace.splitlines()) if line.strip()),
-                      "see debug.log")
-        return f"{prefix}{reason} (details: debug.log)"
+                      "debug.log を確認してください")
+        return f"{prefix}{reason}（詳細: debug.log）"
 
     failures = list(dict.fromkeys(short_reason(failure) for failure in failures))
     warnings = list(dict.fromkeys(short_reason(warning) for warning in warnings))
@@ -210,10 +210,10 @@ def _write_summary(settings: Any, failures: list[str], warnings: list[str],
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body, encoding="utf-8")  # Also clear the previous run after success.
     except OSError as exc:
-        log.error("failed to save failure evidence to %s: %s: %s",
+        log.error("失敗の記録を保存できません: 保存先=%s、エラー=%s: %s",
                   path, type(exc).__name__, redact_log_text(str(exc), settings))
     # Records, not prints: the live handler must keep the run's failure list.
     for failed_path in failed_paths:
-        log.error("document failed: %s", redact_log_text(failed_path, settings))
-    log.info("failed documents=%d index errors=%d details=%s", len(failed_paths), len(warnings), path)
+        log.error("処理に失敗した文書: %s", redact_log_text(failed_path, settings))
+    log.info("失敗した文書=%d件、目次のエラー=%d件、詳細=%s", len(failed_paths), len(warnings), path)
 

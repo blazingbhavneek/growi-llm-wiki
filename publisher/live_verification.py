@@ -60,7 +60,7 @@ def boundary_confirmation(url: str, path: str) -> str:
 def verify_boundary_confirmation(url: str, path: str, confirmation: str) -> None:
     expected = boundary_confirmation(url, path)
     if not confirmation or confirmation != expected:
-        log.error("live verification boundary is not confirmed endpoint=%s path=%s confirmation=%s",
+        log.error("実環境での検証範囲が確認されていません: 接続先=%s、パス=%s、確認状態=%s",
                   _redact_url(url), path, "missing" if not confirmation else "is not the generated plan code")
         raise PermissionError(
             "live verification boundary is not confirmed; generate the local plan and explicitly provide its confirmation code"
@@ -84,7 +84,7 @@ class LiveVerificationReport:
         root = "/" + disposable_path.strip("/")
         configured = "/" + str(settings.target_name).strip("/")
         if root == "/" or not (root == configured or root.startswith(configured + "/")):
-            log.error("live verification path escapes the project boundary path=%s boundary=%s", root, configured)
+            log.error("実環境での検証パスがプロジェクトの範囲外です: パス=%s、対象範囲=%s", root, configured)
             raise ValueError("disposable live path must stay below the configured project boundary")
         url = str(getattr(settings, "growi_url", "")).rstrip("/")
         if not url:
@@ -97,13 +97,13 @@ class LiveVerificationReport:
                     check=False, capture_output=True, text=True,
                 )
             except FileNotFoundError as exc:  # git missing from PATH is an environment failure, not a repo state
-                log.error("git is not installed so the report commit is unknown root=%s error=%s: %s",
+                log.error("git が導入されていないため、検証結果のコミットを特定できません: 保存先=%s、エラー=%s: %s",
                           project.root, type(exc).__name__, exc, exc_info=True)
                 raise
             if result.returncode == 0:
                 commit = result.stdout.strip()
             else:
-                log.error("git rev-parse failed root=%s returncode=%d stderr=%s",
+                log.error("git rev-parse に失敗しました: 保存先=%s、終了コード=%d、標準エラー=%s",
                           project.root, result.returncode, result.stderr.strip()[:200])
         report_dir = Path(project.metadata) / "human-sync" / "live-reports"
         report_path = report_dir / (now_iso().replace(":", "-") + ".json")
@@ -142,7 +142,7 @@ class LiveVerificationReport:
     def open(cls, path: Path) -> "LiveVerificationReport":
         data = read_json(path)
         if data.get("schema_version") != REPORT_VERSION:
-            log.error("live verification report is unusable file=%s found=%r expected=%s",
+            log.error("実環境での検証結果を使えません: ファイル=%s、形式=%r、期待する形式=%s",
                       path, data.get("schema_version"), REPORT_VERSION)
             raise ValueError("unsupported live verification report")
         return cls(Path(path), data)
@@ -177,7 +177,7 @@ class LiveVerificationReport:
         }
         self.data["status"] = "running" if passed else "failed_rollback_required"
         if not passed:
-            log.error("live verification case failed case=%s operation=%s expected=%s actual=%s reason_codes=%s",
+            log.error("実環境での検証に失敗しました: 項目=%s、操作=%s、期待値=%s、実際の値=%s、理由コード=%s",
                       name, operation, str(expected)[:120], str(actual)[:120], sorted(set(reason_codes or [])))
         write_json_atomic(self.path, self.data)
 
@@ -212,7 +212,7 @@ class LiveVerificationReport:
         try:
             write_json_atomic(self.path, self.data)
         except Exception as exc:  # noqa: BLE001 - storage names the errno; only here knows the whole matrix is lost
-            log.error("live verification report could not be finalized file=%s error=%s: %s; the whole test matrix result was not saved",
+            log.error("実環境での検証結果を確定できません。検証条件全体の結果は保存されていません: ファイル=%s、エラー=%s: %s",
                       self.path, type(exc).__name__, exc, exc_info=True)
             raise
         return self.data

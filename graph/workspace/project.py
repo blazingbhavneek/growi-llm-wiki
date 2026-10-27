@@ -39,7 +39,7 @@ def walk_files(root: Path) -> list[Path]:
         return []
 
     def unreadable(error: OSError) -> None:
-        log.error("scan cannot read directory path=%s error=%s: %s", getattr(error, "filename", root), type(error).__name__, error, exc_info=True)
+        log.error("フォルダーを読み込めません: パス=%s、エラー=%s: %s", getattr(error, "filename", root), type(error).__name__, error, exc_info=True)
 
     files: list[Path] = []
     for folder, _folders, names in os.walk(root, onerror=unreadable):
@@ -61,7 +61,7 @@ def assert_unique_generated_paths(mount_rels: Iterable[str]) -> None:
         ):
             previous = owners.get(generated)
             if previous is not None and previous != rel:
-                log.error("mount paths write the same output kind=%s output=%s mount=%s other=%s", kind, generated, rel, previous)
+                log.error("複数の入力パスが同じ出力先を使っています: 種類=%s、出力先=%s、入力パス=%s、別の入力パス=%s", kind, generated, rel, previous)
                 raise ValueError(
                     f"mount paths resolve to the same {kind} {generated!r}: "
                     f"{previous!r}, {rel!r}"
@@ -77,7 +77,7 @@ def assert_unique_generated_paths(mount_rels: Iterable[str]) -> None:
                 break
             parent_owner = raw_owners.get(parent_rel)
             if parent_owner is not None:
-                log.error("generated raw path is both a file and a directory path=%s owner=%s other=%s", parent_rel, parent_owner, owner)
+                log.error("変換テキストのパスがファイルとフォルダーで重複しています: パス=%s、元文書=%s、別の元文書=%s", parent_rel, parent_owner, owner)
                 raise ValueError(
                     f"generated raw path is both a file and a directory {parent_rel!r}: "
                     f"{parent_owner!r}, {owner!r}"
@@ -167,7 +167,7 @@ class Project:
             try:
                 directory.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
-                log.error("project folder create failed path=%s error=%s: %s", directory, type(exc).__name__, exc, exc_info=True)
+                log.error("プロジェクトフォルダーを作成できません: パス=%s、エラー=%s: %s", directory, type(exc).__name__, exc, exc_info=True)
                 raise
         return self
 
@@ -193,11 +193,11 @@ def open_project(settings: Any) -> Project:
     name = str(getattr(settings, "target_name", "")).strip()
     mount_value = str(getattr(settings, "mount_path", "")).strip()
     if not name or not mount_value:
-        log.error("project config is missing required settings target_name=%s source_mount=%s", name, mount_value)
+        log.error("プロジェクト設定に必要な値がありません: target_name=%s、source_mount=%s", name, mount_value)
         raise ValueError("project config did not provide target_name and source_mount")
     mount = Path(mount_value)
     if not mount.is_dir():
-        log.error("mount directory not found path=%s project=%s", mount, name)
+        log.error("入力フォルダーが見つかりません: パス=%s、プロジェクト=%s", mount, name)
         raise FileNotFoundError(f"mount directory not found: {mount}")
     return Project(Path(settings.data_root) / name, mount).ensure()
 
@@ -206,7 +206,7 @@ def zip_wiki(project: Project, team: str | None = None) -> bytes:
     buffer = io.BytesIO()
     base = project.wiki / team if team else project.wiki
     # The whole archive is built in RAM, so name the tree before it is read.
-    log.info("wiki zip started path=%s team=%s", base, team or "")
+    log.info("WikiのZIP圧縮を開始します: パス=%s、チーム=%s", base, team or "")
     files = 0
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(walk_files(base)):
@@ -215,5 +215,5 @@ def zip_wiki(project: Project, team: str | None = None) -> bytes:
             archive.write(path, path.relative_to(project.wiki).as_posix())
             files += 1
     payload = buffer.getvalue()
-    log.info("wiki zip finished files=%d bytes=%d", files, len(payload))
+    log.info("WikiのZIP圧縮が完了しました: ファイル数=%d、バイト数=%d", files, len(payload))
     return payload

@@ -112,7 +112,7 @@ _UNWRAPPED_COMMANDS = sorted(
 )
 if _UNWRAPPED_COMMANDS:
     log.warning(
-        "compat wrapper mapping is missing commands=%s (those commands run without the main.py compat wrappers)",
+        "main.py の互換用関数が未登録のコマンドがあります。該当コマンドは互換用関数を通らず実行されます: コマンド=%s",
         ", ".join(_UNWRAPPED_COMMANDS),
     )
 

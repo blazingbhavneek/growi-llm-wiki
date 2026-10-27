@@ -125,7 +125,7 @@ class DataLayout:
                 path.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 log.error(
-                    "data folder could not be created path=%s root=%s error=%s: %s (disk full, read-only, or the data root is not mounted?)",
+                    "データフォルダーを作成できません: パス=%s、保存先=%s、エラー=%s: %s（容量・書き込み権限・接続状態を確認してください）",
                     path,
                     self.root,
                     type(exc).__name__,

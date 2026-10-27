@@ -126,7 +126,7 @@ def split_sections(
         # ``assert`` is stripped by ``python -O``; this line is what survives a build that
         # ships source lines no section owns.  The caller passes only lines and a range, so
         # the page range is the identity available here.
-        log.error("section split does not tile the page range page_start=%d page_end=%d sections=%d first=%s last=%s sample=%s",
+        log.error("節の分割がページ範囲を過不足なく覆っていません: 開始行=%d、終了行=%d、節数=%d、最初=%s、最後=%s、例=%s",
                   start, end, len(result), result[0], result[-1], result[:12])
     assert result[0][0] == start and result[-1][1] == end
     assert all(result[i][1] + 1 == result[i + 1][0] for i in range(len(result) - 1))

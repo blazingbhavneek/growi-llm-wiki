@@ -21,7 +21,7 @@ def main() -> int:
     parser.add_argument("command", nargs="?", choices=("run", "status"), default="run")
     args = parser.parse_args()
     log.info(
-        "linker command started command=%s config=%s out=%s mode=%s policy=%s",
+        "リンク処理を開始します: コマンド=%s、設定=%s、出力先=%s、リンク方式=%s、処理方式=%s",
         args.command,
         args.config,
         args.out,
@@ -32,7 +32,7 @@ def main() -> int:
         catalog = status(Path(args.out))
         print(json.dumps(catalog, ensure_ascii=False))
         log.info(
-            "linker catalog status out=%s mode=%s documents=%s chunks=%s edges=%s",
+            "リンク情報の状態: 出力先=%s、方式=%s、文書数=%s、分割部分数=%s、リンク数=%s",
             args.out,
             catalog.get("mode"),
             catalog.get("documents"),
@@ -46,7 +46,7 @@ def main() -> int:
     result = run(Config.from_settings(settings, policy=args.policy), Input(Path(args.out)), Path(args.out))
     print(json.dumps(result.__dict__, ensure_ascii=False, default=str))
     log.info(
-        "linker result touched=%d policy=%s calls=%d out=%s project=%s",
+        "リンク処理の結果: 更新文書数=%d、処理方式=%s、呼び出し数=%d、出力先=%s、プロジェクト=%s",
         len(result.touched_documents),
         result.policy,
         result.calls,

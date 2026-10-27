@@ -141,7 +141,7 @@ def decode_text_bytes(raw: bytes, *, source: Path | None = None) -> str:
             continue
     if not candidates:
         label = str(source) if source is not None else "<bytes>"
-        log.error("text encoding not supported file=%s encodings=utf-8,euc_jp,cp932,iso2022_jp error=UnicodeError: unsupported text encoding", label)
+        log.error("文字コードに対応していません: ファイル=%s、対応形式=utf-8,euc_jp,cp932,iso2022_jp、エラー=UnicodeError", label)
         raise UnicodeError(f"unsupported text encoding: {label}")
     return max(candidates, key=_legacy_text_score)
 
@@ -180,9 +180,9 @@ def preflight_document(path: Path) -> None:
                 encrypted = reader.is_encrypted and not reader.decrypt("")
     except ModuleNotFoundError as exc:
         # A missing dependency disables encryption detection for this whole format; the file still reaches the parser.
-        log.warning("parser preflight dependency missing file=%s module=%s error=%s: %s", path.name, exc.name, type(exc).__name__, exc, exc_info=True)
+        log.warning("解析前の確認に必要なモジュールがありません: ファイル=%s、モジュール=%s、エラー=%s: %s", path.name, exc.name, type(exc).__name__, exc, exc_info=True)
     except Exception:  # Inspection is advisory: unknown/corrupt formats still reach the parser.
-        log.debug("parser preflight inconclusive: %s", path.name, exc_info=True)
+        log.debug("解析前の確認で判定できませんでした: %s", path.name, exc_info=True)
     if encrypted:
         raise ParserSkip("スキップ: 暗号化されたドキュメントです")
 
@@ -253,11 +253,11 @@ def parse_document(
             upload = _open_parser_upload(Path(path))
         except Exception as exc:
             # Upload preparation sits outside the request try, so nothing else would name this file.
-            log.error("parser upload preparation failed file=%s error=%s: %s", path.name, type(exc).__name__, exc, exc_info=True)
+            log.error("解析用の送信準備に失敗しました: ファイル=%s、エラー=%s: %s", path.name, type(exc).__name__, exc, exc_info=True)
             raise
         with upload as handle:
             try:
-                log.info("stage=parser endpoint=%s attempt=%d file=%s timeout=%.0fs",
+                log.info("文書を解析します: 接続先=%s、試行=%d、ファイル=%s、制限時間=%.0f秒",
                          safe_endpoint(endpoint), index + 1, path.name, timeout_s)
                 params = {
                     "images": "true",
@@ -307,7 +307,7 @@ def parse_document(
                         raise ParserSkip(f"スキップ: 全パーサーがフォーマットを認識できません: {exc}") from exc
                     raise
             else:
-                log.info("stage=parser endpoint=%s elapsed=%.2fs characters=%d",
+                log.info("文書の解析が完了しました: 接続先=%s、経過時間=%.2f秒、文字数=%d",
                          safe_endpoint(endpoint), time.monotonic() - started, len(markdown))
                 break
     # A completed parse must not be thrown away by post-processing nobody named.
@@ -324,7 +324,7 @@ def parse_document(
             )
         return _repair_image_description_fences(markdown)
     except Exception as exc:
-        log.error("stage=parser post-processing failed file=%s error=%s: %s", path.name, type(exc).__name__, exc, exc_info=True)
+        log.error("解析後の処理に失敗しました: ファイル=%s、エラー=%s: %s", path.name, type(exc).__name__, exc, exc_info=True)
         raise
 
 

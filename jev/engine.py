@@ -84,7 +84,7 @@ class JevEngine:
         self._thread = threading.Thread(target=self._work, name="jev-engine", daemon=True)
         try: self._thread.start()
         except RuntimeError as exc:
-            log.error("Jev engine worker thread did not start name=%s error=%s: %s (the process cannot create another thread, so no Jev request can be served)", self._thread.name, type(exc).__name__, exc, exc_info=True)
+            log.error("Jevの作業用スレッドを開始できないため、要求を処理できません: 名前=%s、エラー=%s: %s", self._thread.name, type(exc).__name__, exc, exc_info=True)
             raise
 
     def _request(self, state, question, state_id=""):
@@ -103,7 +103,7 @@ class JevEngine:
                         with open(self.record_path, "a", encoding="utf-8") as out:
                             out.write(json.dumps({"state": req.state, "question": {"text": req.question.text, "kind": req.question.kind, "options": req.question.options}}, ensure_ascii=False) + "\n")
                     except OSError as exc:
-                        log.error("Jev record file write failed file=%s error=%s: %s (a disk, path or permission problem, not a Jev scoring failure)", self.record_path, type(exc).__name__, exc, exc_info=True)
+                        log.error("Jevの記録ファイルを書き込めません。判定ではなくディスク・パス・権限の問題です: ファイル=%s、エラー=%s: %s", self.record_path, type(exc).__name__, exc, exc_info=True)
                         raise
                     self._recorded += 1
 
@@ -121,7 +121,7 @@ class JevEngine:
         try: return self.backend.prepare(req)
         except Exception as exc:
             self._stats["errors"] += 1
-            log.error("Jev request could not be prepared backend=%s state=%s question=%s kind=%s error=%s: %s", getattr(self.backend, "name", "?"), req.state_id[:12], getattr(req.question, "key", ""), getattr(req.question, "kind", ""), type(exc).__name__, exc, exc_info=True)
+            log.error("Jevの要求を準備できません: 実行方式=%s、状態=%s、質問=%s、種類=%s、エラー=%s: %s", getattr(self.backend, "name", "?"), req.state_id[:12], getattr(req.question, "key", ""), getattr(req.question, "kind", ""), type(exc).__name__, exc, exc_info=True)
             raise
 
     def _enqueue(self, prepared):
@@ -230,9 +230,9 @@ class JevEngine:
                 pending.extendleft(reversed([item for i, item in enumerate(batch) if i not in selected]))
                 self._run(picked)
             try: self.backend.close()
-            except Exception: log.exception("closing Jev backend")
+            except Exception: log.exception("Jevの実行環境を終了します")
         except BaseException as exc:
-            log.critical("Jev engine worker thread stopped name=%s error=%s: %s (the queue is no longer drained and every later decide() blocks forever)", self._thread.name, type(exc).__name__, exc, exc_info=True)
+            log.critical("Jevの作業用スレッドが停止しました。以降の decide() は待機したままになります: 名前=%s、エラー=%s: %s", self._thread.name, type(exc).__name__, exc, exc_info=True)
             raise
 
     def _run(self, group, retries=0):
@@ -241,7 +241,7 @@ class JevEngine:
         try:
             results = self.backend.run([i[0] for i in group])
             if len(results) != len(group):
-                log.error("Jev backend returned the wrong number of results backend=%s expected=%d got=%d states=%d", getattr(self.backend, "name", "?"), len(group), len(results), len({i[3] for i in group}))
+                log.error("Jevの回答数が要求数と一致しません: 実行方式=%s、期待数=%d、回答数=%d、状態数=%d", getattr(self.backend, "name", "?"), len(group), len(results), len({i[3] for i in group}))
                 raise JevUnavailable("backend returned misaligned results")
             for item, result in zip(group, results): item[1].set_result(result)
         except JevOutOfMemory as exc:
@@ -257,7 +257,7 @@ class JevEngine:
                 self._oom_times.clear()
             # The GPU message from torch names the allocation it tried to get, e.g.
             # "Tried to allocate 20.00 MiB"; requested_tokens is what this batch asked for.
-            log.error("Jev GPU out of memory backend=%s state=%s requests=%d requested_tokens=%d budget=%d->%d action=%s error=%s: %s", getattr(self.backend, "name", "?"), group[0][3][:12], len(group), sum(i[0].cost for i in group), budget_before, self.budget, "batch split in half" if len(group) > 1 else "request failed", type(exc).__name__, exc, exc_info=True)
+            log.error("JevのGPUメモリが不足しました: 実行方式=%s、状態=%s、要求数=%d、要求トークン数=%d、上限=%d→%d、対応=%s、エラー=%s: %s", getattr(self.backend, "name", "?"), group[0][3][:12], len(group), sum(i[0].cost for i in group), budget_before, self.budget, "batch split in half" if len(group) > 1 else "request failed", type(exc).__name__, exc, exc_info=True)
             if len(group) > 1:
                 middle = len(group) // 2
                 self._run(group[:middle]); self._run(group[middle:])
@@ -268,11 +268,11 @@ class JevEngine:
             by_state = {}
             for item in group: by_state.setdefault(item[3], []).append(item)
             if len(by_state) > 1:
-                log.debug("Jev batch retried per state states=%d requests=%d retries=%d error=%s: %s", len(by_state), len(group), retries, type(exc).__name__, exc)
+                log.debug("Jevの一括処理を状態ごとに再試行しました: 状態数=%d、要求数=%d、再試行回数=%d、エラー=%s: %s", len(by_state), len(group), retries, type(exc).__name__, exc)
                 for same_state in by_state.values(): self._run(same_state, retries + 1)
             else:
                 self._stats["errors"] += len(group)
-                log.error("Jev batch failed backend=%s state=%s requests=%d retries=%d error=%s: %s (every request in this state failed)", getattr(self.backend, "name", "?"), group[0][3][:12], len(group), retries, type(exc).__name__, exc, exc_info=True)
+                log.error("Jevの一括処理に失敗しました。この状態のすべての要求が失敗しました: 実行方式=%s、状態=%s、要求数=%d、再試行回数=%d、エラー=%s: %s", getattr(self.backend, "name", "?"), group[0][3][:12], len(group), retries, type(exc).__name__, exc, exc_info=True)
                 for item in group: item[1].set_exception(exc)
         elapsed = (time.monotonic() - start) * 1000
         self._stats["runs"] += 1; self._stats["batch_size_sum"] += len(group)
@@ -288,7 +288,7 @@ class JevEngine:
             self._stats["token_cache_misses"] = backend_stats.get("token_cache_misses", self._stats["token_cache_misses"])
             if "fast_kernels" in backend_stats: self._stats["fast_kernels"] = backend_stats["fast_kernels"]
         if self.stats_seconds and time.monotonic() - self._last_stats_log >= self.stats_seconds:
-            log.debug("Jev stats: %s", stats_summary(self._stats, time.monotonic() - self._started))
+            log.debug("Jevの処理統計: %s", stats_summary(self._stats, time.monotonic() - self._started))
             self._last_stats_log = time.monotonic()
 
     def stats(self):

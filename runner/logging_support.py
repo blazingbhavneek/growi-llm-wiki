@@ -39,7 +39,7 @@ def startup_failed(exc: BaseException) -> None:
         if value and value != "local" and name.endswith(("API_KEY", "TOKEN")):
             reason = reason.replace(value, "[redacted]")
     try:
-        sys.__stderr__.write(f"logging disabled: settings: {' '.join(reason.split())}\n")
+        sys.__stderr__.write(f"設定の読み込みに失敗し、ログを保存できません: {' '.join(reason.split())}\n")
         sys.__stderr__.flush()
     except Exception:
         pass
@@ -90,7 +90,7 @@ def run_standalone(main: Callable[[], Any]) -> Any:
         with capture_run_logs(settings) as log_dir:
             handlers = cli._file_handlers(log_dir, run_id=run_id, settings=settings)
     except OSError as exc:
-        cli._emergency("log folder", f"{type(exc).__name__}: {exc}")
+        cli._emergency("ログフォルダー", f"{type(exc).__name__}: {exc}")
     with file_logging(handlers) as root:
         for record in pending:
             root.handle(record)
@@ -98,6 +98,6 @@ def run_standalone(main: Callable[[], Any]) -> Any:
         try:
             return main()
         except Exception as exc:
-            root.error("command failed command=%s error=%s: %s",
+            root.error("コマンドの実行に失敗しました: コマンド=%s、エラー=%s: %s",
                        sys.argv[0], type(exc).__name__, exc, exc_info=True)
             return 1

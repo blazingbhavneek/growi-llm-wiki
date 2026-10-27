@@ -29,7 +29,7 @@ def run_async_blocking(awaitable: Coroutine[Any, Any, Any]) -> Any:
         thread.start()
     except (RuntimeError, OSError) as exc:
         # "can't start new thread": thread or file limit reached, or the process is out of memory.
-        log.error("async worker thread could not start error=%s: %s (thread or file limit, or out of memory)", type(exc).__name__, exc, exc_info=True)
+        log.error("作業用スレッドを開始できません: エラー=%s: %s（スレッド数・ファイル数の上限、メモリ残量を確認してください）", type(exc).__name__, exc, exc_info=True)
         raise
     thread.join()
     if error:

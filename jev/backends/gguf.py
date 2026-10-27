@@ -32,35 +32,35 @@ class GGUFBackend(TorchBackend):
                 except Exception as exc:
                     # A cold HF cache and an unusable one raise the same way; a cold cache is a normal miss.
                     if kwargs.get("local_files_only"):
-                        log.debug("Jev GGUF snapshot is not in the local cache repo=%s, downloading from the hub error=%s: %s", config.gguf_model, type(exc).__name__, exc, exc_info=True)
+                        log.debug("JevのGGUFデータがローカルにないため、配布元から取得します: リポジトリ=%s、エラー=%s: %s", config.gguf_model, type(exc).__name__, exc, exc_info=True)
                     else:
-                        log.error("Jev GGUF snapshot download failed, retrying once repo=%s path=%s error=%s: %s (check network, disk space, permissions and the Hugging Face token)", config.gguf_model, folder, type(exc).__name__, exc, exc_info=True)
+                        log.error("JevのGGUFデータを取得できないため、1回再試行します: リポジトリ=%s、パス=%s、エラー=%s: %s（通信・容量・権限・Hugging Faceトークンを確認してください）", config.gguf_model, folder, type(exc).__name__, exc, exc_info=True)
                     kwargs.pop("local_files_only", None)
                     folder = Path(snapshot_download(**kwargs))
             except Exception as exc:
-                log.error("Jev GGUF model download failed repo=%s path=%s error=%s: %s (there is no usable GGUF snapshot, so the second attempt failed too)", config.gguf_model, folder, type(exc).__name__, exc, exc_info=True)
+                log.error("JevのGGUFモデルを取得できません。使える保存データがなく、2回目の試行も失敗しました: リポジトリ=%s、パス=%s、エラー=%s: %s", config.gguf_model, folder, type(exc).__name__, exc, exc_info=True)
                 raise
         if not all((folder / name).is_file() for name in files):
             missing = [name for name in files if not (folder / name).is_file()]
-            log.error("incomplete GGUF snapshot path=%s missing=%s repo=%s", folder, ",".join(missing), config.gguf_model)
+            log.error("GGUFの保存データが不完全です: パス=%s、不足=%s、リポジトリ=%s", folder, ",".join(missing), config.gguf_model)
             raise JevUnavailable(f"incomplete GGUF snapshot: {folder}")
         spec = importlib.util.spec_from_file_location("jev_style_decision_gguf", folder / files[0])
         if spec is None or spec.loader is None:
-            log.error("Jev GGUF runtime script cannot be loaded file=%s repo=%s", folder / files[0], config.gguf_model)
+            log.error("JevのGGUF実行スクリプトを読み込めません: ファイル=%s、リポジトリ=%s", folder / files[0], config.gguf_model)
             raise JevUnavailable("cannot load GGUF runtime")
         try: module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
         except Exception as exc:
-            log.error("Jev GGUF runtime script could not be imported file=%s repo=%s error=%s: %s (a missing llama.cpp binding is reported here, not later)", folder / files[0], config.gguf_model, type(exc).__name__, exc, exc_info=True)
+            log.error("JevのGGUF実行スクリプトを取り込めません。llama.cpp の連携モジュール不足も確認してください: ファイル=%s、リポジトリ=%s、エラー=%s: %s", folder / files[0], config.gguf_model, type(exc).__name__, exc, exc_info=True)
             raise
         kw = {"quant": config.gguf_quant, "many_mode": config.gguf_many_mode}
         if config.gguf_binary: kw["binary"] = config.gguf_binary
         try:
             try: runtime = module.JevStyleDecisionGGUF(str(folder), **kw)
             except TypeError as exc:
-                log.error("Jev GGUF runtime constructor rejected quant, many_mode and binary, retrying without them path=%s quant=%s error=%s: %s (a runtime API change; the model may load with different defaults)", folder, config.gguf_quant, type(exc).__name__, exc, exc_info=True)
+                log.error("Jevの実行環境が quant・many_mode・binary に対応しないため、省略して再試行します。既定値が変わる場合があります: パス=%s、量子化=%s、エラー=%s: %s", folder, config.gguf_quant, type(exc).__name__, exc, exc_info=True)
                 runtime = module.JevStyleDecisionGGUF(str(folder))
         except Exception as exc:
-            log.error("Jev GGUF model load failed path=%s quant=%s binary=%s error=%s: %s (check the model file, the runtime binary on PATH and free memory)", folder, config.gguf_quant, config.gguf_binary, type(exc).__name__, exc, exc_info=True)
+            log.error("JevのGGUFモデルを読み込めません: パス=%s、量子化=%s、コマンド=%s、エラー=%s: %s（モデルファイル・PATH上の実行コマンド・メモリ残量を確認してください）", folder, config.gguf_quant, config.gguf_binary, type(exc).__name__, exc, exc_info=True)
             raise
         backend = cls(module, runtime)
         backend.stats = {"token_cache_hits": 0, "token_cache_misses": 0}

@@ -36,7 +36,7 @@ class Catalog:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            log.error("catalog folder could not be created path=%s error=%s: %s (disk full, read-only, or the volume is not mounted?)",
+            log.error("リンク情報のフォルダーを作成できません: パス=%s、エラー=%s: %s（容量・書き込み権限・接続状態を確認してください）",
                       self.path.parent, type(exc).__name__, exc, exc_info=True)
             raise
         try:
@@ -45,7 +45,7 @@ class Catalog:
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA foreign_keys=ON")
         except Exception as exc:
-            log.error("catalog database could not be opened path=%s error=%s: %s (corrupt, locked or unreadable catalog file)",
+            log.error("リンク情報のデータベースを開けません: パス=%s、エラー=%s: %s（破損・使用状況・読み取り権限を確認してください）",
                       self.path, type(exc).__name__, exc, exc_info=True)
             raise
         self._has_sqlite_vec = False
@@ -60,7 +60,7 @@ class Catalog:
                 self.conn.enable_load_extension(False)
             except Exception:
                 pass
-            log.error("sqlite_vec unavailable, vector search falls back to a full python scan (~50x slower) path=%s error=%s: %s",
+            log.error("sqlite_vec を利用できないため、Pythonで全件検索します。約50倍遅くなる場合があります: パス=%s、エラー=%s: %s",
                       self.path, type(exc).__name__, exc, exc_info=True)
         self._schema()
         stored = self.meta("mode")
@@ -82,11 +82,11 @@ class Catalog:
                 try:
                     row = conn.execute("SELECT value FROM meta WHERE key='mode'").fetchone()
                 except sqlite3.OperationalError as exc:
-                    log.error("catalog has no mode stored, the file is an old or broken schema path=%s error=%s: %s",
+                    log.error("リンク情報に処理方式がありません。古い形式か破損したファイルです: パス=%s、エラー=%s: %s",
                               path, type(exc).__name__, exc, exc_info=True)
                     return None
         except Exception as exc:
-            log.error("catalog database could not be read path=%s error=%s: %s (corrupt or locked catalog file)",
+            log.error("リンク情報のデータベースを読み込めません: パス=%s、エラー=%s: %s（破損・使用状況を確認してください）",
                       path, type(exc).__name__, exc, exc_info=True)
             raise
         return str(row[0]) if row else None
@@ -149,7 +149,7 @@ class Catalog:
         try:
             self.conn.commit()
         except Exception as exc:
-            log.error("catalog commit failed stage=%s path=%s error=%s: %s (the catalog change is not saved)",
+            log.error("リンク情報の変更を確定できません: 工程=%s、パス=%s、エラー=%s: %s",
                       stage, self.path, type(exc).__name__, exc, exc_info=True)
             raise
 
@@ -175,7 +175,7 @@ class Catalog:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a+") as handle:
             # A second linker run blocks here with no output at all, so say so before waiting.
-            log.info("waiting for the linker lock path=%s", path)
+            log.info("リンク処理のロック解除を待っています: パス=%s", path)
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 yield self
@@ -224,8 +224,8 @@ class Catalog:
             restored += int(self.insert_edge(edge, commit=False))
         self._commit("sync-edges")
         if pending_edges and restored < len(pending_edges):
-            log.warning("stored edges could not be restored during sync restored=%d/%d (their endpoints are missing or their text changed)", restored, len(pending_edges))
-        log.info("catalog synced stage=sync documents=%d edges=%d/%d", documents, restored, len(pending_edges))
+            log.warning("保存済みリンクの一部を復元できません。リンク先の欠落または本文の変更があります: 復元数=%d/%d", restored, len(pending_edges))
+        log.info("リンク情報を同期しました: 文書数=%d、リンク数=%d/%d", documents, restored, len(pending_edges))
 
     def upsert_document(self, document: str, team: str, raw_rel: str, chunks: list[Chunk], page_hashes: dict[str, str] | None = None) -> None:
         page_hashes = page_hashes or {}
@@ -391,9 +391,9 @@ class Catalog:
                 # Leave this batch pending (vectors_ready=0); the next run retries it and
                 # the FTS channels still work meanwhile.
                 self.conn.rollback()
-                log.error("embedding batch failed, vectors left pending stage=embeddings team=%s batch=%d-%d done=%d of %d error=%s: %s (this repeats every run until the endpoint works)",
+                log.error("検索用ベクトルの作成に失敗し、未完了のままです。接続先が復旧するまで毎回再試行します: チーム=%s、範囲=%d-%d、完了=%d、総数=%d、エラー=%s: %s",
                           team, offset, offset + len(batch), done, len(rows), type(exc).__name__, exc, exc_info=True)
-        log.info("embeddings done stage=embeddings team=%s chunks=%d vectors=%d", team, len(rows), done * 3)
+        log.info("検索用ベクトルを作成しました: チーム=%s、分割部分数=%d、ベクトル数=%d", team, len(rows), done * 3)
         return done * 3
 
     def chunks_with_entity(self, entity: str, team: str, exclude_page: str = "") -> list[str]:
@@ -488,7 +488,7 @@ class Catalog:
         try:
             stored = read_json(links_path, default={}).get("edges", [])
         except Exception as exc:
-            log.error("links.json could not be read, stored edges not restored path=%s error=%s: %s", links_path, type(exc).__name__, exc, exc_info=True)
+            log.error("links.json を読めないため、保存済みリンクを復元できません: パス=%s、エラー=%s: %s", links_path, type(exc).__name__, exc, exc_info=True)
             raise
         restored = 0
         for edge in stored:
@@ -496,7 +496,7 @@ class Catalog:
         if commit:
             self._commit("restore-edges")
         if stored and restored < len(stored):
-            message = "stored edges could not be restored, related-page links are lost path=%s restored=%d/%d (their endpoints are missing or their text changed)"
+            message = "保存済みリンクを復元できません。参照先の欠落または本文の変更により、関連リンクが失われます: パス=%s、復元数=%d/%d"
             if restored * 2 < len(stored):
                 log.error(message, links_path, restored, len(stored))
             else:
@@ -542,10 +542,10 @@ class Catalog:
             try:
                 write_json_atomic(target, {"schema_version": 1, "mode": self.meta("mode") or "legacy", "edges": edges})
             except Exception as exc:
-                log.error("links.json write failed stage=links document=%s path=%s edges=%d error=%s: %s (the stored edges are not saved; the next render loses them)",
+                log.error("links.json を保存できません。次回のページ整形でリンクが失われます: 文書=%s、パス=%s、リンク数=%d、エラー=%s: %s",
                           document, target, len(edges), type(exc).__name__, exc, exc_info=True)
                 raise
-            log.info("links written stage=links document=%s edges=%d", document, len(edges))
+            log.info("リンクを書き込みました: 文書=%s、リンク数=%d", document, len(edges))
 
     def delete_document(self, document: str) -> set[str]:
         peers = {str(row[0]) for row in self.conn.execute("SELECT DISTINCT CASE WHEN a.document=? THEN b.document ELSE a.document END FROM edges e JOIN chunks a ON a.chunk_id=e.chunk_a JOIN chunks b ON b.chunk_id=e.chunk_b WHERE a.document=? OR b.document=?", (document, document, document))}

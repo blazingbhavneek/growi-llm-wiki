@@ -43,7 +43,7 @@ def _inside(path: Path, root: Path) -> bool:
     except ValueError:
         # Correct to drop, but until now invisible: an unreadable resolve or a symlink out of the
         # mount is the difference between "the mount is empty" and "the mount is elsewhere".
-        log.debug("scan entry dropped, path escapes the mount root=%s path=%s", root, path)
+        log.debug("入力フォルダー外のため、走査対象から除外します: 入力フォルダー=%s、パス=%s", root, path)
         return False
     return True
 
@@ -62,7 +62,7 @@ def discover_mount(root: Path, errors: dict[str, str]) -> dict[str, os.stat_resu
         except ValueError:
             rel = "."
         # Callers may ignore the errors dict, so the unreadable entry is reported here.
-        log.error("scan entry unreadable path=%s reason=%s error=%s: %s",
+        log.error("走査対象を読み込めません: パス=%s、理由=%s、エラー=%s: %s",
                   path, exc.strerror or "", type(exc).__name__, exc, exc_info=True)
         errors[rel] = "".join(traceback.format_exception(exc))
 
@@ -91,7 +91,7 @@ def scan_mount(root: Path, previous: dict[str, dict[str, object]] | None = None)
         try:
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError as exc:
-            log.error("scan file unreadable file=%s reason=%s error=%s: %s",
+            log.error("走査中にファイルを読み込めません: ファイル=%s、理由=%s、エラー=%s: %s",
                       path, exc.strerror or "", type(exc).__name__, exc, exc_info=True)
             errors[rel] = traceback.format_exc()
             continue
@@ -102,7 +102,7 @@ def scan_mount(root: Path, previous: dict[str, dict[str, object]] | None = None)
     added = sorted(current - known)
     changed = sorted(rel for rel in current & known if str(previous[rel].get("source_sha256", "")) != files[rel].source_sha256)
     if errors:
-        log.warning("scan incomplete errors=%d; delete detection is disabled for this scan", len(errors))
+        log.warning("走査が未完了のため、今回の削除検出を無効にします: エラー件数=%d", len(errors))
     deleted = [] if errors else sorted(known - current)
     return Scan(files, added, changed, deleted, errors)
 

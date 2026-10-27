@@ -91,7 +91,7 @@ async def filter_candidates(catalog: Catalog, model: Any, chunk: Any, selected: 
         target_row = catalog.chunk(chunk.chunk_id)
         if target_row is None:
             # The missing row still raises below; this is the line that names which chunk is gone.
-            log.error("target chunk missing from catalog mode=%s chunk=%s document=%s page=%s", mode, chunk.chunk_id, chunk.document, chunk.page_rel)
+            log.error("対象の分割部分がリンク情報にありません: 方式=%s、分割部分=%s、文書=%s、ページ=%s", mode, chunk.chunk_id, chunk.document, chunk.page_rel)
         target = _view(target_row)
         messages = legacy_edge_messages(target, [_view(row) for row in payload_rows])
         try:
@@ -101,7 +101,7 @@ async def filter_candidates(catalog: Catalog, model: Any, chunk: Any, selected: 
                 result = await model.structured(EdgeSuggestions, messages)
             result = result if isinstance(result, EdgeSuggestions) else EdgeSuggestions.model_validate(result)
         except Exception as exc:
-            log.error("edge model call failed, candidate group dropped mode=%s chunk=%s document=%s candidates=%s error=%s: %s",
+            log.error("リンク判定のモデル呼び出しに失敗したため、候補の組を除外します: 方式=%s、分割部分=%s、文書=%s、候補数=%s、エラー=%s: %s",
                       mode, chunk.chunk_id, chunk.document, [item.chunk_id for item in group], type(exc).__name__, exc, exc_info=True)
             continue
         allowed = {c.chunk_id for c in group}

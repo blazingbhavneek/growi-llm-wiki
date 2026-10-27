@@ -70,19 +70,19 @@ class Llm2JevBackend:
             try: response = self._client.post(self.url, json=payload, headers=headers)
             except httpx.HTTPError as exc:
                 if not attempt:
-                    log.debug("jev llm2jev request retried url=%s attempt=%d error=%s: %s", self.url, attempt + 1, type(exc).__name__, exc)
+                    log.debug("Jevのllm2jevサーバーへの要求を再試行しました: URL=%s、試行=%d、エラー=%s: %s", self.url, attempt + 1, type(exc).__name__, exc)
                     continue
-                log.error("Jev llm2jev endpoint unreachable backend=llm2jev url=%s error=%s: %s", self.url, type(exc).__name__, exc, exc_info=True)
+                log.error("Jevのllm2jevサーバーに接続できません: URL=%s、エラー=%s: %s", self.url, type(exc).__name__, exc, exc_info=True)
                 raise JevUnavailable(f"llm2jev request failed: {exc}") from exc
             if response.status_code >= 500 and not attempt:
-                log.debug("jev llm2jev server error, retrying url=%s status=%d attempt=%d", self.url, response.status_code, attempt + 1)
+                log.debug("Jevのllm2jevサーバーがエラーを返したため再試行します: URL=%s、応答コード=%d、試行=%d", self.url, response.status_code, attempt + 1)
                 continue
             if response.is_error:
-                log.error("Jev llm2jev endpoint returned an error status backend=llm2jev url=%s status=%d state=%s questions=%d", self.url, response.status_code, req.state_id[:12], len(batch))
+                log.error("Jevのllm2jevサーバーがエラーを返しました: URL=%s、応答コード=%d、状態=%s、質問数=%d", self.url, response.status_code, req.state_id[:12], len(batch))
                 raise JevUnavailable(f"llm2jev endpoint HTTP {response.status_code}")
             try: values = self._parse(response.json(), batch)
             except Exception as exc:
-                log.error("Jev llm2jev response is unusable backend=llm2jev url=%s state=%s questions=%d error=%s: %s", self.url, req.state_id[:12], len(batch), type(exc).__name__, str(exc)[:120], exc_info=True)
+                log.error("Jevのllm2jevサーバーの回答を使えません: URL=%s、状態=%s、質問数=%d、エラー=%s: %s", self.url, req.state_id[:12], len(batch), type(exc).__name__, str(exc)[:120], exc_info=True)
                 raise JevUnavailable(f"invalid llm2jev response: {exc}") from exc
             return [self._result(p, value) for p, value in zip(batch, values)]
         raise JevUnavailable("llm2jev request failed after retry")

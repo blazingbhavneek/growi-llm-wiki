@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 
 def _failed(operation: str, target: str, exc: BaseException) -> None:
     """One ERROR per adapter: this layer is the one that knows the document, path or project."""
-    log.error("stage=%s failed %s error=%s: %s", operation, target, type(exc).__name__, exc, exc_info=True)
+    log.error("処理に失敗しました: 工程=%s、対象=%s、エラー=%s: %s", operation, target, type(exc).__name__, exc, exc_info=True)
 
 
 def _project(settings: Any) -> str:

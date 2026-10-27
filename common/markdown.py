@@ -41,7 +41,7 @@ def strip_big_tables(text: str, *, max_rows: int = 40) -> str:
         if len(rows) <= max_rows:
             return table
         # the content loss is silent in the published text, so it has to be visible here
-        log.error("large html table omitted from text rows=%d max_rows=%d characters=%d", len(rows), max_rows, len(table))
+        log.error("大きなHTML表をテキストから省略しました: 行数=%d、行数上限=%d、文字数=%d", len(rows), max_rows, len(table))
         return "<table>[large table omitted]</table>"
 
     return re.sub(r"<table\b[^>]*>.*?</table>", replace, text, flags=re.I | re.S)

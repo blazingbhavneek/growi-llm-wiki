@@ -58,7 +58,7 @@ def _emergency(destination: str, reason: str) -> None:
         return
     _emergency_done.add(destination)
     try:
-        sys.__stderr__.write(f"logging disabled: {destination}: {reason}\n")
+        sys.__stderr__.write(f"ログの保存を停止しました: {destination}: {reason}\n")
         sys.__stderr__.flush()
     except Exception:
         pass  # a broken stderr is best-effort too; never a second logging crash
@@ -146,7 +146,7 @@ def _file_handlers(log_dir: Path, *, run_id: str, settings: Settings) -> list[lo
     """live.log keeps INFO and above (1 MB x 100 files); debug.log keeps everything (10 MB x 100)."""
 
     from publisher.failure_logs import redact_log_text
-    from publisher.progress import LiveJapaneseFormatter
+    from publisher.progress import LiveLogFormatter
 
     class RedactedDebugFormatter(logging.Formatter):
         def format(self, record: logging.LogRecord) -> str:
@@ -154,8 +154,8 @@ def _file_handlers(log_dir: Path, *, run_id: str, settings: Settings) -> list[lo
             return redact_log_text(super().format(copy.copy(record)), settings)
 
     live = _open_log_handler(log_dir / "live.log", level=logging.INFO, max_bytes=1_000_000,
-                             formatter=LiveJapaneseFormatter(run_id=run_id,
-                                                             redact=lambda text: redact_log_text(text, settings)))
+                             formatter=LiveLogFormatter(run_id=run_id,
+                                                        redact=lambda text: redact_log_text(text, settings)))
     debug = _open_log_handler(log_dir / "debug.log", level=logging.DEBUG, max_bytes=10_000_000,
                               formatter=RedactedDebugFormatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     return [handler for handler in (live, debug) if handler is not None]
@@ -164,7 +164,7 @@ def _file_handlers(log_dir: Path, *, run_id: str, settings: Settings) -> list[lo
 def _thread_excepthook(args: Any) -> None:
     """A dying thread is an ERROR record with its traceback in debug.log, not a stderr dump."""
 
-    log.error("uncaught thread error thread=%s", getattr(args.thread, "name", "?"),
+    log.error("スレッドで未処理のエラーが発生しました: スレッド=%s", getattr(args.thread, "name", "?"),
               exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 
 
@@ -285,14 +285,14 @@ def _progress(event: dict[str, Any]) -> None:
         event.pop("current", None)
         event.pop("total", None)
     details = json.dumps(event, ensure_ascii=False, default=str)
-    log.debug(f"[{stage}] {step}{progress} {details}".rstrip())
+    log.debug(f"処理の進捗: 工程={stage}、段階={step}{progress}、詳細={details}".rstrip())
 
 
 def _report(result: dict[str, Any], settings: Settings | None = None) -> int:
     for row in result.get("done", []):
         # stdout JSON is a script contract; the log record is the durable copy.
         print(json.dumps(row, ensure_ascii=False))
-        log.info("processed path=%s status=%s",
+        log.info("処理が完了しました: パス=%s、状態=%s",
                  row.get("path") or row.get("document") or row.get("folder") or "<batch>",
                  row.get("status", "done"))
     failures = result.get("failures", []) + result.get("scan_failures", [])
@@ -302,7 +302,7 @@ def _report(result: dict[str, Any], settings: Settings | None = None) -> int:
         report_failure_summary(settings, failures, result.get("warnings", []))
     else:
         for failure in failures:
-            logging.error("ドキュメントの処理に失敗: %s", failure)
+            logging.error("文書の処理に失敗しました: %s", failure)
     return 1 if failures else 0
 
 
@@ -377,23 +377,23 @@ def cmd_check(args: argparse.Namespace) -> int:
     bad = 0
     for name, url in targets.items():
         if not url:
-            log.info("check %s skipped (not configured)", name)
+            log.info("未設定のため接続確認を省略します: 対象=%s", name)
             continue
         try:
             response = requests.get(url, timeout=5)
-            log.info("check %s status=%s url=%s", name, response.status_code, url)
+            log.info("接続確認: 対象=%s、応答コード=%s、URL=%s", name, response.status_code, url)
             bad += response.status_code >= 400
         except Exception as exc:
-            log.error("check %s unreachable url=%s error=%s: %s", name, url, type(exc).__name__, exc)
+            log.error("接続確認に失敗しました: 対象=%s、URL=%s、エラー=%s: %s", name, url, type(exc).__name__, exc)
             bad += 1
     jev_line, jev_bad = _jev_check(settings)
     if jev_bad:
-        log.error("check jev failed: %s", jev_line)
+        log.error("Jevの接続確認に失敗しました: %s", jev_line)
     else:
-        log.info("check jev %s", jev_line)
+        log.info("Jevの接続確認: %s", jev_line)
     bad += jev_bad
     project = open_project(settings)
-    log.info("data root=%s mount=%s ingest=%s linker=%s", project.root.resolve(), project.mount,
+    log.info("データの保存先: 基準=%s、入力=%s、取り込み=%s、リンク情報=%s", project.root.resolve(), project.mount,
              settings.ingest_mode, "off" if not settings.wiki_linker_enabled else settings.wiki_linker_mode)
     return 1 if bad else 0
 
@@ -444,7 +444,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     try:
         stale = pipeline.republish_if_stale(settings)
         if stale is not None:
-            log.info("growi endpoint or markers changed: full republish %s", stale["run_id"])
+            log.info("GROWIの接続先または識別設定が変わったため、全体を再公開します: %s", stale["run_id"])
             combined["failures"].extend(stale["failures"])
         with worker_lock(project):
             with pipeline._lock(project):
@@ -498,7 +498,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             try:
                 index = build_index(settings, on_progress=on_event)
             except Exception as exc:  # a stale table of contents must not fail a sync
-                log.exception("インデックス処理に失敗")
+                log.exception("目次処理に失敗しました")
                 index = {"done": [], "failures": [f"index: {type(exc).__name__}: {exc}"]}
             combined["done"].extend(index["done"])
             combined["failures"].extend(index["failures"])
@@ -631,7 +631,7 @@ def _run_fast_link(
     except Exception as exc:
         if not accepted:
             result["done"] = []
-        log.exception("ファストリンクに失敗")
+        log.exception("高速リンク処理に失敗しました")
         result["failures"].append(f"fast link: {type(exc).__name__}: {exc}")
     return result
 
@@ -660,7 +660,7 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
                 if continuing else (False, frozenset(), frozenset())
             )
         except Exception as exc:
-            log.exception("fast repair resume inspection failed")
+            log.exception("高速修復の再開状態を確認できません")
             combined["failures"].append(
                 f"fast repair resume inspection: {type(exc).__name__}: {exc}"
             )
@@ -685,18 +685,18 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
             )
             targets = repair.targets(getattr(args, "items", None) or None)
         except Exception as exc:
-            log.exception("ファストリペアのセットアップに失敗")
+            log.exception("高速修復の準備に失敗しました")
             combined["failures"].append(f"fast repair setup: {type(exc).__name__}: {exc}")
             return _report(combined, settings)
 
         if not targets:
-            log.info("fast repair project=%s has no eligible documents", settings.target_name)
+            log.info("高速修復の対象文書はありません: プロジェクト=%s", settings.target_name)
             return _report(combined, settings)
 
         if limit is None:
             progress.add_documents(targets)
         log.info(
-            "fast repair project=%s documents=%d page_limit=%s concurrency=%d",
+            "高速修復を開始します: プロジェクト=%s、文書数=%d、ページ上限=%s、並列数=%d",
             settings.target_name,
             len(targets),
             limit if limit is not None else "all",
@@ -706,19 +706,18 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
         if has_growi:
             if resume_dirty:
                 log.warning(
-                    "continuing interrupted fast repair versions=%s checkpoints=%d "
-                    "without a preflight GROWI pull; accepted pages will be reused",
+                    "中断した高速修復を再開します。GROWIからの事前取り込みを省略し、確定済みページを再利用します: バージョン=%s、再開情報数=%d",
                     ",".join(sorted(resume_versions)),
                     len(resume_page_states),
                 )
             else:
-                log.info("checking GROWI edits before repair")
+                log.info("修復前にGROWIでの編集を確認します")
                 try:
                     pulled = pull_growi_once(settings)
                     combined["done"].extend(pulled.get("done", []))
                     combined["failures"].extend(pulled.get("failures", []))
                 except Exception as exc:
-                    log.exception("fast repair GROWI preflight failed")
+                    log.exception("高速修復前のGROWI確認に失敗しました")
                     combined["failures"].append(
                         f"fast repair preflight: {type(exc).__name__}: {exc}"
                     )
@@ -736,7 +735,7 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
                 break
             try:
                 progress.add_documents([raw_rel])
-                log.info("repairing document path=%s", raw_rel)
+                log.info("文書を修復します: パス=%s", raw_rel)
                 result = repair.repair_document(
                     raw_rel,
                     limit=remaining,
@@ -752,7 +751,7 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
                         progress.mark_completed([raw_rel])
                     continue
                 if has_growi:
-                    log.info("publishing repaired document path=%s", raw_rel)
+                    log.info("修復済み文書を公開します: パス=%s", raw_rel)
                     published = publish_only(
                         settings,
                         only=[raw_rel],
@@ -783,7 +782,7 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
                     continue
                 progress.mark_completed([raw_rel])
             except Exception as exc:
-                log.exception("fast repair failed for %s", raw_rel)
+                log.exception("高速修復に失敗しました: %s", raw_rel)
                 combined["failures"].append(
                     f"{raw_rel}: {type(exc).__name__}: {exc}"
                 )
@@ -870,7 +869,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 )
             }
             for rel, error in discovery.items():
-                log.error("source discovery failed: %s: %s", rel, error)
+                log.error("元文書の走査に失敗しました: %s: %s", rel, error)
             # Parse, plan and build form one bounded train; every ahead worker only
             # fills a content-addressed cache (publisher/ahead.py).
             settings.cache_dir = getattr(settings, "cache_dir", "") or str((project.metadata / "cache").resolve())
@@ -901,7 +900,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                                and skipped_versions.get(row["rel"]) != row["version"]}
                     retry_failed(project, only=args.items or None, versions=targets)
                     attempt = 2
-                    log.info("first pass complete; final retry documents=%d discovery=%d", len(targets), len(discovery))
+                    log.info("初回処理が完了しました。最後の再試行を行います: 文書数=%d、走査エラー数=%d", len(targets), len(discovery))
                     continue
                 paths = result.get("paths", [])
                 skipped_paths = set(result.get("parser_skips", []))
@@ -914,9 +913,9 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                     break
                 if result.get("failures"):
                     if skipped_paths and set(paths) <= skipped_paths:
-                        log.warning("ドキュメントをスキップ: %s", paths)
+                        log.warning("文書の処理を省略します: %s", paths)
                     else:
-                        log.warning("document attempt %d failed: %s", attempt, paths)
+                        log.warning("文書の処理に失敗しました: 試行=%d、パス=%s", attempt, paths)
                     continue
                 combined["done"].extend(result.get("done", []))
                 progress.mark_completed(paths)
@@ -947,7 +946,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 if failed_links:
                     # Linking is attempted first and remains pending for the next sync,
                     # but a linker outage must not withhold successfully built content.
-                    log.info("リンク未完了のドキュメントを先に公開します: %d件", len(failed_links))
+                    log.info("リンク未完了の文書を先に公開します: %d件", len(failed_links))
                     published = pipeline.publish_only(
                         settings,
                         only=failed_links,
@@ -974,14 +973,14 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                     combined["done"].extend(index.get("done", []))
                     combined["failures"].extend(index.get("failures", []))
                 except Exception as exc:
-                    log.exception("インデックス処理に失敗")
+                    log.exception("目次処理に失敗しました")
                     combined["failures"].append(f"index: {type(exc).__name__}: {exc}")
         if recovered:
             print(json.dumps({"recovered_on_final_retry": recovered}, ensure_ascii=False))
-            log.info("recovered on final retry documents=%s", len(recovered))
+            log.info("最後の再試行で復旧しました: 文書数=%s", len(recovered))
         return _report(combined, settings)
     except Exception as exc:
-        log.exception("シンク処理に失敗")
+        log.exception("同期に失敗しました")
         combined["failures"].append(f"shared sync failure: {type(exc).__name__}: {exc}")
         return _report(combined, settings)
     finally:
@@ -1006,7 +1005,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     )
     if result.get("human_sync"):
         print(json.dumps({"human_sync": result["human_sync"]}, ensure_ascii=False, default=str))
-        log.info("human sync captured documents=%s", len(result["human_sync"] or []))
+        log.info("GROWIでの編集を取り込みました: 文書数=%s", len(result["human_sync"] or []))
     return _report(result, settings)
 
 
@@ -1107,7 +1106,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
 
     result = convert(settings, on_progress=_progress)
     print(json.dumps({key: value for key, value in result.items() if key != "failures"}, ensure_ascii=False))
-    log.info("convert done files=%d failed=%d", len(result.get("converted") or []), len(result.get("failed") or []))
+    log.info("変換が完了しました: ファイル数=%d、失敗数=%d", len(result.get("converted") or []), len(result.get("failed") or []))
     _report({"failures": result.get("failures") or result["failed"]}, settings)
     return 1 if result["failed"] else 0
 
@@ -1153,7 +1152,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
         progress.on_event(event)
         _progress(event)
 
-    log.info("publish project=%s allow_unlinked=True; linking skipped", settings.target_name)
+    log.info("リンク処理を省略して公開します: プロジェクト=%s、未リンクの公開を許可", settings.target_name)
     with closing(SyncProgress()) as progress:
         result = run(
             Config(
@@ -1168,7 +1167,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
             on_progress=on_event,
         )
     log.info(
-        "publish completed documents=%s pages=%s indexes=%s failures=%d",
+        "公開が完了しました: 文書数=%s、ページ数=%s、目次数=%s、失敗数=%d",
         stats.get("documents", 0),
         stats.get("pages", 0),
         stats.get("indexed", stats.get("indexes", 0)),
@@ -1241,9 +1240,9 @@ def cmd_link(args: argparse.Namespace) -> int:
         model, embedder = linker_cli._model_and_embedder(settings, project, Path(rel).parent.as_posix())
         result = run_async_blocking(link_document(project, rel, model=model, embedder=embedder, settings=settings, on_progress=_progress))
         print(json.dumps({"touched": result.touched_documents}, ensure_ascii=False))
-        log.info("relink done touched=%s", len(result.touched_documents))
+        log.info("リンクの再処理が完了しました: 更新数=%s", len(result.touched_documents))
         if result.touched_documents:
-            log.info("更新したドキュメントをGROWIへ反映するには `python main.py publish` を実行してください")
+            log.info("更新した文書をGROWIに反映するには `python main.py publish` を実行してください")
     return 0
 
 
@@ -1388,14 +1387,14 @@ def main() -> int:
             handlers = _file_handlers(log_dir, run_id=run_id, settings=settings)
         except OSError as exc:
             # An unusable log folder is a logging problem, not a reason to stop the run.
-            _emergency("log folder", f"{type(exc).__name__}: {exc}")
+            _emergency("ログフォルダー", f"{type(exc).__name__}: {exc}")
         root = stack.enter_context(file_logging(handlers))
         for record in pending:
             root.handle(record)
         # Nothing logs to the terminal: it keeps tqdm, stdout contracts and these notices.
         # file_logging supplies a NullHandler when neither file can be opened.
         reset_failure_summaries(settings)
-        log.info("run started project=%s run=%s command=%s", settings.target_name, run_id, args.command)
+        log.info("実行を開始します: プロジェクト=%s、実行ID=%s、コマンド=%s", settings.target_name, run_id, args.command)
         # -v means "show our debug in debug.log", not third-party HTTP/client chatter.
         for noisy in (
             "asyncio",
@@ -1423,13 +1422,13 @@ def main() -> int:
                         code = int(args.fn(args) or 0)
             except Exception as exc:
                 # The reason goes to live.log, the traceback to debug.log, never the terminal.
-                log.error("command failed command=%s error=%s: %s",
+                log.error("コマンドの実行に失敗しました: コマンド=%s、エラー=%s: %s",
                           args.command, type(exc).__name__, exc, exc_info=True)
                 code = 1
             outcome = "ok" if code == 0 else f"exit={code}"
             return code
         finally:
-            log.info("run finished project=%s run=%s command=%s outcome=%s",
+            log.info("実行が終了しました: プロジェクト=%s、実行ID=%s、コマンド=%s、結果=%s",
                      settings.target_name, run_id, args.command, outcome)
 
 

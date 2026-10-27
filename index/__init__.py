@@ -55,19 +55,19 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
         # growi_url="" is only harmless for a metadata-only run; a publish run cannot reach GROWI.
         if cfg.publish:
             log.error(
-                "index settings fallback built growi_url=(empty) publish=True out=%s (GROWI publishing cannot work without GROWI_URL; pass --config)",
+                "GROWI_URL が未設定のため、公開用の目次設定ではGROWIに公開できません。--config を指定してください: 出力先=%s",
                 out,
             )
         else:
             log.debug(
-                "index settings fallback built growi_url=(empty) publish=False out=%s (no project settings were passed)",
+                "プロジェクト設定が指定されていないため、GROWIに公開しない目次設定を作成しました: 出力先=%s",
                 out,
             )
         try:
             layout.mount.mkdir(exist_ok=True)
         except OSError as exc:
             log.error(
-                "mount folder could not be created path=%s error=%s: %s (disk full, read-only, or the volume is not mounted?)",
+                "入力フォルダーを作成できません: パス=%s、エラー=%s: %s（容量・書き込み権限・接続状態を確認してください）",
                 layout.mount,
                 type(exc).__name__,
                 exc,

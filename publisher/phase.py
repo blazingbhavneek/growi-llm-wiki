@@ -62,7 +62,7 @@ def assemble(root: Path, documents: tuple[str, ...] = ()) -> Result:
         if target.exists() and any(target.glob("*.md")):
             continue
         if not generated.is_dir():
-            log.warning("document has no generated state and was not assembled document=%s generated=%s",
+            log.warning("生成状態がないため、文書を組み立てませんでした: 文書=%s、生成先=%s",
                         document, generated)
             continue
         target.mkdir(parents=True, exist_ok=True)

@@ -222,8 +222,7 @@ def model_pair(config: WikiConfig) -> ModelPair:
     # One line per run so a later 401 or timeout can be attributed to one of these endpoints.
     # ``fallback`` means the judge/writer key was blank and the chat key is being reused.
     log.info(
-        "fast model endpoints writer=%s writer_model=%s judge=%s judge_model=%s "
-        "writer_key=%s judge_key=%s",
+        "高速処理のモデル設定: 本文生成の接続先=%s、生成モデル=%s、確認の接続先=%s、確認モデル=%s、生成用キー=%s、確認用キー=%s",
         writer_config.chat_base_url,
         writer_config.chat_model,
         judge_config.chat_base_url,

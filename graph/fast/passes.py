@@ -67,7 +67,7 @@ async def bounded_as_completed(
             for result in results:
                 if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
                     log.error(
-                        "fast model pass cancelled with a failed in-flight item operation=%s error=%s: %s",
+                        "高速モデル処理の中止中に実行中の項目が失敗しました: 処理=%s、エラー=%s: %s",
                         getattr(operation, "__qualname__", repr(operation)),
                         type(result).__name__,
                         result,

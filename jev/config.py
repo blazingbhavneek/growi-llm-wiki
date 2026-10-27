@@ -39,7 +39,7 @@ class JevConfig:
         get = env.get
         backend = (get("WIKI_JEV_BACKEND") or "shisa").strip().lower()
         if not (get("WIKI_JEV_BACKEND") or "").strip():
-            log.warning("Jev backend is not configured setting=WIKI_JEV_BACKEND using=%s (this run judges with that backend; set WIKI_JEV_BACKEND to the one the deployment serves)", backend)
+            log.warning("WIKI_JEV_BACKEND が未設定のため、指定の実行方式を使います: 方式=%s。接続先に合う WIKI_JEV_BACKEND を設定してください", backend)
         base, local = get("WIKI_JEV_BASE_URL", ""), get("WIKI_JEV_LOCAL_PATH", "")
         # hosted = the vanilla /v1/systemone API (stock llm2jev over sglang/vllm);
         # llm2jev = the custom batched /score scorer.
@@ -78,30 +78,30 @@ class JevConfig:
                                   else "WIKI_JEV_LLM2JEV_CONCURRENCY", 20),
         )
         if backend not in {"torch", "gguf", "hosted", "llm2jev", "shisa"}:
-            log.error("Jev setting is not valid setting=WIKI_JEV_BACKEND value=%r valid=torch,gguf,hosted,llm2jev,shisa", backend)
+            log.error("WIKI_JEV_BACKEND の値が不正です: 値=%r、指定可能=torch,gguf,hosted,llm2jev,shisa", backend)
             raise ValueError("WIKI_JEV_BACKEND must be torch, gguf, hosted, llm2jev or shisa")
         if fields["device"] not in {"auto", "cuda", "mps", "cpu"}:
-            log.error("Jev setting is not valid setting=WIKI_JEV_DEVICE value=%r valid=auto,cuda,mps,cpu", fields["device"])
+            log.error("WIKI_JEV_DEVICE の値が不正です: 値=%r、指定可能=auto,cuda,mps,cpu", fields["device"])
             raise ValueError("WIKI_JEV_DEVICE must be auto, cuda, mps or cpu")
         if fields["dtype"] not in {"float32", "bfloat16", "float16"}:
-            log.error("Jev setting is not valid setting=WIKI_JEV_DTYPE value=%r valid=float32,bfloat16,float16", fields["dtype"])
+            log.error("WIKI_JEV_DTYPE の値が不正です: 値=%r、指定可能=float32,bfloat16,float16", fields["dtype"])
             raise ValueError("WIKI_JEV_DTYPE must be float32, bfloat16 or float16")
         if fields["gguf_many_mode"] not in {"exact", "batched"}:
-            log.error("Jev setting is not valid setting=WIKI_JEV_GGUF_MANY_MODE value=%r valid=exact,batched", fields["gguf_many_mode"])
+            log.error("WIKI_JEV_GGUF_MANY_MODE の値が不正です: 値=%r、指定可能=exact,batched", fields["gguf_many_mode"])
             raise ValueError("WIKI_JEV_GGUF_MANY_MODE must be exact or batched")
         for key in ("timeout", "max_batch_requests", "record_max", "max_batch_tokens", "token_cache_mb", "share_state_max_forks", "http_concurrency"):
             if fields[key] <= 0:
-                log.error("Jev setting is not positive setting=WIKI_JEV_%s value=%s", key.upper(), fields[key])
+                log.error("Jevの設定が正の数ではありません: 設定=WIKI_JEV_%s、値=%s", key.upper(), fields[key])
                 raise ValueError(f"WIKI_JEV_{key.upper()} must be positive")
         if fields["batch_wait_ms"] < 0 or fields["stats_seconds"] < 0:
-            log.error("Jev setting is negative setting=WIKI_JEV_BATCH_WAIT_MS,WIKI_JEV_STATS_SECONDS batch_wait_ms=%s stats_seconds=%s", fields["batch_wait_ms"], fields["stats_seconds"])
+            log.error("Jevの時間設定が負の値です: WIKI_JEV_BATCH_WAIT_MS=%s、WIKI_JEV_STATS_SECONDS=%s", fields["batch_wait_ms"], fields["stats_seconds"])
             raise ValueError("WIKI_JEV_BATCH_WAIT_MS and WIKI_JEV_STATS_SECONDS must be non-negative")
         if backend in {"hosted", "llm2jev", "shisa"}:
             if not base:
-                log.warning("Jev endpoint is not configured setting=WIKI_JEV_BASE_URL backend=%s (every Jev request fails until it names the server)", backend)
+                log.warning("WIKI_JEV_BASE_URL が未設定のため、Jevへの要求は失敗します: 実行方式=%s", backend)
             if not fields["api_key"]:
-                log.warning("Jev API key is not configured setting=WIKI_JEV_API_KEY backend=%s (requests are sent without an Authorization header)", backend)
-        log.info("Jev config resolved backend=%s model=%s device=%s dtype=%s endpoint=%s max_batch_requests=%d max_batch_tokens=%d batch_wait_ms=%d record=%s", fields["backend"], fields["model"], fields["device"], fields["dtype"], base or "-", fields["max_batch_requests"], fields["max_batch_tokens"], fields["batch_wait_ms"], fields["record_path"] or "-")
+                log.warning("WIKI_JEV_API_KEY が未設定です。認証ヘッダーなしで要求を送信します: 実行方式=%s", backend)
+        log.info("Jevの設定を決定しました: 実行方式=%s、モデル=%s、実行装置=%s、データ型=%s、接続先=%s、一括要求上限=%d、一括トークン上限=%d、待機時間ms=%d、記録先=%s", fields["backend"], fields["model"], fields["device"], fields["dtype"], base or "-", fields["max_batch_requests"], fields["max_batch_tokens"], fields["batch_wait_ms"], fields["record_path"] or "-")
         return cls(**fields)
 
     @classmethod
@@ -113,7 +113,7 @@ class JevConfig:
         try:
             concurrency = int(configured)
         except (TypeError, ValueError) as exc:
-            log.error("Jev setting is not an integer setting=wiki_jev_http_concurrency value=%r error=%s: %s", configured, type(exc).__name__, exc, exc_info=True)
+            log.error("wiki_jev_http_concurrency が整数ではありません: 値=%r、エラー=%s: %s", configured, type(exc).__name__, exc, exc_info=True)
             raise
         resolved = replace(
             config,
@@ -133,7 +133,7 @@ class JevConfig:
         )
         if resolved.backend not in {"torch", "gguf", "hosted", "llm2jev", "shisa"}:
             # Project settings are applied after from_env, so they skip every WIKI_JEV_* check.
-            log.error("Jev setting is not valid setting=wiki_jev_backend value=%r valid=torch,gguf,hosted,llm2jev,shisa (the engine cannot be built from this backend)", resolved.backend)
+            log.error("wiki_jev_backend の値が不正なため、Jevを準備できません: 値=%r、指定可能=torch,gguf,hosted,llm2jev,shisa", resolved.backend)
         return resolved
 
 
@@ -143,7 +143,7 @@ def _int(get, name, default):
         return int(value)
     except ValueError as exc:
         # The rejected text is dropped by the raise below, so name it here.
-        log.error("Jev setting is not an integer setting=%s value=%r error=%s: %s", name, value, type(exc).__name__, exc, exc_info=True)
+        log.error("Jevの設定が整数ではありません: 設定=%s、値=%r、エラー=%s: %s", name, value, type(exc).__name__, exc, exc_info=True)
         raise ValueError(f"{name} must be an integer") from exc
 
 

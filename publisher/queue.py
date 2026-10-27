@@ -72,7 +72,7 @@ def _connect(project: Project):
     try:
         conn = sqlite3.connect(project.queue_database, timeout=30)
     except sqlite3.Error as exc:
-        log.error("queue database open failed file=%s error=%s: %s",
+        log.error("待機処理のデータベースを開けません: ファイル=%s、エラー=%s: %s",
                   project.queue_database, type(exc).__name__, exc, exc_info=True)
         raise
     conn.row_factory = sqlite3.Row
@@ -140,7 +140,7 @@ def _connect(project: Project):
         yield conn
         conn.commit()
     except sqlite3.Error as exc:
-        log.error("queue database read/write failed file=%s error=%s: %s",
+        log.error("待機処理のデータベースを読み書きできません: ファイル=%s、エラー=%s: %s",
                   project.queue_database, type(exc).__name__, exc, exc_info=True)
         conn.rollback()
         raise
@@ -198,7 +198,7 @@ def _docx_similarity(old_rel: str, old: bytes, new_rel: str, new: bytes) -> floa
     try:
         return SequenceMatcher(None, _docx_text(old), _docx_text(new), autojunk=False).ratio()
     except Exception as exc:
-        log.error("docx move detection disabled for this pair old=%s new=%s error=%s: %s",
+        log.error("この組のDOCX移動検出を無効にします: 変更前=%s、変更後=%s、エラー=%s: %s",
                   old_rel, new_rel, type(exc).__name__, exc, exc_info=True)
         return 0.0
 
@@ -541,7 +541,7 @@ def _resumable_transaction(project: Project) -> dict[str, Any] | None:
     try:
         base = last_good(project)
     except Exception as exc:
-        log.error("resume check failed, last-good commit is unknown and work will restart root=%s error=%s: %s",
+        log.error("再開確認に失敗しました。前回の正常なコミットが不明なため、処理を最初からやり直します: 保存先=%s、エラー=%s: %s",
                   project.root, type(exc).__name__, exc, exc_info=True)
         return None
     with _connect(project) as conn:
@@ -555,7 +555,7 @@ def _resumable_transaction(project: Project) -> dict[str, Any] | None:
         try:
             exists = candidate_project(project, str(data.get("operation_id") or "")).root.exists()
         except (ValueError, OSError) as exc:
-            log.error("candidate worktree unreadable, left behind on disk and not resumable operation=%s error=%s: %s",
+            log.error("候補の作業ツリーを読めません。ディスクに残り、再開もできません: 操作=%s、エラー=%s: %s",
                       data.get("operation_id"), type(exc).__name__, exc, exc_info=True)
             continue
         if exists:
@@ -597,7 +597,7 @@ def _adopt_resumable_orphan(project: Project) -> str | None:
                 continue
             candidates.append((staged.root.stat().st_mtime_ns, operation_id))
         except (OSError, subprocess.CalledProcessError, ValueError) as exc:
-            log.error("candidate inspection failed, worktree left behind and resume restarts from scratch operation=%s error=%s: %s",
+            log.error("候補の確認に失敗しました。作業ツリーは残り、再開時は最初からやり直します: 操作=%s、エラー=%s: %s",
                       operation_id, type(exc).__name__, exc, exc_info=True)
             continue
     if not candidates:
@@ -622,7 +622,7 @@ def _prune_orphan_candidates(project: Project, *, keep: str | None = None) -> No
         try:
             remove_candidate(project, operation_id)
         except (ValueError, OSError) as exc:
-            log.error("candidate worktree could not be removed, left behind on disk operation=%s error=%s: %s",
+            log.error("候補の作業ツリーを削除できません。ディスクに残っています: 操作=%s、エラー=%s: %s",
                       operation_id, type(exc).__name__, exc, exc_info=True)
             continue
 
@@ -642,7 +642,7 @@ def recover(project: Project, settings: Any | None = None, *, preserve_operation
         transactions = list(conn.execute("SELECT * FROM transactions ORDER BY started_at"))
         jobs = [_job_from_row(row) for row in conn.execute("SELECT * FROM jobs")]
     if any(str(row["phase"]) == "publishing" for row in transactions) and settings is None:
-        log.error("recovery refused, publisher settings are missing for an interrupted GROWI publication root=%s", project.root)
+        log.error("中断したGROWI公開の設定がないため、復旧できません: 保存先=%s", project.root)
         raise RuntimeError("publisher settings are required to recover an interrupted GROWI publication")
     if transactions:
         from .pipeline import candidate_publication_complete, restore_publication
@@ -654,13 +654,13 @@ def recover(project: Project, settings: Any | None = None, *, preserve_operation
             staged = candidate_project(project, operation_id)
             if phase == "restored":
                 if not commit or last_good(project) != commit:
-                    log.error("cannot recover publication operation=%s error=restored commit is missing commit=%s", operation_id, commit)
+                    log.error("復元先のコミットがないため、公開を復旧できません: 操作=%s、コミット=%s", operation_id, commit)
                     raise RuntimeError(f"cannot recover publication {operation_id}: restored commit is missing")
                 _finish_transaction(project, operation_id)
                 continue
             if phase == "restoring" and last_good(project) != str(transaction["base_commit"]):
                 if not candidate_publication_complete(settings, project):
-                    log.error("cannot recover publication operation=%s error=restored state is incomplete base=%s", operation_id, transaction["base_commit"])
+                    log.error("復元先の状態が不完全なため、公開を復旧できません: 操作=%s、基準=%s", operation_id, transaction["base_commit"])
                     raise RuntimeError(f"cannot recover publication {operation_id}: restored state is incomplete")
                 _finish_transaction(project, operation_id)
                 continue
@@ -690,12 +690,12 @@ def recover(project: Project, settings: Any | None = None, *, preserve_operation
                 continue
             if last_good(project) != str(transaction["base_commit"]):
                 # A publishing operation may have written pages from that older base.
-                log.error("cannot recover publication operation=%s error=last-good changed since the operation base=%s", operation_id, transaction["base_commit"])
+                log.error("開始時から正常な確定状態が変わったため、公開を復旧できません: 操作=%s、開始時の基準=%s", operation_id, transaction["base_commit"])
                 raise RuntimeError(f"cannot recover publication {operation_id}: last-good changed")
             if phase in {"publishing", "restoring"}:
                 if not staged.root.exists():
                     if not commit:
-                        log.error("cannot recover publication operation=%s error=candidate commit is missing phase=%s", operation_id, phase)
+                        log.error("候補のコミットがないため、公開を復旧できません: 操作=%s、工程=%s", operation_id, phase)
                         raise RuntimeError(f"cannot recover publication {operation_id}: candidate commit is missing")
                     staged = reopen_candidate(project, operation_id, commit)
                 if commit and candidate_is_clean(staged, commit) and candidate_publication_complete(settings, staged):
@@ -1170,7 +1170,7 @@ def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool
                 if on_event:
                     on_event({"stage": "history", "step": "rollback", "base_commit": base})
     except Exception as exc:
-        log.exception("operation=%s stage=operation failed error=%s: %s", operation_id, type(exc).__name__, exc)
+        log.exception("操作の実行に失敗しました: 操作=%s、エラー=%s: %s", operation_id, type(exc).__name__, exc)
         recovery_error = ""
         if publishing:
             try:
@@ -1181,7 +1181,7 @@ def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool
                 _transaction(project, operation_id, base, "restored", restored)
                 publishing = False
             except Exception as restore_exc:
-                log.exception("operation=%s stage=recovery failed error=%s: %s", operation_id, type(restore_exc).__name__, restore_exc)
+                log.exception("操作の復旧に失敗しました: 操作=%s、エラー=%s: %s", operation_id, type(restore_exc).__name__, restore_exc)
                 recovery_error = f"; recovery: {type(restore_exc).__name__}: {restore_exc}"
         prefix = "recovery required: " if publishing else ""
         error = f"{prefix}{type(exc).__name__}: {exc}{recovery_error}"
@@ -1248,9 +1248,9 @@ def work_once(settings: Any, *, on_event: Any = None, continue_run: bool = False
                 "failures": list(index.get("failures", [])),
             }
             if result["index"]["failures"]:
-                log.error("index reconcile reported failures after promote failures=%s", "; ".join(result["index"]["failures"]))
+                log.error("候補反映後の目次調整で失敗が報告されました: 失敗内容=%s", "; ".join(result["index"]["failures"]))
         except Exception as exc:
-            log.error("index reconcile failed after promote error=%s: %s", type(exc).__name__, exc, exc_info=True)
+            log.error("候補反映後の目次調整に失敗しました: エラー=%s: %s", type(exc).__name__, exc, exc_info=True)
             result["index"] = {
                 "updated": 0,
                 "failures": [f"index: {type(exc).__name__}: {exc}"],
@@ -1267,7 +1267,7 @@ def worker_lock(project: Project):
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            log.error("queue worker lock held by another worker path=%s error=%s: %s",
+            log.error("別の作業処理が待機処理のロックを保持しています: パス=%s、エラー=%s: %s",
                       path, type(exc).__name__, exc, exc_info=True)
             raise RuntimeError("queue worker already running") from exc
         try:
@@ -1307,11 +1307,11 @@ def serve(
             try:
                 result = scan(settings, only=only, settle_seconds=interval, force=force and first)
                 if result.get("errors"):
-                    log.error("scan reported %d unreadable paths, delete detection skipped", len(result["errors"]))
+                    log.error("読み込めないパスが%d件あるため、削除検出を省略します", len(result["errors"]))
                 if first or any(result.get(key) for key in ("added", "updated", "deleted", "cancelled", "moved")):
                     emit("scan", result)
             except Exception as exc:
-                log.error("watch scan failed, mount changes are not being queued error=%s: %s",
+                log.error("監視中の走査に失敗しました。入力元の変更を待機一覧に登録できません: エラー=%s: %s",
                           type(exc).__name__, exc, exc_info=True)
                 emit("scan-error", f"{type(exc).__name__}: {exc}")
             first = False
@@ -1347,7 +1347,7 @@ def serve(
 
                             emit("index", build_index(settings, on_progress=on_event))
                         except Exception as exc:
-                            log.error("watch index reconcile failed error=%s: %s", type(exc).__name__, exc, exc_info=True)
+                            log.error("監視中の目次調整に失敗しました: エラー=%s: %s", type(exc).__name__, exc, exc_info=True)
                             emit("index-error", f"{type(exc).__name__}: {exc}")
                     scan(settings, only=only, settle_seconds=interval, verify_content=True)
                     next_growi = time.monotonic() + growi_interval

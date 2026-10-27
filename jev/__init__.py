@@ -17,7 +17,7 @@ def get_engine(config=None):
         if _engine is None:
             config = config or JevConfig.from_env()
             from .backends import make_backend
-            log.info("Jev engine creating backend=%s model=%s device=%s endpoint=%s (the first model load can take minutes)", config.backend, config.model, config.device, config.base_url or "-")
+            log.info("Jevを準備しています。初回のモデル読み込みには数分かかる場合があります: 実行方式=%s、モデル=%s、実行装置=%s、接続先=%s", config.backend, config.model, config.device, config.base_url or "-")
             _engine = JevEngine(make_backend(config), config)
         return _engine
 

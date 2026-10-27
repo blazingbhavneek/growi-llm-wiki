@@ -102,12 +102,12 @@ class HostedBackend:
             try: response = self._client.post(self.url, json=payload, headers=headers)
             except httpx.HTTPError as exc:
                 if not attempt:
-                    log.debug("jev hosted request retried url=%s attempt=%d error=%s: %s", self.url, attempt + 1, type(exc).__name__, exc)
+                    log.debug("Jevのhostedサーバーへの要求を再試行しました: URL=%s、試行=%d、エラー=%s: %s", self.url, attempt + 1, type(exc).__name__, exc)
                     continue
-                log.error("Jev hosted endpoint unreachable backend=hosted url=%s error=%s: %s", self.url, type(exc).__name__, exc, exc_info=True)
+                log.error("Jevのhostedサーバーに接続できません: URL=%s、エラー=%s: %s", self.url, type(exc).__name__, exc, exc_info=True)
                 raise JevUnavailable(f"hosted request failed: {exc}") from exc
             if response.status_code >= 500 and not attempt:
-                log.debug("jev hosted server error, retrying url=%s status=%d attempt=%d", self.url, response.status_code, attempt + 1)
+                log.debug("Jevのhostedサーバーがエラーを返したため再試行します: URL=%s、応答コード=%d、試行=%d", self.url, response.status_code, attempt + 1)
                 continue
             return response
         raise JevUnavailable("hosted request failed after retry")
@@ -121,7 +121,7 @@ class HostedBackend:
         questions = {f"q{i}": self._question(p.request.question) for i, p in enumerate(chunk)}
         response = self._send({"state": chunk[0].request.state, "questions": questions})
         if response.is_error:
-            log.error("Jev hosted endpoint returned an error status backend=hosted url=%s status=%d state=%s questions=%d", self.url, response.status_code, chunk[0].request.state_id[:12], len(chunk))
+            log.error("Jevのhostedサーバーがエラーを返しました: URL=%s、応答コード=%d、状態=%s、質問数=%d", self.url, response.status_code, chunk[0].request.state_id[:12], len(chunk))
             raise JevUnavailable(f"hosted endpoint HTTP {response.status_code}")
         try:
             body = response.json()
@@ -131,7 +131,7 @@ class HostedBackend:
             return [self._parse(chunk[i].request.question, answers[f"q{i}"], share) for i in range(len(chunk))]
         except JevUnavailable: raise
         except Exception as exc:
-            log.error("Jev hosted response is unusable backend=hosted url=%s state=%s questions=%d error=%s: %s", self.url, chunk[0].request.state_id[:12], len(chunk), type(exc).__name__, str(exc)[:120], exc_info=True)
+            log.error("Jevのhostedサーバーの回答を使えません: URL=%s、状態=%s、質問数=%d、エラー=%s: %s", self.url, chunk[0].request.state_id[:12], len(chunk), type(exc).__name__, str(exc)[:120], exc_info=True)
             raise JevUnavailable(f"invalid hosted response: {exc}") from exc
 
     @staticmethod
@@ -148,7 +148,7 @@ class HostedBackend:
             if math.isfinite(value) and 0 <= value <= 1: return value
         except (TypeError, ValueError): pass
         if provided is not None:
-            log.error("Jev hosted server confidence is unusable backend=hosted value=%s action=local entropy scoring", repr(provided)[:120])
+            log.error("Jevのhostedサーバーの信頼度を使えないため、ローカルでエントロピーを計算します: 値=%s", repr(provided)[:120])
         entropy = -sum(p * math.log(p) for p in probs if p > 0)
         if len(probs) < 2: return 1.0 if probs and probs[0] >= 1 else 0.0
         return min(1.0, max(0.0, 1 - entropy / math.log(len(probs))))

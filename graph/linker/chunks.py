@@ -240,7 +240,7 @@ def _meta_from_json(value: dict[str, Any]) -> ChunkMeta:
     try:
         return ChunkMeta.model_validate(value)
     except Exception as exc:
-        log.error("stored chunk metadata is unusable, the chunk looks cached but carries nothing chunk=%s error=%s: %s",
+        log.error("分割部分の保存情報を使えません。保存済みとして扱われていますが内容がありません: 分割部分=%s、エラー=%s: %s",
                   value.get("chunk_id", "") if isinstance(value, dict) else "", type(exc).__name__, exc, exc_info=True)
         return ChunkMeta()
 
@@ -278,7 +278,7 @@ def snapshot_originals(doc_dir: Path) -> dict[str, str]:
             try:
                 return {page.name: short_hash(page.read_text(encoding="utf-8"), 64) for page in existing}
             except Exception as exc:
-                log.error("snapshot pages could not be read stage=snapshot path=%s error=%s: %s", originals, type(exc).__name__, exc, exc_info=True)
+                log.error("ページの保存用コピーを読み込めません: パス=%s、エラー=%s: %s", originals, type(exc).__name__, exc, exc_info=True)
                 raise
     if originals.exists():
         shutil.rmtree(originals)
@@ -289,7 +289,7 @@ def snapshot_originals(doc_dir: Path) -> dict[str, str]:
             text = page.read_text(encoding="utf-8")
             write_text_atomic(originals / page.name, text)
         except Exception as exc:
-            log.error("snapshot page could not be written stage=snapshot path=%s error=%s: %s", originals / page.name, type(exc).__name__, exc, exc_info=True)
+            log.error("ページの保存用コピーを書き込めません: パス=%s、エラー=%s: %s", originals / page.name, type(exc).__name__, exc, exc_info=True)
             raise
         result[page.name] = short_hash(text, 64)
     return result
@@ -349,7 +349,7 @@ async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str,
                     artifact_dir.mkdir(parents=True, exist_ok=True)
                     write_text_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}.prompt.md", prompt.render())
                 except Exception as exc:
-                    log.error("describe prompt artifact could not be written stage=describe chunk=%s document=%s path=%s error=%s: %s (an optional artifact aborts the whole describe pass)",
+                    log.error("解析用の指示を保存できないため、解析全体が中断します: 分割部分=%s、文書=%s、パス=%s、エラー=%s: %s",
                               item.chunk_id, item.document, artifact_dir, type(exc).__name__, exc, exc_info=True)
                     raise
             async def describe(target=item, request=prompt):
@@ -365,20 +365,20 @@ async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str,
             calls += 1
             if error:
                 fallbacks += 1
-                log.error("chunk metadata call failed after retry stage=describe chunk=%s document=%s page=%s error=%s: %s (the chunk keeps a degraded 300-character summary)",
+                log.error("再試行後も分割部分を解析できません。300文字の簡易要約を使います: 分割部分=%s、文書=%s、ページ=%s、エラー=%s: %s",
                           item.chunk_id, item.document, item.page_rel, type(error).__name__, error, exc_info=True)
                 if artifact_dir:
                     try:
                         write_text_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}-error.txt", f"{type(error).__name__}: {error}")
                     except Exception as exc:
-                        log.error("describe error artifact could not be written stage=describe chunk=%s path=%s error=%s: %s (an optional artifact aborts the whole describe pass and orphans the in-flight describe tasks)",
+                        log.error("解析エラーを保存できないため、解析全体が中断します。実行中の解析は管理から外れます: 分割部分=%s、パス=%s、エラー=%s: %s",
                                   item.chunk_id, artifact_dir, type(exc).__name__, exc, exc_info=True)
                         raise
             if artifact_dir:
                 try:
                     write_json_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}.json", item.meta)
                 except Exception as exc:
-                    log.error("describe result artifact could not be written stage=describe chunk=%s path=%s error=%s: %s (an optional artifact aborts the whole describe pass)",
+                    log.error("解析結果を保存できないため、解析全体が中断します: 分割部分=%s、パス=%s、エラー=%s: %s",
                               item.chunk_id, artifact_dir, type(exc).__name__, exc, exc_info=True)
                     raise
         processed: list[Chunk] = []
@@ -409,7 +409,7 @@ async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str,
                     artifact_dir.mkdir(parents=True, exist_ok=True)
                     write_text_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}.prompt.md", prompt.render())
                 except Exception as exc:
-                    log.error("describe prompt artifact could not be written stage=describe chunk=%s document=%s path=%s error=%s: %s (an optional artifact aborts the whole describe pass)",
+                    log.error("解析用の指示を保存できないため、解析全体が中断します: 分割部分=%s、文書=%s、パス=%s、エラー=%s: %s",
                               item.chunk_id, item.document, artifact_dir, type(exc).__name__, exc, exc_info=True)
                     raise
             calls += 1
@@ -419,20 +419,20 @@ async def describe_all(chunks: list[Chunk], *, model: Any, output_language: str,
             except Exception as exc:
                 item.meta = ChunkMeta(summary=item.model_text[:300])
                 fallbacks += 1
-                log.error("chunk metadata call failed after retry stage=describe chunk=%s document=%s page=%s error=%s: %s (the chunk keeps a degraded 300-character summary)",
+                log.error("再試行後も分割部分を解析できません。300文字の簡易要約を使います: 分割部分=%s、文書=%s、ページ=%s、エラー=%s: %s",
                           item.chunk_id, item.document, item.page_rel, type(exc).__name__, exc, exc_info=True)
                 if artifact_dir:
                     try:
                         write_text_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}-error.txt", f"{type(exc).__name__}: {exc}")
                     except Exception as write_exc:
-                        log.error("describe error artifact could not be written stage=describe chunk=%s path=%s error=%s: %s (an optional artifact aborts the whole describe pass)",
+                        log.error("解析エラーを保存できないため、解析全体が中断します: 分割部分=%s、パス=%s、エラー=%s: %s",
                                   item.chunk_id, artifact_dir, type(write_exc).__name__, write_exc, exc_info=True)
                         raise
             if artifact_dir:
                 try:
                     write_json_atomic(artifact_dir / f"meta-{item.ordinal}-{Path(item.filename).stem}.json", item.meta)
                 except Exception as exc:
-                    log.error("describe result artifact could not be written stage=describe chunk=%s path=%s error=%s: %s (an optional artifact aborts the whole describe pass)",
+                    log.error("解析結果を保存できないため、解析全体が中断します: 分割部分=%s、パス=%s、エラー=%s: %s",
                               item.chunk_id, artifact_dir, type(exc).__name__, exc, exc_info=True)
                     raise
         replaced = {normalize_name(name) for entity in item.entities for name in entity.replaces}

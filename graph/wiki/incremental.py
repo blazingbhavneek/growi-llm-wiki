@@ -84,7 +84,7 @@ def line_hunks(old: Sequence[str], new: Sequence[str]) -> list[Hunk]:
             old_path.write_text(_diff_input(old), encoding="utf-8")
             new_path.write_text(_diff_input(new), encoding="utf-8")
         except OSError as exc:
-            log.error("diff input files could not be written, the incremental update cannot be decided dir=%s old_lines=%d new_lines=%d error=%s: %s (disk full, permissions, or too many open files?)",
+            log.error("比較用ファイルを書き込めないため、差分更新の要否を判定できません: フォルダー=%s、旧行数=%d、新行数=%d、エラー=%s: %s（容量・権限・開いているファイル数を確認してください）",
                       tmp, len(old), len(new), type(exc).__name__, exc, exc_info=True)
             raise
         try:
@@ -99,11 +99,11 @@ def line_hunks(old: Sequence[str], new: Sequence[str]) -> list[Hunk]:
                 errors="replace",
             )
         except FileNotFoundError as exc:
-            log.error("git binary not found, the incremental line diff cannot be computed binary=git old_lines=%d new_lines=%d error=%s: %s",
+            log.error("git が見つからないため、行の差分を計算できません: 旧行数=%d、新行数=%d、エラー=%s: %s",
                       len(old), len(new), type(exc).__name__, exc, exc_info=True)
             raise
     if result.returncode not in (0, 1):
-        log.error("git diff failed, the incremental update cannot be decided binary=git old_lines=%d new_lines=%d returncode=%d stderr=%.500s",
+        log.error("git diff に失敗したため、差分更新の要否を判定できません: 旧行数=%d、新行数=%d、終了コード=%d、標準エラー=%.500s",
                   len(old), len(new), result.returncode, result.stderr.strip())
         raise RuntimeError(f"git diff failed: {result.stderr.strip()[:500]}")
     hunks: list[Hunk] = []
@@ -113,7 +113,7 @@ def line_hunks(old: Sequence[str], new: Sequence[str]) -> list[Hunk]:
         # With a zero count git names the line *before* the change.
         hunks.append((old_start + (old_len == 0), old_len, new_start + (new_len == 0), new_len))
     if not hunks:
-        log.error("git diff reported differences but no hunks, the incremental update cannot be decided binary=git old_lines=%d new_lines=%d stdout_bytes=%d",
+        log.error("git diff が変更を報告しましたが変更箇所がないため、差分更新の要否を判定できません: 旧行数=%d、新行数=%d、出力バイト数=%d",
                   len(old), len(new), len(result.stdout))
         raise RuntimeError("git diff reported differences but no hunks")
     return hunks
@@ -210,7 +210,7 @@ class UpdateDecision:
 
 
 def _full(reason: str) -> UpdateDecision:
-    log.info("incremental update decided tier=3 reason=%s", reason)
+    log.info("差分更新の方式を決定しました: 段階=3、理由=%s", reason)
     return UpdateDecision(tier=3, reason=reason)
 
 
@@ -219,7 +219,7 @@ def _drop_research_cache(directory: Path) -> None:
     # that is still there afterwards is the only signal that the delete failed.
     shutil.rmtree(directory, ignore_errors=True)
     if directory.exists():
-        log.error("stale research cache could not be deleted, this run and the next one keep facts this edit invalidated path=%s (permission, locked file, or busy mount)", directory)
+        log.error("古い調査結果を削除できません。今回と次回の処理で、変更前の情報が使われます: パス=%s（権限・ファイルの使用状況・入力元の接続状態を確認してください）", directory)
 
 
 def _overlaps(ranges: Sequence[Sequence[int]], start: int, end: int) -> bool:
@@ -289,20 +289,20 @@ def decide_update(
     old, new = diff_lines(old_text), diff_lines(new_text)
     if old == new:
         return UpdateDecision(tier=0, reason="unchanged", old_count=len(old), new_count=len(new))
-    log.info("source diff for the incremental update old_lines=%d new_lines=%d", len(old), len(new))
+    log.info("差分更新の元テキスト: 旧行数=%d、新行数=%d", len(old), len(new))
     pages_json = list(plan.get("pages", []))
     if not pages_json or int(plan.get("source_line_count", -1)) != len(old):
         # A missing, unreadable or permission-locked plan all arrive here as {};
         # graph/wiki/storage.py names which of the three it was.
         blocked = "plan file is absent or unreadable" if not plan else "stored plan does not match the source"
-        log.error("incremental update cannot reuse the stored plan, the whole document is rebuilt from scratch path=%s reason=%s plan_pages=%d plan_source_lines=%s source_lines=%d",
+        log.error("保存済み構成を再利用できないため、文書全体を作り直します: パス=%s、理由=%s、構成ページ数=%d、構成の元行数=%s、現在の元行数=%d",
                   plan_path, blocked, len(pages_json), plan.get("source_line_count"), len(old))
         return _full("plan-mismatch")
     pages = [(int(page["owner_ranges"][0][0]), int(page["owner_ranges"][-1][1])) for page in pages_json]
     names = [str(page["filename"]) for page in pages_json]
 
     hunks = split_at_cuts(line_hunks(old, new), [last for _first, last in pages[:-1]])
-    log.info("line diff for the incremental update hunks=%d old_lines=%d new_lines=%d pages=%d", len(hunks), len(old), len(new), len(pages))
+    log.info("差分更新の行変更: 変更箇所=%d、旧行数=%d、新行数=%d、ページ数=%d", len(hunks), len(old), len(new), len(pages))
     boundaries = BoundaryMap(hunks, len(old), len(new))
     new_ranges: list[list[int]] = []
     for first, last in pages:
@@ -391,7 +391,7 @@ def decide_update(
         decision.reason = "retitle"
     elif not decision.patch:
         decision.tier, decision.reason = 0, "image-representation"
-    log.info("incremental update decided tier=%d reason=%s hunks=%d patch_pages=%d regenerate_pages=%d retitle_pages=%d",
+    log.info("差分更新の方式を決定しました: 段階=%d、理由=%s、変更箇所=%d、修正ページ数=%d、再生成ページ数=%d、題名変更ページ数=%d",
              decision.tier, decision.reason, len(decision.hunks), len(decision.patch), len(decision.regenerate), len(decision.retitle))
     return decision
 
@@ -435,7 +435,7 @@ def _retitle(run_root: Path, plan_pages: list[dict[str, Any]], retitle: dict[str
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            log.error("published page could not be read, its renamed title and links stay unchanged file=%s error=%s: %s",
+            log.error("公開用ページを読めません。題名とリンクは変更されません: ファイル=%s、エラー=%s: %s",
                       path, type(exc).__name__, exc, exc_info=True)
             raise
         updated = text
@@ -467,7 +467,7 @@ def apply_update(run_root: Path, decision: UpdateDecision, new_source_text: str)
     """
 
     if decision.tier not in (0, 1, 2):
-        log.error("incremental update state cannot be applied, the run state is left untouched tier=%d reason=%.200s", decision.tier, decision.reason)
+        log.error("差分更新の状態を適用できません。実行状態は変更しません: 段階=%d、理由=%.200s", decision.tier, decision.reason)
         raise ValueError("apply_update only handles tiers 0-2")
     run_root = Path(run_root)
     plan_path = run_root / "state" / "plan.json"

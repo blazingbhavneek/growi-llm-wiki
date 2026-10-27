@@ -35,7 +35,7 @@ def heading_tree(lines: Sequence[str], *, title: str = "document") -> Section:
     scan = scan_markdown_fences(list(lines))
     if scan.unclosed is not None:
         document = next((line.lstrip("# ").strip() for line in lines[:20] if line.startswith("# ")), "") or title
-        log.error("heading tree cannot be built; the document falls back to the generic planner document=%s lines=%d fence_line=%d", document, len(lines), scan.unclosed.line_number)
+        log.error("見出しの階層を作成できないため、通常の構成作成に切り替えます: 文書=%s、行数=%d、コード囲みの行=%d", document, len(lines), scan.unclosed.line_number)
         raise ValueError(f"unclosed fence at line {scan.unclosed.line_number}")
     for opening, closing in zip(scan.openings, scan.closings):
         fenced.update(range(opening.line_number, closing.line_number + 1))

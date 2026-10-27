@@ -210,7 +210,7 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     try:
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as exc:
-        log.error("artifact write failed path=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        log.error("生成物を書き込めません: パス=%s、エラー=%s: %s", path, type(exc).__name__, exc, exc_info=True)
         raise
 
 
@@ -512,7 +512,7 @@ def add_or_update_file_record(
                 else:
                     merged.append([start, end])
                     log.debug(
-                        f"[WARNING] Discontinuous source ranges in {filename}: {record['source_ranges']}"
+                        f"元文書の参照範囲が連続していません: ファイル={filename}、範囲={record['source_ranges']}"
                     )
 
         record["_merged_source_ranges"] = merged
@@ -1020,7 +1020,7 @@ async def structured_ainvoke(
     except (TypeError, ValueError) as exc:
         hard_timeout = None
         log.error(
-            "invalid model timeout setting setting=model_timeout value=%r error=%s: %s; timeout disabled",
+            "model_timeout が不正なため、時間制限を無効にします: 値=%r、エラー=%s: %s",
             request_timeout,
             type(exc).__name__,
             exc,
@@ -1062,7 +1062,7 @@ async def structured_ainvoke(
         # triples the loss. Let the caller's retry policy decide.
         if isinstance(structured_error, TimeoutError) or "Timeout" in type(structured_error).__name__:
             log.error(
-                "model call timed out schema=%s model=%s timeout=%s error=%s: %s",
+                "モデルの応答が制限時間を超えました: 形式=%s、モデル=%s、制限時間=%s、エラー=%s: %s",
                 schema_cls.__name__,
                 getattr(llm, "model_name", ""),
                 hard_timeout,
@@ -1103,7 +1103,7 @@ async def structured_ainvoke(
             except Exception as fallback_error:
                 last_error = fallback_error
                 log.debug(
-                    "structured fallback attempt failed schema=%s attempt=%s error=%s: %s",
+                    "指定形式の回答の再試行に失敗しました: 形式=%s、試行=%s、エラー=%s: %s",
                     schema_cls.__name__,
                     retry + 1,
                     type(fallback_error).__name__,
@@ -1112,7 +1112,7 @@ async def structured_ainvoke(
                 )
 
         log.error(
-            "model structured call failed schema=%s model=%s attempts=%s error=%s: %s last_error=%s: %s",
+            "モデルから指定形式の回答を取得できません: 形式=%s、モデル=%s、試行回数=%s、エラー=%s: %s、最後のエラー=%s: %s",
             schema_cls.__name__,
             getattr(llm, "model_name", ""),
             2,
@@ -1619,8 +1619,8 @@ def try_auto_repair_concept_partition_boundaries(
             return None, error
 
         log.debug(
-            f"[Planning] {label}: auto-repairing unsafe boundary "
-            f"before line {bad_boundary} -> before line {repaired_boundary}"
+            f"不適切な分割位置を自動修正します: 対象={label}、"
+            f"変更前={bad_boundary}行の直前、変更後={repaired_boundary}行の直前"
         )
 
         working[current_index - 1] = copy_plan_with_range(
@@ -1893,8 +1893,8 @@ async def split_window_until_valid(
             raise JobCancelled("chunk planning cancelled")
 
         log.debug(
-            f"[Planning] {label}: split attempt {attempt}, "
-            f"source lines {source_start}-{source_end}"
+            f"文書を分割します: 対象={label}、試行={attempt}、"
+            f"元文書の行範囲={source_start}-{source_end}"
         )
 
         messages = build_concept_split_prompt(
@@ -1937,7 +1937,7 @@ async def split_window_until_valid(
 
             if repaired is not None:
                 log.debug(
-                    f"[Planning] {label}: accepted after automatic boundary repair."
+                    f"分割位置の自動修正後に検証を通過しました: 対象={label}"
                 )
                 return repaired
 
@@ -1952,8 +1952,8 @@ async def split_window_until_valid(
             last_error = f"{type(exc).__name__}: {exc}"
 
         log.debug(
-            f"[Planning] {label}: invalid split on attempt {attempt}; retrying. "
-            f"Reason: {last_error}"
+            f"分割結果が不正なため、再試行します: 対象={label}、試行={attempt}、"
+            f"理由={last_error}"
         )
 
         if attempt < PARTITION_RETRY_ATTEMPTS:
@@ -1964,7 +1964,7 @@ async def split_window_until_valid(
     if CHUNK_FALLBACK_MECHANICAL:
         fallback_title = f"{label} 自動分割"
         log.error(
-            "concept split failed label=%s lines=%s-%s attempts=%s error=%s; mechanical fallback used",
+            "内容の分割に失敗したため、規則による分割を使います: 対象=%s、行範囲=%s-%s、試行回数=%s、エラー=%s",
             label,
             source_start,
             source_end,
@@ -1972,8 +1972,8 @@ async def split_window_until_valid(
             repr(last_error)[:200],
         )
         log.debug(
-            f"[Planning] {label}: using mechanical fallback after "
-            f"{PARTITION_RETRY_ATTEMPTS} attempts. Last error: {last_error}"
+            f"再試行の上限に達したため、規則による分割を使います: 対象={label}、"
+            f"試行回数={PARTITION_RETRY_ATTEMPTS}、最後のエラー={last_error}"
         )
         return [
             ConceptFilePlan(
@@ -2081,7 +2081,7 @@ async def plan_concept_files_streaming(
             pending = split[-1]
 
             log.debug(
-                "[Planning] Carrying pending concept forward: "
+                "未完了の内容を次の処理に引き継ぎます: "
                 f"{pending.title} [{pending.source_start}-{pending.source_end}]"
             )
 
@@ -2152,7 +2152,7 @@ def write_concept_plan_document(
     try:
         path.write_text("\n".join(lines), encoding="utf-8")
     except Exception as exc:
-        log.error("artifact write failed path=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        log.error("生成物を書き込めません: パス=%s、エラー=%s: %s", path, type(exc).__name__, exc, exc_info=True)
         raise
 
 
@@ -2483,7 +2483,7 @@ async def enrich_concept_plan(
     if not files:
         return EnrichmentResult(inferred_file_name="document.md", files=[])
 
-    log.debug("[Enrichment] Inferring global name...")
+    log.debug("文書全体の名前を推定しています")
     try:
         global_name_raw = await structured_ainvoke(
             llm,
@@ -2494,7 +2494,7 @@ async def enrich_concept_plan(
         global_name = GlobalName.model_validate(global_name_raw).inferred_file_name
     except Exception as e:
         log.error(
-            "enrichment failed stage=global-name document=%s error=%s: %s",
+            "文書全体の名前を作成できません: 文書=%s、エラー=%s: %s",
             original_filename,
             type(e).__name__,
             e,
@@ -2509,7 +2509,7 @@ async def enrich_concept_plan(
     inferred_headers = []
 
     # First chunk
-    log.debug(f"[Enrichment] Inferring header for chunk 1/{len(files)}...")
+    log.debug(f"分割部分の見出しを推定しています: 1/{len(files)}")
     if stop_check and stop_check():
         raise JobCancelled("chunk enrichment cancelled")
     try:
@@ -2522,7 +2522,7 @@ async def enrich_concept_plan(
         first_header = ChunkHeader.model_validate(first_raw).header
     except Exception as e:
         log.error(
-            "enrichment failed stage=chunk-header document=%s chunk=1/%s error=%s: %s",
+            "分割部分の見出しを作成できません: 文書=%s、分割部分=1/%s、エラー=%s: %s",
             original_filename,
             len(files),
             type(e).__name__,
@@ -2536,7 +2536,7 @@ async def enrich_concept_plan(
     for i in range(1, len(files)):
         if stop_check and stop_check():
             raise JobCancelled("chunk enrichment cancelled")
-        log.debug(f"[Enrichment] Inferring header for chunk {i+1}/{len(files)}...")
+        log.debug(f"分割部分の見出しを推定しています: {i+1}/{len(files)}")
         prompt = build_subsequent_chunk_prompt(
             original_filename=original_filename,
             current=files[i],
@@ -2548,7 +2548,7 @@ async def enrich_concept_plan(
             header = ChunkHeader.model_validate(raw).header
         except Exception as e:
             log.error(
-                "enrichment failed stage=chunk-header document=%s chunk=%s/%s error=%s: %s",
+                "分割部分の見出しを作成できません: 文書=%s、分割部分=%s/%s、エラー=%s: %s",
                 original_filename,
                 i + 1,
                 len(files),
@@ -2750,7 +2750,7 @@ async def arun_chunk_pipeline(
             shutil.rmtree(out_dir)
         except OSError as exc:
             log.error(
-                "clean output failed path=%s error=%s: %s; old output may mix with new",
+                "出力先を初期化できません。以前と今回の出力が混在する場合があります: パス=%s、エラー=%s: %s",
                 out_dir,
                 type(exc).__name__,
                 exc,
@@ -2810,7 +2810,7 @@ async def arun_chunk_pipeline(
             raise
         except Exception as exc:
             log.error(
-                "wiki concept planning failed document=%s lines=%s error=%s: %s",
+                "Wikiの内容構成を作成できません: 文書=%s、行数=%s、エラー=%s: %s",
                 document_name,
                 source_line_count,
                 type(exc).__name__,
@@ -2826,7 +2826,7 @@ async def arun_chunk_pipeline(
             )
         except Exception as exc:
             log.error(
-                "wiki coverage gate failed document=%s lines=%s error=%s: %s",
+                "Wikiの内容の網羅性を確認できません: 文書=%s、行数=%s、エラー=%s: %s",
                 document_name,
                 source_line_count,
                 type(exc).__name__,
@@ -2845,7 +2845,7 @@ async def arun_chunk_pipeline(
             )
         except Exception as exc:
             log.error(
-                "wiki page render failed document=%s pages=%s error=%s: %s",
+                "Wikiページを整形できません: 文書=%s、ページ数=%s、エラー=%s: %s",
                 document_name,
                 len(concept_files),
                 type(exc).__name__,
@@ -2862,7 +2862,7 @@ async def arun_chunk_pipeline(
             )
         except Exception as exc:
             log.error(
-                "wiki render integrity gate failed document=%s pages=%s error=%s: %s",
+                "Wikiの整形結果の整合性を確認できません: 文書=%s、ページ数=%s、エラー=%s: %s",
                 document_name,
                 len(coverage),
                 type(exc).__name__,
@@ -2872,7 +2872,7 @@ async def arun_chunk_pipeline(
             raise
 
         log.info(
-            "wiki plan complete document=%s pages=%s source_lines=%s",
+            "Wikiの構成作成が完了しました: 文書=%s、ページ数=%s、元行数=%s",
             document_name,
             len(concept_files),
             source_line_count,
@@ -2962,7 +2962,7 @@ async def arun_chunk_pipeline(
     write_json(manifest_json_path, manifest)
 
     log.info(
-        "wiki build complete document=%s pages=%s out_dir=%s",
+        "Wikiの生成が完了しました: 文書=%s、ページ数=%s、出力先=%s",
         document_name,
         len(ordered_concept_files),
         out_dir,

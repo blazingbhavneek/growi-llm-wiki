@@ -566,7 +566,7 @@ async def _structured_with_artifacts(
                 write_json_atomic(output_dir / f"{stem}.json", result)
             except OSError as exc:
                 log.error(
-                    "usable model answer could not be saved, the attempt is retried as if the model failed file=%s error=%s: %s",
+                    "有効なモデル回答を保存できません。呼び出し失敗として再試行します: ファイル=%s、エラー=%s: %s",
                     output_dir / f"{stem}.json",
                     type(exc).__name__,
                     exc,
@@ -581,7 +581,7 @@ async def _structured_with_artifacts(
                 last_error + "\n",
             )
     log.error(
-        "structured model call gave up task=%s attempts=%d output_dir=%s last_error=%s",
+        "モデルから指定形式の回答を取得できませんでした: 処理=%s、試行回数=%d、出力先=%s、最後のエラー=%s",
         stem,
         max(1, attempts),
         output_dir,
@@ -855,7 +855,7 @@ async def _research_references(
     if result is None:
         # document_slug is optional; the run directory is always <slug>-<source hash>.
         log.error(
-            "cross-page research gave up, this page is written without a single fact from the reference pages document=%s page=%s references=%d attempts=%d",
+            "ページ間の調査に失敗したため、参照ページの情報を使わずに本文を生成します: 文書=%s、ページ=%s、参照先数=%d、試行回数=%d",
             work_root.parent.name,
             page.title,
             len(selected),
@@ -923,21 +923,21 @@ def _load_seed_plan(
     """Load the completed seed plan so a stopped run resumes at rewriting."""
 
     if not path.exists():
-        log.debug("no stored seed plan to resume file=%s", path)
+        log.debug("再開用の基本構成が保存されていません: ファイル=%s", path)
         return None
     try:
         raw = read_json(path)
         if raw.get("source_sha256") != source_sha256:
-            log.debug("stored seed plan is for another source revision file=%s", path)
+            log.debug("保存済みの基本構成は別の版の元文書に対応しています: ファイル=%s", path)
             return None
         if int(raw.get("source_line_count", 0)) != source_line_count:
-            log.debug("stored seed plan is for a %s-line source file=%s", raw.get("source_line_count", 0), path)
+            log.debug("保存済みの基本構成は元文書%s行に対応しています: ファイル=%s", raw.get("source_line_count", 0), path)
             return None
         if raw.get("prompt_version") != prompt_version:
-            log.debug("stored seed plan was made by an older prompt version file=%s", path)
+            log.debug("保存済みの基本構成は古い指示の版で作成されています: ファイル=%s", path)
             return None
         if bool(raw.get("single_page_rewrite", False)) != single_page_rewrite:
-            log.debug("stored seed plan was made in the other rewrite mode file=%s", path)
+            log.debug("保存済みの基本構成は異なる書き換え方式で作成されています: ファイル=%s", path)
             return None
         pages = [
             SeedPage(
@@ -967,7 +967,7 @@ def _load_seed_plan(
         return pages
     except OSError as exc:
         log.error(
-            "stored seed plan exists but could not be read, the document is re-planned from scratch file=%s error=%s: %s",
+            "保存済みの基本構成を読めないため、最初から作り直します: ファイル=%s、エラー=%s: %s",
             path,
             type(exc).__name__,
             exc,
@@ -976,7 +976,7 @@ def _load_seed_plan(
         return None
     except (KeyError, OSError, TypeError, ValueError, PipelineError) as exc:
         log.error(
-            "stored seed plan is corrupt or unusable, the document is re-planned from scratch file=%s error=%s: %s",
+            "保存済みの基本構成が破損しているか使えないため、最初から作り直します: ファイル=%s、エラー=%s: %s",
             path,
             type(exc).__name__,
             exc,
@@ -1029,7 +1029,7 @@ def _plan_cache_path(source_text: str, config: WikiConfig) -> Path | None:
 def _load_plan_cache(path: Path | None, source_text: str, lines: list[str], config: WikiConfig) -> CompiledSeedPlan | None:
     if path is None or not path.exists():
         if path is not None:
-            log.debug("no planner cache entry to resume file=%s", path)
+            log.debug("再開用の構成情報がありません: ファイル=%s", path)
         return None
     # document_slug is optional; the first hash bytes match the run directory name.
     document = config.document_slug or sha256_text(source_text)[:12]
@@ -1049,7 +1049,7 @@ def _load_plan_cache(path: Path | None, source_text: str, lines: list[str], conf
         )
         if error is not None:
             log.error(
-                "planner cache entry is not a usable seed plan, the document is re-planned from scratch document=%s file=%s reason=%.300s",
+                "保存済みの構成を基本構成として使えないため、最初から作り直します: 文書=%s、ファイル=%s、理由=%.300s",
                 document,
                 path,
                 error,
@@ -1058,7 +1058,7 @@ def _load_plan_cache(path: Path | None, source_text: str, lines: list[str], conf
         return checked
     except OSError as exc:
         log.error(
-            "planner cache entry exists but could not be read, the document is re-planned from scratch document=%s file=%s error=%s: %s",
+            "保存済みの構成を読めないため、最初から作り直します: 文書=%s、ファイル=%s、エラー=%s: %s",
             document,
             path,
             type(exc).__name__,
@@ -1068,7 +1068,7 @@ def _load_plan_cache(path: Path | None, source_text: str, lines: list[str], conf
         return None
     except (KeyError, OSError, TypeError, ValueError) as exc:
         log.error(
-            "planner cache entry is corrupt or unusable, the document is re-planned from scratch document=%s file=%s error=%s: %s",
+            "保存済みの構成が破損しているか使えないため、最初から作り直します: 文書=%s、ファイル=%s、エラー=%s: %s",
             document,
             path,
             type(exc).__name__,
@@ -1092,7 +1092,7 @@ def _store_plan_cache(path: Path | None, source_text: str, lines: list[str], con
         })
     except OSError as exc:
         log.error(
-            "planner cache write failed, the whole document build stops for an optimization-only cache file=%s error=%s: %s",
+            "構成情報を保存できないため、文書全体の生成を中断します: ファイル=%s、エラー=%s: %s",
             path,
             type(exc).__name__,
             exc,
@@ -1146,7 +1146,7 @@ async def _compute_seed_plan(
         )
         if seed_plan is None:
             log.error(
-                "structural seed plan rejected, the expensive observation and planner path runs instead document=%s source_lines=%d reason=%.300s",
+                "元文書の構造に基づく構成が検証に通らないため、解析と構成作成を実行します。処理費用が増えます: 文書=%s、元行数=%d、理由=%.300s",
                 config.document_slug or sha256_text(source_text)[:12],
                 len(lines),
                 error,
@@ -1205,7 +1205,7 @@ async def prepare_seed_plan_cache(
     if not leader:
         # There is no timeout on this wait (audit 4.5); the line is the only
         # evidence when the leader dies and the wait never ends.
-        log.info("waiting for the planner leader to finish this cache entry, no timeout file=%s", target)
+        log.info("構成作成の主処理が保存を終えるまで待っています。待機時間の制限はありません: ファイル=%s", target)
         await asyncio.to_thread(running.wait)
         return _load_plan_cache(target, source_text, lines, config) is not None
     try:
@@ -1214,7 +1214,7 @@ async def prepare_seed_plan_cache(
             temp_dir = tempfile.TemporaryDirectory(prefix=".planner-", dir=target.parent)
         except OSError as exc:
             log.error(
-                "planner workspace could not be created, the cache entry cannot be written dir=%s error=%s: %s",
+                "構成作成用フォルダーを作成できないため、構成情報を保存できません: フォルダー=%s、エラー=%s: %s",
                 target.parent,
                 type(exc).__name__,
                 exc,
@@ -1246,7 +1246,7 @@ async def _wait_for_plan_ahead(path: Path | None) -> None:
         running = _PLANNING.get(str(path.resolve()))
     if running is not None:
         # No timeout on this wait (audit 4.5); this is the only trace of the hang.
-        log.info("waiting for the ahead planner to finish this cache entry, no timeout file=%s", path)
+        log.info("先行の構成作成が保存を終えるまで待っています。待機時間の制限はありません: ファイル=%s", path)
         await asyncio.to_thread(running.wait)
 
 
@@ -1302,7 +1302,7 @@ def _resume_rewritten_page(
     """Reuse a page whose sidecar state still matches the file on disk."""
 
     if not output_path.exists() or not state_path.exists():
-        log.debug("page is not built yet, nothing to resume page=%s file=%s", page.filename, state_path)
+        log.debug("ページが未生成のため、再開する処理はありません: ページ=%s、ファイル=%s", page.filename, state_path)
         return None
     try:
         markdown = output_path.read_text(encoding="utf-8")
@@ -1327,7 +1327,7 @@ def _resume_rewritten_page(
         )
     except OSError as exc:
         log.error(
-            "published page or its state exists but could not be read, the page is rewritten from scratch page=%s path=%s file=%s error=%s: %s",
+            "生成済みページまたは状態情報を読めないため、ページを最初から作り直します: ページ=%s、ページパス=%s、状態ファイル=%s、エラー=%s: %s",
             page.filename,
             output_path,
             state_path,
@@ -1338,7 +1338,7 @@ def _resume_rewritten_page(
         return None
     except (OSError, TypeError, ValueError) as exc:
         log.error(
-            "published page or its state is corrupt or unusable, the page is rewritten from scratch page=%s path=%s file=%s error=%s: %s",
+            "生成済みページまたは状態情報が破損しているか使えないため、ページを最初から作り直します: ページ=%s、ページパス=%s、状態ファイル=%s、エラー=%s: %s",
             page.filename,
             output_path,
             state_path,
@@ -1502,7 +1502,7 @@ async def _write_section(
             )
         except Exception as exc:  # noqa: BLE001 - bounded retry with evidence
             log.error(
-                "section writer model call failed run=%s page=%s section=%d/%d attempt=%d/%d error=%s: %s",
+                "節の本文生成モデルを呼び出せません: 実行ID=%s、ページ=%s、節=%d/%d、試行=%d/%d、エラー=%s: %s",
                 task_dir.parent.parent,
                 page.filename,
                 index,
@@ -1582,7 +1582,7 @@ async def _write_section(
             _emit(on_progress, "write", "judge_unavailable",
                   page=page.title, section=index, attempt=attempt, error=judge_error)
             log.error(
-                "section judge gave up, this section is published without any semantic review run=%s page=%s section=%d/%d attempt=%d strict_judge=%s",
+                "節の判定に失敗したため、意味の確認をせずに公開します: 実行ID=%s、ページ=%s、節=%d/%d、試行=%d、厳格な判定=%s",
                 task_dir.parent.parent,
                 page.filename,
                 index,
@@ -1620,7 +1620,7 @@ async def _write_section(
         )
         if policy.strict_judge and (best.missing or best.defects):
             log.error(
-                "judge reported missing information or defects, the section is published as the original source text run=%s page=%s section=%d/%d score=%s missing=%d defects=%d",
+                "判定で情報欠落または問題が見つかったため、節を原文のまま公開します: 実行ID=%s、ページ=%s、節=%d/%d、評価点=%s、欠落数=%d、問題数=%d",
                 task_dir.parent.parent,
                 page.filename,
                 index,
@@ -1645,7 +1645,7 @@ async def _write_section(
             )
         if not policy.strict_judge and (best.missing or best.defects):
             log.error(
-                "judge reported missing information or defects, the rewritten section ships without review run=%s page=%s section=%d/%d score=%s missing=%d defects=%d",
+                "判定で情報欠落または問題が見つかりましたが、書き換えた節を確認なしで公開します: 実行ID=%s、ページ=%s、節=%d/%d、評価点=%s、欠落数=%d、問題数=%d",
                 task_dir.parent.parent,
                 page.filename,
                 index,
@@ -1663,7 +1663,7 @@ async def _write_section(
         )
     errors = candidates[-1].errors if candidates else list(feedback)
     log.error(
-        "no writer attempt passed the lossless checks, the section is published as the original source text run=%s page=%s section=%d/%d attempts=%d reason=%.300s",
+        "情報欠落の確認に通る本文がないため、節を原文のまま公開します: 実行ID=%s、ページ=%s、節=%d/%d、試行回数=%d、理由=%.300s",
         task_dir.parent.parent,
         page.filename,
         index,
@@ -1786,7 +1786,7 @@ async def _rewrite_page(
         )
     if not sections:
         log.error(
-            "page has no writable section, the published page is only its title and intro page=%s filename=%s owner_ranges=%s-%s",
+            "書き込める節がないため、題名と導入文のみのページになります: ページ=%s、ファイル名=%s、担当範囲=%s-%s",
             page.title,
             page.filename,
             start,
@@ -1951,7 +1951,7 @@ async def _rewrite_all(
             )
         except OSError as exc:
             log.error(
-                "rewritten page could not be published, the wiki stays incomplete page=%s path=%s error=%s: %s",
+                "書き換えたページを確定できません。Wikiは未完了のままです: ページ=%s、パス=%s、エラー=%s: %s",
                 result.page.filename,
                 wiki_root / result.page.filename,
                 type(exc).__name__,
@@ -2059,7 +2059,7 @@ async def run_pipeline(
         source_text = source_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         log.error(
-            "source document is not valid UTF-8 document=%s path=%s bytes=%d error=%s: %s",
+            "元文書がUTF-8形式ではありません: 文書=%s、パス=%s、バイト数=%d、エラー=%s: %s",
             source_path.name,
             source_path,
             len(source_bytes),
@@ -2070,7 +2070,7 @@ async def run_pipeline(
         raise
     except OSError as exc:
         log.error(
-            "source document could not be read document=%s path=%s error=%s: %s",
+            "元文書を読み込めません: 文書=%s、パス=%s、エラー=%s: %s",
             source_path.name,
             source_path,
             type(exc).__name__,
@@ -2082,7 +2082,7 @@ async def run_pipeline(
     lines = split_source_lines(normalized)
     # The whole source is held in memory (audit 4.5); record the size up front.
     log.info(
-        "source document loaded document=%s path=%s bytes=%d lines=%d",
+        "元文書を読み込みました: 文書=%s、パス=%s、バイト数=%d、行数=%d",
         source_path.name,
         source_path,
         len(source_bytes),
@@ -2100,7 +2100,7 @@ async def run_pipeline(
             model = policy.model_port(config)
     if model is None:
         log.error(
-            "no model client, every section would be published as the original source text document=%s policy_offline=%s chat_base_url=%s",
+            "モデルが未設定のため、すべての節が原文のままになります: 文書=%s、モデルなし設定=%s、接続先=%s",
             source_path.name,
             policy.offline,
             config.chat_base_url or "(unset)",
@@ -2124,7 +2124,7 @@ async def run_pipeline(
         write_text_atomic(source_snapshot_path, source_text)
     except OSError as exc:
         log.error(
-            "run directory or source snapshot could not be written, the build stops before any page is planned run=%s error=%s: %s",
+            "実行フォルダーまたは元文書の保存用コピーを書き込めないため、構成作成前に中断します: 実行ID=%s、エラー=%s: %s",
             run_root,
             type(exc).__name__,
             exc,
@@ -2150,7 +2150,7 @@ async def run_pipeline(
             pages = None
     if pages is None and config.require_resume:
         log.error(
-            "resume refused: the stored seed plan is stale, corrupt or unreadable document=%s file=%s source_lines=%d",
+            "保存済みの基本構成が古いか、破損・読み取り不能のため再開できません: 文書=%s、ファイル=%s、元行数=%d",
             source_path.name,
             plan_path,
             len(lines),
@@ -2187,7 +2187,7 @@ async def run_pipeline(
             _verify_ranges(pages, len(lines))
         except PipelineError as exc:
             log.error(
-                "seed plan does not cover the source, no page can be written document=%s stage=seed error=%s: %s",
+                "基本構成が元文書を網羅していないため、ページを生成できません: 文書=%s、エラー=%s: %s",
                 source_path.name,
                 type(exc).__name__,
                 exc,
@@ -2297,7 +2297,7 @@ async def run_pipeline(
         )
     except PipelineError as exc:
         log.error(
-            "wiki rewrite stopped, the run directory keeps a partial wiki document=%s stage=rewrite error=%s: %s",
+            "Wikiの書き換えを中断しました。実行フォルダーに一部のWikiが残っています: 文書=%s、エラー=%s: %s",
             source_path.name,
             type(exc).__name__,
             exc,
@@ -2350,7 +2350,7 @@ async def run_pipeline(
 
     if not pages:
         log.error(
-            "wiki build is published with zero pages document=%s run=%s source_lines=%d",
+            "ページ数が0のままWikiの生成結果が確定されました: 文書=%s、実行ID=%s、元行数=%d",
             source_path.name,
             run_root,
             len(lines),

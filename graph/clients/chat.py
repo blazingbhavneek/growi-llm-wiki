@@ -62,7 +62,7 @@ def _note_cap_disabled(limit: int, base_url: str, model: str) -> None:
         return
     _cap_noted.add("max_tokens")
     log.error(
-        "model output token cap is disabled requested_max_tokens=%s endpoint=%s model=%s (unbounded responses can exhaust memory)",
+        "モデルの出力長が無制限です。長い回答でメモリ不足になる場合があります: 指定値=%s、接続先=%s、モデル=%s",
         limit,
         base_url,
         model,
@@ -107,7 +107,7 @@ def extract_json_from_text(text: str) -> Any:
                 return _loads(text[start : end + 1])
             except json.JSONDecodeError as final_error:
                 log.error(
-                    "model response json could not be repaired response=%r characters=%d error=%s: %s",
+                    "モデルの回答を正しいJSONに修復できません: 回答=%r、文字数=%d、エラー=%s: %s",
                     _sample(text),
                     len(text),
                     type(final_error).__name__,
@@ -116,7 +116,7 @@ def extract_json_from_text(text: str) -> Any:
                 )
                 raise
         log.error(
-            "model response contains no json object response=%r characters=%d error=%s: %s",
+            "モデルの回答にJSONオブジェクトがありません: 回答=%r、文字数=%d、エラー=%s: %s",
             _sample(text),
             len(text),
             type(error).__name__,
@@ -149,7 +149,7 @@ async def structured_ainvoke(
         # A non-numeric request_timeout does not just fall back: it removes the hard
         # timeout, so every call through this client can hang forever.
         log.error(
-            "chat request_timeout is not a number, hard timeout is disabled setting=request_timeout value=%r endpoint=%s model=%s error=%s: %s",
+            "request_timeout が数値ではないため強制終了の時間制限を無効にします: 値=%r、接続先=%s、モデル=%s、エラー=%s: %s",
             request_timeout,
             base_url,
             model,
@@ -190,7 +190,7 @@ async def structured_ainvoke(
         # triples the loss. Let the caller's retry policy decide.
         if isinstance(structured_error, TimeoutError) or "Timeout" in type(structured_error).__name__:
             log.error(
-                "structured model call hit its timeout hard_timeout=%s endpoint=%s model=%s error=%s: %s",
+                "モデルの応答が制限時間を超えました: 制限時間=%s、接続先=%s、モデル=%s、エラー=%s: %s",
                 hard_timeout,
                 base_url,
                 model,
@@ -202,7 +202,7 @@ async def structured_ainvoke(
         # The type name is the difference between "the endpoint is dead" and
         # "the model answered wrongly"; the caller cannot tell them apart.
         log.error(
-            "structured model call failed schema=%s endpoint=%s model=%s error=%s: %s",
+            "モデルから指定形式の回答を取得できません: 形式=%s、接続先=%s、モデル=%s、エラー=%s: %s",
             getattr(schema_cls, "__name__", schema_cls),
             base_url,
             model,
@@ -213,7 +213,7 @@ async def structured_ainvoke(
         schema_json = json.dumps(schema_cls.model_json_schema(), indent=2)
         last_error: Exception = structured_error
         log.info(
-            "structured output failed, retrying with a plain json prompt schema=%s model=%s endpoint=%s",
+            "指定形式の回答を取得できないため、通常のJSON指示で再試行します: 形式=%s、モデル=%s、接続先=%s",
             getattr(schema_cls, "__name__", schema_cls),
             model,
             base_url,
@@ -247,7 +247,7 @@ async def structured_ainvoke(
             except Exception as fallback_error:
                 last_error = fallback_error
                 log.error(
-                    "json fallback attempt failed attempt=%s schema=%s endpoint=%s model=%s response=%r error=%s: %s",
+                    "JSON回答の再試行に失敗しました: 試行=%s、形式=%s、接続先=%s、モデル=%s、回答=%r、エラー=%s: %s",
                     retry + 1,
                     getattr(schema_cls, "__name__", schema_cls),
                     base_url,

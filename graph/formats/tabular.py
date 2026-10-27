@@ -308,7 +308,7 @@ async def decide_structure(sheet: str, grid: Grid, regions: Sequence[Region], *,
             f"{previews}\n\n回答は「行」または「列」の一語だけにしてください。"
         ))])
     except Exception as exc:
-        log.error("table orientation model call failed; the sheet is read row-first, which can produce wrong records and statistics sheet=%s error=%s: %s", sheet, type(exc).__name__, exc, exc_info=True)
+        log.error("表の向きを判定できないため、行単位で読み込みます。記録や集計が誤る場合があります: シート=%s、エラー=%s: %s", sheet, type(exc).__name__, exc, exc_info=True)
         return row_structure
     choice = answer.strip().splitlines()[-1].strip("。. `").casefold() if answer.strip() else ""
     return column_structure if choice in {"列", "column", "columns"} else row_structure
@@ -392,7 +392,7 @@ def specs_in_page(body: str) -> list[dict[str, Any]]:
         try:
             specs.append(json.loads(match.group(1)))
         except ValueError as exc:
-            log.error("table-spec comment in a page is malformed spec=%.120s error=%s: %s", match.group(1), type(exc).__name__, exc, exc_info=True)
+            log.error("ページ内の表定義の形式が不正です: 定義=%.120s、エラー=%s: %s", match.group(1), type(exc).__name__, exc, exc_info=True)
             raise
     return specs
 
@@ -427,7 +427,7 @@ def records_from_page(body: str) -> list[tuple[dict[str, Any], list[str], list[R
             grid = grids[index] if "<table>" in body and index < len(grids) else (grids[-1] if grids else Grid(cells={}))
             columns, records = records_for(grid, spec)
         except (IndexError, ValueError) as exc:
-            log.error("table-spec in a page cannot be read as records region=%s title=%s error=%s: %s", spec_dict.get("region"), spec_dict.get("title"), type(exc).__name__, exc, exc_info=True)
+            log.error("ページ内の表定義からデータを読み込めません: 領域=%s、題名=%s、エラー=%s: %s", spec_dict.get("region"), spec_dict.get("title"), type(exc).__name__, exc, exc_info=True)
             raise
         output.append((spec_dict, columns, records))
     return output
@@ -437,7 +437,7 @@ def query_records(columns: Sequence[str], records: Sequence[Record], sql: str, *
     try:
         conn = sqlite3.connect(":memory:")
     except sqlite3.Error as exc:
-        log.error("record query database could not be created error=%s: %s", type(exc).__name__, exc, exc_info=True)
+        log.error("表の検索用データベースを作成できません: エラー=%s: %s", type(exc).__name__, exc, exc_info=True)
         raise
     quoted = ", ".join(f'"{name.replace(chr(34), chr(34) * 2)}"' for name in ["key", "label", *columns])
     conn.execute(f"CREATE TABLE t ({quoted})")
@@ -458,7 +458,7 @@ def query_records(columns: Sequence[str], records: Sequence[Record], sql: str, *
     conn.set_authorizer(authorizer)
     statement = sql.strip().rstrip(";")
     if ";" in statement:
-        log.error("record SQL query rejected, more than one statement sql=%.120s", sql)
+        log.error("複数のSQL文が含まれているため検索を拒否しました: SQL=%.120s", sql)
         return "error: one statement only"
     if not re.search(r"\blimit\b", statement, re.IGNORECASE):
         statement += f" LIMIT {limit}"
@@ -470,7 +470,7 @@ def query_records(columns: Sequence[str], records: Sequence[Record], sql: str, *
         writer.writerows(cursor.fetchmany(limit))
         return output.getvalue()[:8000]
     except sqlite3.Error as exc:
-        log.error("record SQL query failed error=%s: %s sql=%.120s", type(exc).__name__, exc, sql, exc_info=True)
+        log.error("表のSQL検索に失敗しました: エラー=%s: %s、SQL=%.120s", type(exc).__name__, exc, sql, exc_info=True)
         return f"error: {exc}"
     finally:
         conn.close()
@@ -539,7 +539,7 @@ async def write_tables(
     try:
         docs.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        log.error("page directory could not be created, no page can be written run=%s error=%s: %s", run_dir, type(exc).__name__, exc, exc_info=True)
+        log.error("ページフォルダーを作成できないため、ページを保存できません: 実行ID=%s、エラー=%s: %s", run_dir, type(exc).__name__, exc, exc_info=True)
         raise
     files: list[dict[str, Any]] = []
     prepared = []
@@ -579,7 +579,7 @@ async def write_tables(
                 cached = read_json(cache, default={}) if cache else {}
             except (OSError, ValueError) as exc:
                 # graph/wiki/storage logs the file error (path + errno, or corrupt-vs-missing) on the line above.
-                log.error("sheet cache file is corrupt or unreadable sheet=%s file=%s", sheet, cache, exc_info=True)
+                log.error("シートの保存情報が破損しているか読めません: シート=%s、ファイル=%s", sheet, cache, exc_info=True)
                 raise
             if cached:
                 description = VbaDescription.model_validate(cached["vba"]) if cached.get("vba") else None
@@ -599,14 +599,14 @@ async def write_tables(
                     try:
                         write_json_atomic(cache, {"vba": description.model_dump() if description else None, "structure": structure.model_dump()})
                     except OSError as exc:
-                        log.error("sheet cache write failed, the next workbook update pays for this sheet again sheet=%s file=%s", sheet, cache, exc_info=True)
+                        log.error("シートの保存情報を書き込めません。次回の更新時に再解析します: シート=%s、ファイル=%s", sheet, cache, exc_info=True)
                         raise
             tables = []
             for spec in structure.tables:
                 try:
                     columns, records = records_for(grid, spec)
                 except (IndexError, ValueError) as exc:
-                    log.error("table spec has an empty or unusable data range, the sheet page cannot be built sheet=%s region=%s title=%s error=%s: %s", sheet, spec.region, spec.title, type(exc).__name__, exc, exc_info=True)
+                    log.error("表のデータ範囲が空または不正なため、シートのページを作成できません: シート=%s、領域=%s、題名=%s、エラー=%s: %s", sheet, spec.region, spec.title, type(exc).__name__, exc, exc_info=True)
                     raise
                 if records:
                     tables.append((spec, columns, records, stats_for(columns, records)))
@@ -616,7 +616,7 @@ async def write_tables(
             try:
                 write_text_atomic(docs / name, render_table_page(page_title if is_vba else sheet, structure, tables, table_text, grid))
             except OSError as exc:
-                log.error("sheet page write failed, the run stops with a partial page set sheet=%s file=%s error=%s: %s", sheet, docs / name, type(exc).__name__, exc, exc_info=True)
+                log.error("シートのページを書き込めないため中断します。ページは一部だけ保存された状態です: シート=%s、ファイル=%s、エラー=%s: %s", sheet, docs / name, type(exc).__name__, exc, exc_info=True)
                 raise
             completed += 1
             if on_progress:
@@ -647,7 +647,7 @@ async def write_tables(
             try:
                 body = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as exc:
-                log.error("page could not be read for the link rename sweep file=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+                log.error("名前変更に伴うリンク修正のためにページを読み込めません: ファイル=%s、エラー=%s: %s", path, type(exc).__name__, exc, exc_info=True)
                 raise
             rewritten = body
             for old_name, new_name in link_renames.items():
@@ -656,7 +656,7 @@ async def write_tables(
                 try:
                     write_text_atomic(path, rewritten)
                 except OSError as exc:
-                    log.error("renamed page links could not be written, the old links stay broken file=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+                    log.error("名前変更後のリンクを保存できません。以前のリンクは切れたままです: ファイル=%s、エラー=%s: %s", path, type(exc).__name__, exc, exc_info=True)
                     raise
 
     number = len(prepared)
@@ -675,13 +675,13 @@ async def write_tables(
                     try:
                         text = await model.text([HumanMessage(content=analysis_prompt(sheet, spec, columns, subset, stats, language=config.output_language, feedback=feedback))])
                     except Exception as exc:
-                        log.error("table analysis model call failed sheet=%s table=%s part=%s error=%s: %s", sheet, spec.title, suffix, type(exc).__name__, exc, exc_info=True)
+                        log.error("表の分析モデルを呼び出せません: シート=%s、表=%s、部分=%s、エラー=%s: %s", sheet, spec.title, suffix, type(exc).__name__, exc, exc_info=True)
                         raise
                     feedback = check_citations(text, subset)
                     if not feedback:
                         break
                 if feedback:
-                    log.error("table analysis citations failed after 3 attempts, the page publishes statistics only sheet=%s table=%s part=%s reason=%s", sheet, spec.title, suffix, "; ".join(feedback))
+                    log.error("表の分析の出典確認に3回失敗したため、集計値のみ公開します: シート=%s、表=%s、部分=%s、理由=%s", sheet, spec.title, suffix, "; ".join(feedback))
                     text = "> 引用チェックに失敗したため、統計のみを掲載します。\n\n" + json.dumps(stats, ensure_ascii=False, indent=1)
                 number += 1
                 prefix = "解説" if config.source_kind == "xlsx" else "series"
@@ -689,7 +689,7 @@ async def write_tables(
                 try:
                     write_text_atomic(docs / filename, f"# {spec.title} — {suffix}\n\n元の表: [{sheet}]({name})（{spec.title}）\n\n{text}\n")
                 except OSError as exc:
-                    log.error("analysis page write failed sheet=%s file=%s error=%s: %s", sheet, docs / filename, type(exc).__name__, exc, exc_info=True)
+                    log.error("分析ページを書き込めません: シート=%s、ファイル=%s、エラー=%s: %s", sheet, docs / filename, type(exc).__name__, exc, exc_info=True)
                     raise
                 files.append({"filename": filename, "title": f"{spec.title} — {suffix}", "kind": "analysis", "source_ranges": [list(source_range)], "summary": text.strip().splitlines()[0][:120] if text.strip() else ""})
         if on_progress:
@@ -703,7 +703,7 @@ async def write_tables(
         write_json_atomic(planning / "coverage.json", {"files": [{"title": item["title"], "filename": re.sub(r"^\d+-", "", item["filename"]), "summary": item["summary"], "header": "VBA" if item["kind"] == "vba" else "表", "source_start": item["source_ranges"][0][0], "source_end": item["source_ranges"][0][1]} for item in files]})
         write_json_atomic(planning / "metadata.json", {"files": [{"name": re.sub(r"^\d+-", "", item["filename"]), "header": "VBA" if item["kind"] == "vba" else "表"} for item in files]})
     except OSError as exc:
-        log.error("planning manifests could not be written, the built pages are not published as a run run=%s error=%s: %s", run_dir, type(exc).__name__, exc, exc_info=True)
+        log.error("構成の管理情報を保存できないため、生成したページを公開用の一式として登録できません: 実行ID=%s、エラー=%s: %s", run_dir, type(exc).__name__, exc, exc_info=True)
         raise
     return files
 

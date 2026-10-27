@@ -349,7 +349,7 @@ def _page_text(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         log.error(
-            "wiki page could not be read path=%s error=%s: %s",
+            "Wikiページを読み込めません: パス=%s、エラー=%s: %s",
             path, type(exc).__name__, exc, exc_info=True,
         )
         raise
@@ -375,14 +375,13 @@ def _clean_existing(project: Any) -> tuple[dict[str, str], list[str]]:
         path = Path(project.wiki) / rel
         if not path.exists():
             log.error(
-                "fast link manifest lists a page that is not in the wiki tree; its recorded links "
-                "cannot be undone page=%s path=%s", rel, path,
+                "高速リンクの記録にあるページがWikiにありません。記録されたリンクを取り消せません: ページ=%s、パス=%s", rel, path,
             )
             continue
         text, error = _undo_manifest_row(_page_text(path), row)
         if error:
             log.error(
-                "fast link undo failed; generated links remain on the published page page=%s error=%s",
+                "高速リンクを取り消せません。公開ページに生成済みリンクが残ります: ページ=%s、エラー=%s",
                 rel, error,
             )
             failures.append(f"{rel}: {error}")
@@ -398,7 +397,7 @@ def _inventory(project: Any, cleaned: dict[str, str]) -> list[Page]:
         planning_dirs = sorted(wiki.rglob("_planning/pages"))
     except OSError as exc:
         log.error(
-            "wiki page scan failed path=%s error=%s: %s (permission, unreadable mount, or too many open files?)",
+            "Wikiページを走査できません: パス=%s、エラー=%s: %s（権限・入力元の接続状態・開いているファイル数を確認してください）",
             wiki, type(exc).__name__, exc, exc_info=True,
         )
         raise
@@ -410,7 +409,7 @@ def _inventory(project: Any, cleaned: dict[str, str]) -> list[Page]:
             live = document_dir / original.name
             if not live.exists():
                 log.error(
-                    "planned page has no published page beside it; the page is skipped for linking page=%s",
+                    "構成にあるページが公開用フォルダーにないため、リンク処理を省略します: ページ=%s",
                     original.name,
                 )
                 continue
@@ -525,8 +524,7 @@ async def _extract(
                     pass  # a cold cache entry is the normal path, not a failure
                 except (TypeError, ValueError) as exc:
                     log.error(
-                        "fast link page cache entry is unusable; the page facts are extracted "
-                        "again with new model calls page=%s file=%s error=%s: %s",
+                        "高速リンクの保存情報を使えないため、モデルで再解析します: ページ=%s、ファイル=%s、エラー=%s: %s",
                         page.rel, path, type(exc).__name__, exc,
                     )
             jobs.append((page, group, key, path))
@@ -563,7 +561,7 @@ async def _extract(
                 error = f"{type(exc).__name__}: {exc}"
                 if attempt == EXTRACTION_ATTEMPTS:
                     log.error(
-                        "fast link metadata extraction failed page=%s attempts=%d error=%s: %s",
+                        "高速リンク用の情報を取得できません: ページ=%s、試行回数=%d、エラー=%s: %s",
                         page.rel, attempt, type(exc).__name__, exc, exc_info=True,
                     )
                 if attempt < EXTRACTION_ATTEMPTS and on_progress:
@@ -594,7 +592,7 @@ async def _extract(
         calls += attempts
         if error:
             failures.append(error)
-            log.error("fast link page failed; the whole link run will abort: %s", error)
+            log.error("高速リンク処理に失敗したため、今回のリンク処理全体を中断します: %s", error)
             continue
         facts_by_job[key] = facts
         write_json_atomic(path, {"version": VERSION, "facts": facts})
@@ -741,8 +739,7 @@ async def _check_roles(
                 reason = (f"{type(failed).__name__}: {failed}" if failed is not None
                           else f"no Jev score in {len(results)} results")
                 log.error(
-                    "fast link Jev role check failed; the entity is dropped page=%s entity=%s "
-                    "section=%s error=%s",
+                    "Jevで役割を確認できないため、用語を除外します: ページ=%s、用語=%s、節=%s、エラー=%s",
                     item.page.rel, item.name, item.segment.key, reason, exc_info=failed,
                 )
                 continue
@@ -880,8 +877,7 @@ async def _judge_candidates(
                 reason = (f"{type(failed).__name__}: {failed}" if failed is not None
                           else f"no Jev score in {len(results)} results")
                 log.error(
-                    "fast link Jev candidate check failed; the candidate is dropped "
-                    "page=%s target=%s anchor=%s kind=%s error=%s",
+                    "Jevでリンク候補を確認できないため、候補を除外します: ページ=%s、対象=%s、リンク位置=%s、種類=%s、エラー=%s",
                     candidate.source_page.rel, candidate.target_page.rel, candidate.anchor,
                     candidate.kind, reason, exc_info=failed,
                 )
@@ -1179,7 +1175,7 @@ def link_project(
                      if any(path.parent.parent.glob("*.md"))}
     except OSError as exc:
         log.error(
-            "wiki page scan failed path=%s error=%s: %s (permission, unreadable mount, or too many open files?)",
+            "Wikiページを走査できません: パス=%s、エラー=%s: %s（権限・入力元の接続状態・開いているファイル数を確認してください）",
             project.wiki, type(exc).__name__, exc, exc_info=True,
         )
         raise
@@ -1199,7 +1195,7 @@ def link_project(
         engine = get_engine_for(settings)
     except Exception as exc:
         log.error(
-            "fast link Jev engine unavailable; no links were added backend=%s error=%s: %s",
+            "Jevを利用できないため、高速リンクを追加できませんでした: 実行方式=%s、エラー=%s: %s",
             getattr(settings, "wiki_jev_backend", ""), type(exc).__name__, exc, exc_info=True,
         )
         return {"done": [], "failures": [f"fast link: Jev unavailable: {type(exc).__name__}: {exc}"]}
@@ -1237,8 +1233,7 @@ def reset_project(settings: Any) -> dict[str, Any]:
         text, error = _undo_manifest_row(_page_text(path), row)
         if error:
             log.error(
-                "fast link reset could not undo the generated links; they stay on the published "
-                "page page=%s error=%s", rel, error,
+                "高速リンクの初期化で生成済みリンクを取り消せません。公開ページにリンクが残ります: ページ=%s、エラー=%s", rel, error,
             )
             failures.append(f"{rel}: {error}")
             unresolved[rel] = row

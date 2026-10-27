@@ -84,11 +84,11 @@ class ActivityDetector:
         try:
             cursor = self.cursor()
         except (OSError, ValueError, TypeError) as exc:
-            log.error("activity cursor is unusable, detection restarts from nothing path=%s reason=malformed_cursor error=%s: %s",
+            log.error("変更検出の記録を使えないため、最初から検出します: パス=%s、エラー=%s: %s",
                       self.path, type(exc).__name__, exc, exc_info=True)
             return DetectionBatch(fallback_reason="malformed_cursor", metrics={"cursor_resets": 1})
         if cursor.get("endpoint_identity") != self.endpoint_identity:
-            log.error("activity cursor belongs to another endpoint, events across the change are unprocessed path=%s reason=endpoint_changed boundary=%s",
+            log.error("変更検出の記録が別の接続先のものです。切り替え前後の変更は未処理です: パス=%s、対象範囲=%s",
                       self.path, self.boundary)
             return DetectionBatch(fallback_reason="endpoint_changed", metrics={"cursor_resets": 1})
         known_ids = set(cursor.get("recent_ids") or []) | set(cursor.get("ids_at_last_timestamp") or [])
@@ -103,7 +103,7 @@ class ActivityDetector:
                 last_total = total
                 if not rows:
                     if offset < total:
-                        log.error("activity pages stopped before the reported total, events were missed path=%s reason=activity_pagination_gap offset=%d total=%d",
+                        log.error("変更一覧が報告された総数に達する前に終了しました。取得できなかった変更があります: パス=%s、取得位置=%d、総数=%d",
                                   self.path, offset, total)
                         return DetectionBatch(fallback_reason="activity_pagination_gap",
                                               metrics={"cursor_resets": 1})
@@ -114,7 +114,7 @@ class ActivityDetector:
                 if (floor is not None and oldest < floor) or offset >= total:
                     break
         except ValueError as exc:
-            log.error("activity timestamps are unparsable, events may be missed path=%s reason=malformed_activity_response error=%s: %s",
+            log.error("変更時刻を読み取れません。変更を見落とす場合があります: パス=%s、エラー=%s: %s",
                       self.path, type(exc).__name__, exc, exc_info=True)
             return DetectionBatch(
                 fallback_reason="malformed_activity_response",
@@ -122,7 +122,7 @@ class ActivityDetector:
             )
         except Exception as exc:
             status = getattr(exc, "status_code", None)
-            log.error("activity feed request failed, events may be missed path=%s reason=%s status=%s boundary=%s error=%s: %s",
+            log.error("変更一覧の取得に失敗しました。変更を見落とす場合があります: パス=%s、理由=%s、応答コード=%s、対象範囲=%s、エラー=%s: %s",
                       self.path,
                       "activity_permission_gap" if status in {401, 403} else "activity_api_unavailable",
                       status, self.boundary, type(exc).__name__, exc, exc_info=True)
@@ -134,12 +134,12 @@ class ActivityDetector:
         if checkpoint and known_ids and unique and not (set(unique) & known_ids):
             oldest_seen = min(_parse_time(row.created_at) for row in unique.values())
             if offset >= last_total and oldest_seen > checkpoint:
-                log.error("activity cursor is older than the events GROWI still returns, missed events are possible path=%s reason=cursor_too_old oldest_seen=%s checkpoint=%s",
+                log.error("変更検出の記録がGROWIの保存期間より古いため、変更を見落とす場合があります: パス=%s、取得できた最古の時刻=%s、記録時刻=%s",
                           self.path, oldest_seen.isoformat(), checkpoint.isoformat())
                 return DetectionBatch(fallback_reason="cursor_too_old", metrics={"cursor_resets": 1})
         if any(_parse_time(row.created_at) > datetime.now(timezone.utc) + timedelta(seconds=max(300, self.overlap_seconds))
                for row in unique.values()):
-            log.error("activity timestamps are in the future, this host or GROWI has a broken clock path=%s reason=clock_skew boundary=%s now=%s",
+            log.error("変更時刻が未来になっています。この端末またはGROWIの時計を確認してください: パス=%s、対象範囲=%s、現在時刻=%s",
                       self.path, self.boundary, datetime.now(timezone.utc).isoformat())
             return DetectionBatch(fallback_reason="clock_skew", metrics={"cursor_resets": 1})
         ordered = sorted(unique.values(), key=lambda row: (_parse_time(row.created_at), row.activity_id))
@@ -152,7 +152,7 @@ class ActivityDetector:
         sequences = [row.sequence for row in events if row.sequence is not None]
         previous_sequence = cursor.get("last_sequence")
         if sequences and previous_sequence is not None and min(sequences) > int(previous_sequence) + 1:
-            log.error("activity sequence jumped, events were missed path=%s reason=sequence_gap last_sequence=%s first_seen=%s",
+            log.error("変更の通し番号が飛んでいます。取得できなかった変更があります: パス=%s、前回の番号=%s、今回の先頭番号=%s",
                       self.path, previous_sequence, min(sequences))
             return DetectionBatch(fallback_reason="sequence_gap", metrics={"cursor_resets": 1})
         owned_ids = {str(row.get("page_id") or "") for row in owned_pages.values()}
@@ -200,7 +200,7 @@ class ActivityDetector:
         try:
             write_json_atomic(self.path, batch.cursor)
         except Exception as exc:  # noqa: BLE001 - the storage layer names the errno, only here knows the events at risk
-            log.error("activity cursor commit failed path=%s error=%s: %s; the next poll reprocesses these events or misses them",
+            log.error("変更検出の記録を確定できません。次回に同じ変更を再処理するか、見落とす場合があります: パス=%s、エラー=%s: %s",
                       self.path, type(exc).__name__, exc, exc_info=True)
             raise
 
@@ -211,10 +211,10 @@ class ActivityDetector:
         try:
             remote = asyncio.run(client.list_all_pages(self.boundary))
         except Exception as exc:  # noqa: BLE001 - a partial listing cannot be mistaken for the whole boundary
-            log.error("GROWI inventory listing failed boundary=%s error=%s: %s", self.boundary, type(exc).__name__, exc, exc_info=True)
+            log.error("GROWIのページ一覧を取得できません: 対象範囲=%s、エラー=%s: %s", self.boundary, type(exc).__name__, exc, exc_info=True)
             raise
         if any(not _inside(page.path, self.boundary) for page in remote):
-            log.error("GROWI inventory returned a page outside the configured boundary boundary=%s pages=%d",
+            log.error("GROWIのページ一覧に設定範囲外のページが含まれています: 対象範囲=%s、ページ数=%d",
                       self.boundary, len(remote))
             raise ValueError("inventory returned a page outside the configured boundary")
         remote_by_id = {page.page_id: page for page in remote if page.page_id}
@@ -248,7 +248,7 @@ class ActivityDetector:
                 try:
                     full = asyncio.run(client.get_page(page_id=page_id))
                 except Exception as exc:  # noqa: BLE001 - the ownership marker of this page stays unknown
-                    log.error("GROWI page fetch failed during inventory page_id=%s path=%s error=%s: %s",
+                    log.error("一覧確認中にGROWIページを取得できません: ページID=%s、パス=%s、エラー=%s: %s",
                               page_id, page.path, type(exc).__name__, exc, exc_info=True)
                     raise
                 fetched += 1

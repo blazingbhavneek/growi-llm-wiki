@@ -61,7 +61,7 @@ class ParseAhead:
         try:
             self._on_ready(position, job, markdown)
         except Exception as exc:  # noqa: BLE001 - planning ahead is only a cache optimization
-            log.warning("plan-ahead enqueue %s failed; the build will plan it: %s: %s",
+            log.warning("先行の構成作成を登録できません。本処理で構成を作成します: 文書=%s、エラー=%s: %s",
                         job.rel, type(exc).__name__, exc)
 
     def _run(self, project: Any, settings: Any, jobs: list[Any]) -> None:
@@ -123,7 +123,7 @@ class ParseAhead:
                         self._ready(position, job, target.read_text(encoding="utf-8"))
                     continue
             except Exception as exc:  # noqa: BLE001 - re-raised unchanged; the thread still dies, but not silently
-                log.error("parse-ahead failed outside the parse handler document=%s error=%s: %s; the remaining queued documents are parsed by the build itself",
+                log.error("先行解析の管理処理で失敗しました。残りの待機文書は本処理で解析します: 文書=%s、エラー=%s: %s",
                           job.rel, type(exc).__name__, exc, exc_info=True)
                 raise
             started = time.monotonic()
@@ -142,23 +142,23 @@ class ParseAhead:
                     )
                 _write_raw(target, markdown)
                 self._ready(position, job, markdown)
-                log.info("parse-ahead %s: %.1fs", job.rel, time.monotonic() - started)
+                log.info("先行解析が完了しました: 文書=%s、経過時間=%.1f秒", job.rel, time.monotonic() - started)
             except Exception as exc:  # noqa: BLE001 - the build parses it itself
                 if isinstance(exc, ParserSkip):
                     if skips is not None:
                         skips[skip_key] = str(exc)
-                    log.warning("パースをスキップ: %s: %s", job.rel, exc)
+                    log.warning("解析を省略します: %s: %s", job.rel, exc)
                 elif isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
                     # "the build will parse it" would be a false promise: the parse cache and the
                     # builder's raw tree share this full filesystem, so the same write fails again.
-                    log.error("parse-ahead cache write failed, the filesystem is full document=%s path=%s error=%s: %s",
+                    log.error("保存先の容量不足で先行解析の情報を書き込めません: 文書=%s、パス=%s、エラー=%s: %s",
                               job.rel, target, type(exc).__name__, exc, exc_info=True)
                 elif isinstance(exc, requests.exceptions.Timeout):
                     # A slow or dead parser endpoint is not a document that cannot be parsed.
-                    log.warning("parse-ahead parser request timed out document=%s error=%s: %s; the build will parse it again",
+                    log.warning("先行解析が制限時間を超えました。本処理で再解析します: 文書=%s、エラー=%s: %s",
                                 job.rel, type(exc).__name__, exc)
                 else:
-                    log.warning("parse-ahead %s failed; the build will parse it: %s: %s", job.rel, type(exc).__name__, exc)
+                    log.warning("先行解析に失敗しました。本処理で再解析します: 文書=%s、エラー=%s: %s", job.rel, type(exc).__name__, exc)
             finally:
                 with _PARSING_LOCK:
                     _PARSING.pop(target.name, None)
@@ -203,8 +203,7 @@ class PlannerAhead:
         try:
             model = _model(settings, project)
         except Exception as exc:  # noqa: BLE001 - the serial builder retains the normal fallback
-            log.error("plan-ahead disabled for the whole run setting=chat_base_url,chat_api_key,chat_model"
-                      " env=OPENAI_BASE_URL,OPENAI_API_KEY,OPENAI_MODEL_NAME error=%s: %s; the build plans every document itself",
+            log.error("先行の構成作成を今回の実行全体で停止します。本処理で全書類の構成を作成します: 設定=chat_base_url,chat_api_key,chat_model、環境変数=OPENAI_BASE_URL,OPENAI_API_KEY,OPENAI_MODEL_NAME、エラー=%s: %s",
                       type(exc).__name__, exc, exc_info=True)
             return
         while True:
@@ -230,9 +229,9 @@ class PlannerAhead:
                     model=model,
                     stop_check=self._stop.is_set,
                 )
-                log.info("plan-ahead %s: %.1fs", job.rel, time.monotonic() - started)
+                log.info("先行の構成作成が完了しました: 文書=%s、経過時間=%.1f秒", job.rel, time.monotonic() - started)
             except Exception as exc:  # noqa: BLE001 - the serial builder plans it itself
-                log.warning("plan-ahead %s failed; the build will plan it: %s: %s",
+                log.warning("先行の構成作成に失敗しました。本処理で再試行します: 文書=%s、エラー=%s: %s",
                             job.rel, type(exc).__name__, exc)
 
 
@@ -287,8 +286,7 @@ class LinkAhead:
         try:
             model = model or _model(settings, project)
         except Exception as exc:  # noqa: BLE001 - without a model the linker describes everything itself
-            log.error("link-ahead disabled for the whole run setting=chat_base_url,chat_api_key,chat_model"
-                      " env=OPENAI_BASE_URL,OPENAI_API_KEY,OPENAI_MODEL_NAME error=%s: %s; the linker describes every chunk itself",
+            log.error("先行リンクを今回の実行全体で停止します。リンクの本処理で全体を解析します: 設定=chat_base_url,chat_api_key,chat_model、環境変数=OPENAI_BASE_URL,OPENAI_API_KEY,OPENAI_MODEL_NAME、エラー=%s: %s",
                       type(exc).__name__, exc, exc_info=True)
             return
         engine = None
@@ -298,8 +296,7 @@ class LinkAhead:
 
                 engine = get_engine_for(settings)
             except Exception as exc:  # noqa: BLE001 - the linker reports Jev itself
-                log.error("link-ahead without Jev roles for the whole run setting=wiki_linker_judge"
-                          " env=WIKI_JEV_BACKEND,WIKI_JEV_BASE_URL,WIKI_JEV_MODEL,WIKI_JEV_TOKENIZER error=%s: %s; the judge runs without the role check",
+                log.error("今回の先行リンクではJevの役割確認を省略して判定します: 設定=wiki_linker_judge、環境変数=WIKI_JEV_BACKEND,WIKI_JEV_BASE_URL,WIKI_JEV_MODEL,WIKI_JEV_TOKENIZER、エラー=%s: %s",
                           type(exc).__name__, exc, exc_info=True)
         meta_version = policy.cache_key(CHUNK_META_VERSION)
         while True:
@@ -310,7 +307,7 @@ class LinkAhead:
                 await self._describe(item, settings=settings, model=model, engine=engine,
                                      policy=policy, meta_version=meta_version)
             except Exception as exc:  # noqa: BLE001 - the linker describes it itself
-                log.warning("link-ahead %s failed; the linker will describe it: %s: %s", item[0], type(exc).__name__, exc)
+                log.warning("先行リンクに失敗しました。リンクの本処理で解析します: 文書=%s、エラー=%s: %s", item[0], type(exc).__name__, exc)
 
     async def _describe(self, item: tuple, *, settings: Any, model: Any, engine: Any, policy: Any, meta_version: str) -> None:
         from graph.linker import chunks, meta_cache
@@ -341,7 +338,7 @@ class LinkAhead:
             chunk.text_sha256: chunk.meta for chunk in new
             if chunk.meta.keywords or chunk.meta.search_terms or chunk.meta.entities
         })
-        log.info("link-ahead %s: %d chunks, %d calls, %.1fs", rel, len(new), calls, time.monotonic() - started)
+        log.info("先行リンク処理が完了しました: 文書=%s、分割部分数=%d、呼び出し数=%d、経過時間=%.1f秒", rel, len(new), calls, time.monotonic() - started)
 
 
 __all__ = ["LinkAhead", "ParseAhead", "PlannerAhead"]

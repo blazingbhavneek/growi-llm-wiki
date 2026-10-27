@@ -24,15 +24,15 @@ class ShisaJevBackend:
 
     def __init__(self, config):
         if not config.base_url:
-            log.error("Shisa Jev backend cannot start: WIKI_JEV_BASE_URL is not set model=%s", config.model)
+            log.error("WIKI_JEV_BASE_URL が未設定のため、Shisa Jevを開始できません: モデル=%s", config.model)
             raise JevUnavailable("Shisa backend requires WIKI_JEV_BASE_URL")
         if not config.model:
-            log.error("Shisa Jev backend cannot start: WIKI_JEV_MODEL is not set")
+            log.error("WIKI_JEV_MODEL が未設定のため、Shisa Jevを開始できません")
             raise JevUnavailable("Shisa backend requires WIKI_JEV_MODEL")
         try:
             from shisa_de import DecisionModel, calibration_for
         except ImportError as exc:
-            log.error("Shisa Jev backend cannot start: the shisa-de package is missing error=%s: %s", type(exc).__name__, exc, exc_info=True)
+            log.error("shisa-de パッケージがないため、Shisa Jevを開始できません: エラー=%s: %s", type(exc).__name__, exc, exc_info=True)
             raise JevUnavailable(
                 "Shisa backend requires shisa-de (uv pip install --python .venv/bin/python shisa-de)"
             ) from exc
@@ -114,13 +114,13 @@ class ShisaJevBackend:
             result = self._result(request.question, answer, decision.usage)
             if result.answer == "None":
                 # shortcut: the value is still returned unchanged (class B); this only makes it visible.
-                log.error("Shisa DE-2 returned no answer value state=%s question=%s kind=%s (the string \"None\" is flowing downstream as the answer)", request.state_id[:12], getattr(request.question, "key", ""), getattr(request.question, "kind", ""))
+                log.error("Shisa DE-2の回答値がありません。文字列の None が回答として後続処理に渡されます: 状態=%s、質問=%s、種類=%s", request.state_id[:12], getattr(request.question, "key", ""), getattr(request.question, "kind", ""))
             return result
         except Exception as exc:
             if stage == "parse":
-                log.error("Shisa DE-2 answer could not be parsed state=%s question=%s kind=%s error=%s: %s (a response-shape bug, not a network failure)", request.state_id[:12], getattr(request.question, "key", ""), getattr(request.question, "kind", ""), type(exc).__name__, exc, exc_info=True)
+                log.error("Shisa DE-2の回答形式を読み取れません。通信ではなく回答形式の問題です: 状態=%s、質問=%s、種類=%s、エラー=%s: %s", request.state_id[:12], getattr(request.question, "key", ""), getattr(request.question, "kind", ""), type(exc).__name__, exc, exc_info=True)
             else:
-                log.error("Shisa DE-2 decide request failed state=%s question=%s kind=%s error=%s: %s", request.state_id[:12], getattr(request.question, "key", ""), getattr(request.question, "kind", ""), type(exc).__name__, exc, exc_info=True)
+                log.error("Shisa DE-2への判定要求に失敗しました: 状態=%s、質問=%s、種類=%s、エラー=%s: %s", request.state_id[:12], getattr(request.question, "key", ""), getattr(request.question, "kind", ""), type(exc).__name__, exc, exc_info=True)
             raise JevUnavailable(f"Shisa DE-2 request failed: {exc}") from exc
 
     @staticmethod

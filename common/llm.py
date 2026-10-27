@@ -43,14 +43,14 @@ async def structured_call(
     try:
         value = await structured_ainvoke(llm, schema, list(messages))
     except Exception as exc:
-        log.error("stage=llm structured call failed schema=%s error=%s: %s", name, type(exc).__name__, exc, exc_info=True)
+        log.error("モデルから指定形式の回答を取得できません: 形式=%s、エラー=%s: %s", name, type(exc).__name__, exc, exc_info=True)
         raise
     if validate is None:
         return value
     try:
         return validate(value)
     except Exception as exc:
-        log.error("stage=llm answer rejected by validator schema=%s error=%s: %s", name, type(exc).__name__, exc, exc_info=True)
+        log.error("モデルの回答が検証に通りません: 形式=%s、エラー=%s: %s", name, type(exc).__name__, exc, exc_info=True)
         raise
 
 
@@ -62,7 +62,7 @@ async def embed(embedder: Any, texts: list[str], *, ctx: Any = None) -> list[lis
     try:
         result = await embedder.aembed_documents(texts)
     except Exception as exc:
-        log.error("stage=embedder failed texts=%d error=%s: %s", len(texts), type(exc).__name__, exc, exc_info=True)
+        log.error("検索用ベクトルを作成できません: テキスト数=%d、エラー=%s: %s", len(texts), type(exc).__name__, exc, exc_info=True)
         raise
     return [list(vector) for vector in result]
 

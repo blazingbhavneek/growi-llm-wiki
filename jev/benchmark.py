@@ -34,7 +34,7 @@ def main():
                 except Exception as exc:
                     # A MemoryError here is the host running out of memory inside this cell; a
                     # kernel OOM kill (SIGKILL) cannot be logged from the dying process.
-                    log.error("Jev benchmark cell failed length=%d questions=%d sample=%d concurrency=%d error=%s: %s (the benchmark stops at this cell)", length, count, i, args.concurrency, type(exc).__name__, exc, exc_info=True)
+                    log.error("Jevの性能測定に失敗しました。この条件で測定を中断します: 長さ=%d、質問数=%d、標本数=%d、並列数=%d、エラー=%s: %s", length, count, i, args.concurrency, type(exc).__name__, exc, exc_info=True)
                     raise
                 latencies.append(time.perf_counter() - t)
                 return result
@@ -52,7 +52,7 @@ def main():
         if torch.cuda.is_available(): peak_vram = torch.cuda.max_memory_allocated()
     except ImportError as exc:
         # peak_vram_bytes stays 0, so the table must say "torch is missing" and not "there was no GPU".
-        log.error("Jev benchmark peak VRAM is unknown because torch is not installed, peak_vram_bytes stays 0 error=%s: %s", type(exc).__name__, exc, exc_info=True)
+        log.error("torch がないため、Jev性能測定の最大VRAM使用量を取得できません。peak_vram_bytes は0のままです: エラー=%s: %s", type(exc).__name__, exc, exc_info=True)
     for row in rows: row["peak_vram_bytes"] = peak_vram
     headers = ("length", "questions", "requests_s", "questions_s", "input_tokens_s", "p50", "p95", "p99", "peak_vram_bytes")
     print("| " + " | ".join(headers) + " |\n|" + "|".join("---" for _ in headers) + "|")

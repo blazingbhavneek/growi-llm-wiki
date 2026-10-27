@@ -89,7 +89,7 @@ def candidates(catalog: Catalog, chunk: Any, *, team: str | None = None, setting
         # Fewer values than hops means fewer hops: "40,30" disables the 3-hop expansion.
         try: caps = ([int(value) for value in settings.wiki_linker_hop_caps.split(",")] + [0, 0, 0])[:3]
         except (AttributeError, TypeError, ValueError) as exc:
-            log.error("hop caps setting is invalid, defaults kept setting=wiki_linker_hop_caps value=%r caps=%s error=%s: %s",
+            log.error("wiki_linker_hop_caps が不正なため、既定値を維持します: 値=%r、上限=%s、エラー=%s: %s",
                       getattr(settings, "wiki_linker_hop_caps", None), caps, type(exc).__name__, exc, exc_info=True)
     obvious = set() if judge else set(_similar_ids(catalog, chunk, team))
     for cid, _score in catalog.behaviour_chunks(team, entity_names, exclude_page=chunk.page_rel)[:caps[0]]:
@@ -159,7 +159,7 @@ async def filter_candidates(catalog: Catalog, model: Any, chunk: Any, selected: 
         pairs = [(item, row) for item, row in pairs if row is not None]
         target_row = catalog.chunk(chunk.chunk_id)
         if target_row is None:
-            log.error("target chunk missing from catalog chunk=%s document=%s page=%s; no edges are judged for this chunk", chunk.chunk_id, chunk.document, chunk.page_rel)
+            log.error("対象の分割部分がリンク情報にないため、リンクを判定しません: 分割部分=%s、文書=%s、ページ=%s", chunk.chunk_id, chunk.document, chunk.page_rel)
         if target_row is None or not pairs:
             continue
         messages = neo_edge_messages(_view(target_row), [{**_view(row), "via": item.via} for item, row in pairs])
@@ -170,7 +170,7 @@ async def filter_candidates(catalog: Catalog, model: Any, chunk: Any, selected: 
                 result = await model.structured(NeoEdgeSuggestions, messages)
             result = result if isinstance(result, NeoEdgeSuggestions) else NeoEdgeSuggestions.model_validate(result)
         except Exception as exc:
-            log.error("edge model call failed, candidate group dropped chunk=%s document=%s candidates=%s error=%s: %s",
+            log.error("リンク判定のモデル呼び出しに失敗したため、候補の組を除外します: 分割部分=%s、文書=%s、候補数=%s、エラー=%s: %s",
                       chunk.chunk_id, chunk.document, [item.chunk_id for item, _row in pairs], type(exc).__name__, exc, exc_info=True)
             continue
         allowed = {item.chunk_id for item, _row in pairs}

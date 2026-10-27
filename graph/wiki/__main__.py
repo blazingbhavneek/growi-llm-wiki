@@ -91,12 +91,12 @@ def main() -> None:
     try:
         result = asyncio.run(run_pipeline(args.source, config=config, on_progress=progress))
     except Exception as exc:  # noqa: BLE001 - the CLI has to name the run it failed on
-        log.error("wiki build failed source=%s kind=%s output=%s slug=%s error=%s: %s",
+        log.error("Wikiの生成に失敗しました: 元文書=%s、種類=%s、出力先=%s、文書識別名=%s、エラー=%s: %s",
                   args.source, config.source_kind, args.output, args.slug,
                   type(exc).__name__, exc, exc_info=True)
         raise
     print(json.dumps({"run": str(result), "wiki": str(result / "wiki")}, indent=2))
-    log.info("wiki build finished source=%s kind=%s output=%s run=%s wiki=%s",
+    log.info("Wikiの生成が完了しました: 元文書=%s、種類=%s、出力先=%s、実行ID=%s、Wiki=%s",
              args.source, config.source_kind, args.output, result, result / "wiki")
 
 

@@ -110,20 +110,20 @@ def parse(markdown: str) -> MokujiData | None:
         try:
             value = json.loads(line)
         except ValueError as exc:  # a hand edit broke one line: keep the rest
-            log.error("mokuji data record is not valid json and was dropped line=%d record=%s error=%s: %s", number, line[:120], type(exc).__name__, exc)
+            log.error("JSON形式ではない目次データを除外しました: 行=%d、記録=%s、エラー=%s: %s", number, line[:120], type(exc).__name__, exc)
             continue
         if isinstance(value, dict):
             records.append(value)
         else:
-            log.error("mokuji data record is not an object and was dropped line=%d found=%s", number, type(value).__name__)
+            log.error("オブジェクト形式ではない目次データを除外しました: 行=%d、形式=%s", number, type(value).__name__)
     head = next((record for record in records if record.get("type") == "block"), None)
     if head is None:
-        log.error("mokuji data block has no header record, records=%d; the block is corrupt, not absent, and its search data is unusable", len(records))
+        log.error("目次データの先頭情報がありません。データが破損しているため検索に使えません: 記録数=%d", len(records))
         return None
     if head.get("version") != VERSION:
-        log.error("mokuji data block has an unknown version=%s expected=%s name=%s", head.get("version"), VERSION, head.get("name", ""))
+        log.error("目次データのバージョンに対応していません: バージョン=%s、対応バージョン=%s、名前=%s", head.get("version"), VERSION, head.get("name", ""))
     if not head.get("hash"):
-        log.error("mokuji data header has no hash; the recomputed hash cannot detect a corrupt block name=%s", head.get("name", ""))
+        log.error("目次データのハッシュがありません。再計算したハッシュでは破損を検出できません: 名前=%s", head.get("name", ""))
     body = [record for record in records if record.get("type") != "block"]
     return MokujiData(level=str(head.get("level") or ""), name=str(head.get("name") or ""),
                       hash=str(head.get("hash") or block_hash(body)), version=int(head.get("version") or 0),

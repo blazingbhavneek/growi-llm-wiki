@@ -19,7 +19,7 @@ def render_page(*args: Any, **kwargs: Any) -> str:
     try:
         return render_legacy(*args, **kwargs)
     except Exception as exc:
-        log.error("stage=link page render failed page=%s error=%s: %s", kwargs.get("page_rel", ""), type(exc).__name__, exc, exc_info=True)
+        log.error("リンク処理でページを整形できません: ページ=%s、エラー=%s: %s", kwargs.get("page_rel", ""), type(exc).__name__, exc, exc_info=True)
         raise
 
 
@@ -29,7 +29,7 @@ def footer_edges(*args: Any, **kwargs: Any) -> Any:
     try:
         return footer_legacy(*args, **kwargs)
     except Exception as exc:
-        log.error("stage=link footer edges failed page=%s error=%s: %s", kwargs.get("page_rel", ""), type(exc).__name__, exc, exc_info=True)
+        log.error("ページ末尾の関連リンクを作成できません: ページ=%s、エラー=%s: %s", kwargs.get("page_rel", ""), type(exc).__name__, exc, exc_info=True)
         raise
 
 

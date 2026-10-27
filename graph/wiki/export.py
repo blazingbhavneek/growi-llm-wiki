@@ -29,36 +29,36 @@ def export_ingest_layout(run_root: Path, dest: Path, *, document_name: str) -> P
     try:
         plan = read_json(plan_path)
     except FileNotFoundError as exc:
-        log.error("wiki export stopped, this run has no seed plan file=%s run=%s document=%s error=%s: %s (the run never produced a plan, so there is nothing to export)",
+        log.error("基本構成がないため、Wikiの書き出しを中断します。構成が生成されていません: ファイル=%s、実行ID=%s、文書=%s、エラー=%s: %s",
                   plan_path, run_root, document_name, type(exc).__name__, exc, exc_info=True)
         raise
     except (OSError, ValueError) as exc:
         # storage.read_json already names the file and the errno; this names the export it stopped.
-        log.error("wiki export stopped, the seed plan exists but could not be read file=%s run=%s document=%s error=%s: %s (corrupt or unreadable run state, not a missing file)",
+        log.error("基本構成が破損しているか読めないため、Wikiの書き出しを中断します: ファイル=%s、実行ID=%s、文書=%s、エラー=%s: %s",
                   plan_path, run_root, document_name, type(exc).__name__, exc, exc_info=True)
         raise
     try:
         pages = plan["pages"]
     except KeyError as exc:
-        log.error("wiki plan has no page list file=%s key=%s document=%s error=%s: %s",
+        log.error("Wiki構成にページ一覧がありません: ファイル=%s、項目=%s、文書=%s、エラー=%s: %s",
                   plan_path, exc, document_name, type(exc).__name__, exc, exc_info=True)
         raise
     manifest_path = run_root / "state" / "manifest.json"
     try:
         manifest = read_json(manifest_path, default={})
     except (OSError, ValueError) as exc:
-        log.error("wiki export stopped, the run manifest could not be read file=%s run=%s document=%s error=%s: %s (judge scores and verbatim-section marks cannot be recovered without it)",
+        log.error("実行情報を読めないため、Wikiの書き出しを中断します。評価点と原文使用箇所を復元できません: ファイル=%s、実行ID=%s、文書=%s、エラー=%s: %s",
                   manifest_path, run_root, document_name, type(exc).__name__, exc, exc_info=True)
         raise
     if not manifest:
         # shortcut: a run without a manifest is a normal older run, not a failure; only the
         # judge fields stay empty.  Upgrade to ERROR if the manifest ever becomes mandatory.
-        log.debug("run has no judge manifest file=%s run=%s; the exported planning files carry no judge_score or verbatim_sections",
+        log.debug("判定結果の管理ファイルがありません。出力する構成に評価点と原文使用箇所は含まれません: ファイル=%s、実行ID=%s",
                   manifest_path, run_root)
     try:
         by_number = {int(item["number"]): item for item in manifest.get("pages", [])}
     except (KeyError, TypeError, ValueError) as exc:
-        log.error("wiki run manifest has no usable page numbers file=%s run=%s document=%s error=%s: %s (the manifest exists but is corrupt, not missing)",
+        log.error("実行情報のページ番号が不正です。ファイルが破損しています: ファイル=%s、実行ID=%s、文書=%s、エラー=%s: %s",
                   manifest_path, run_root, document_name, type(exc).__name__, exc, exc_info=True)
         raise
 
@@ -66,7 +66,7 @@ def export_ingest_layout(run_root: Path, dest: Path, *, document_name: str) -> P
         try:
             shutil.rmtree(dest)
         except OSError as exc:
-            log.error("export destination delete failed dest=%s document=%s error=%s: %s (the destination may be half-deleted)",
+            log.error("書き出し先を削除できません。一部だけ削除されている場合があります: 保存先=%s、文書=%s、エラー=%s: %s",
                       dest, document_name, type(exc).__name__, exc, exc_info=True)
             raise
     docs = dest / "docs"
@@ -75,7 +75,7 @@ def export_ingest_layout(run_root: Path, dest: Path, *, document_name: str) -> P
         docs.mkdir(parents=True)
         planning.mkdir(parents=True)
     except OSError as exc:
-        log.error("export destination could not be created dest=%s document=%s error=%s: %s (the previous export contents may already be deleted)",
+        log.error("書き出し先を作成できません。以前の出力は削除済みの場合があります: 保存先=%s、文書=%s、エラー=%s: %s",
                   dest, document_name, type(exc).__name__, exc, exc_info=True)
         raise
 
@@ -86,18 +86,18 @@ def export_ingest_layout(run_root: Path, dest: Path, *, document_name: str) -> P
         try:
             filename = page["filename"]
         except KeyError as exc:
-            log.error("planned page has no file name file=%s run=%s document=%s page_number=%s error=%s: %s",
+            log.error("構成内のページにファイル名がありません: ファイル=%s、実行ID=%s、文書=%s、ページ番号=%s、エラー=%s: %s",
                       plan_path, run_root, document_name, page.get("number"), type(exc).__name__, exc, exc_info=True)
             raise
         source = run_root / "wiki" / filename
         if not source.exists():
-            log.error("wiki run has no published page for a planned page run=%s document=%s page=%s file=%s (the plan lists a page this run never wrote, so the export cannot be complete)",
+            log.error("構成にあるページが生成されていないため、完全に書き出せません: 実行ID=%s、文書=%s、ページ=%s、ファイル=%s",
                       run_root, document_name, filename, source)
             raise FileNotFoundError(f"wiki run has no published page {filename}")
         try:
             shutil.copyfile(source, docs / filename)
         except OSError as exc:
-            log.error("export page copy failed page=%s path=%s run=%s document=%s error=%s: %s (disk full, permissions, or the source page disappeared)",
+            log.error("ページを書き出し先にコピーできません: ページ=%s、パス=%s、実行ID=%s、文書=%s、エラー=%s: %s（容量・権限・元ページの存在を確認してください）",
                       filename, docs / filename, run_root, document_name, type(exc).__name__, exc, exc_info=True)
             raise
         owner = page["owner_ranges"]
@@ -159,7 +159,7 @@ def export_ingest_layout(run_root: Path, dest: Path, *, document_name: str) -> P
         )
     except (OSError, ValueError) as exc:
         # _atomic_write already named the file and the errno; this adds what the caller loses.
-        log.error("export planning files are incomplete dest=%s document=%s error=%s: %s (the ingest layout at this path is unusable until the run is exported again)",
+        log.error("構成ファイルの書き出しが未完了です。再度書き出すまで取り込み用データを使えません: 保存先=%s、文書=%s、エラー=%s: %s",
                   dest, document_name, type(exc).__name__, exc, exc_info=True)
         raise
     review = run_root / "wiki" / "_review.md"
@@ -167,7 +167,7 @@ def export_ingest_layout(run_root: Path, dest: Path, *, document_name: str) -> P
         try:
             shutil.copyfile(review, planning / "_review.md")
         except OSError as exc:
-            log.error("review file copy failed path=%s source=%s document=%s error=%s: %s (the pages are exported; only the review notes are missing)",
+            log.error("確認用メモをコピーできません。ページの書き出しは完了しています: パス=%s、コピー元=%s、文書=%s、エラー=%s: %s",
                       planning / "_review.md", review, document_name, type(exc).__name__, exc, exc_info=True)
             raise
     return dest

@@ -101,7 +101,7 @@ class Policy:
     def offline_seed_plan(self, lines: Sequence[str]) -> Any:
         """Plan used when ``offline`` and no model client exists."""
         log.error(
-            "policy cannot plan without a model policy=%s lines=%d (the policy name comes from the settings policy field, --policy or --set policy=)",
+            "モデルが未設定のため構成を作成できません: 処理方式=%s、行数=%d（設定の policy、--policy、--set policy= を確認してください）",
             self.name,
             len(lines),
         )
@@ -155,7 +155,7 @@ _RESOLVED: set[str] = set()
 def _note_resolved(policy: Policy) -> Policy:
     if policy.name not in _RESOLVED:
         _RESOLVED.add(policy.name)
-        log.info("policy resolved policy=%s version=%s", policy.name, policy.version)
+        log.info("処理方式を決定しました: 方式=%s、バージョン=%s", policy.name, policy.version)
     return policy
 
 
@@ -166,7 +166,7 @@ def resolve_policy(value: str | Policy | None) -> Policy:
     if normalized in {"", "standard", "standard-v1"}:
         if value is not None and not str(value).strip():
             log.warning(
-                "policy field is empty, standard policy is used instead policy=%r (check the settings policy field, --policy or --set policy=)",
+                "policy が空のため standard を使います: 値=%r（設定の policy、--policy、--set policy= を確認してください）",
                 value,
             )
         return _note_resolved(STANDARD)
@@ -175,7 +175,7 @@ def resolve_policy(value: str | Policy | None) -> Policy:
 
         return _note_resolved(FAST)
     log.error(
-        "policy name is not a known policy policy=%r error=policy must be standard or fast (the value comes from the settings policy field, --policy or --set policy=)",
+        "処理方式の設定が不正です: 値=%r。standard または fast を指定してください（設定の policy、--policy、--set policy= を確認してください）",
         value,
     )
     raise ValueError("policy must be standard or fast")
@@ -186,7 +186,7 @@ def policy_of(owner: Any) -> Policy:
 
     if not hasattr(owner, "policy"):
         log.warning(
-            "policy field is missing, standard policy is used owner=%s field=policy",
+            "policy が未設定のため standard を使います: 設定元=%s",
             type(owner).__name__,
         )
     return resolve_policy(getattr(owner, "policy", "standard"))

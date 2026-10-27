@@ -301,7 +301,7 @@ async def _generate_page(
 
     if best_verdict is None:
         log.error(
-            "fast page has no acceptable candidate; it is published as a raw source dump document=%s page=%s attempts=%d last errors=%s",
+            "採用できる生成結果がないため、元のテキストをそのまま公開します: 文書=%s、ページ=%s、試行回数=%d、最後のエラー=%s",
             prompt_page.document,
             page.filename,
             max_attempts,
@@ -364,7 +364,7 @@ async def rewrite_pending_pages(
     policy = policy_of(config)
     if model is None:
         log.error(
-            "fast page writing has no model client (missing model config or API key); every page of this document becomes a verbatim source dump document=%s pages=%d",
+            "モデル設定またはAPIキーがないため、この文書の全ページを元のテキストのまま作成します: 文書=%s、ページ数=%d",
             source_path,
             len(pending),
         )
@@ -401,7 +401,7 @@ async def rewrite_pending_pages(
             )
             error = f"{type(exc).__name__}: {exc}"[:1000]
             log.error(
-                "fast page generation failed; the page is published as verbatim source document=%s page=%s error=%s",
+                "ページの生成に失敗したため、元のテキストをそのまま公開します: 文書=%s、ページ=%s、エラー=%s",
                 source_path,
                 session.page.filename,
                 error,
@@ -439,7 +439,7 @@ async def rewrite_pending_pages(
         except OSError as exc:
             # common/storage + graph/wiki/storage log the file error (path + errno) on the line above.
             log.error(
-                "fast page artifacts could not be written; the commit loop stops here and this document stays partly written document=%s page=%s path=%s",
+                "生成物を書き込めないため、ページの確定を中断します。文書は一部だけ保存された状態です: 文書=%s、ページ=%s、パス=%s",
                 source_path,
                 page.filename,
                 session.task_dir,
@@ -463,7 +463,7 @@ async def rewrite_pending_pages(
         restored, unresolved = wiki.restore_images(markdown, session.page_units)
         if unresolved:
             log.error(
-                "fast page commit stopped; unresolved image placeholders abort the remaining commits document=%s page=%s placeholders=%s",
+                "未解決の画像参照があるため、残りのページの確定を中断します: 文書=%s、ページ=%s、画像参照=%s",
                 source_path,
                 page.filename,
                 unresolved,
@@ -508,7 +508,7 @@ async def rewrite_pending_pages(
             )
         except OSError as exc:
             log.error(
-                "fast page could not be committed; the document is half-published and the remaining pages are not written document=%s page=%s path=%s",
+                "ページを確定できません。文書は一部だけ公開された状態で、残りのページは保存されません: 文書=%s、ページ=%s、パス=%s",
                 source_path,
                 page.filename,
                 wiki_root / page.filename,
@@ -534,7 +534,7 @@ async def rewrite_pending_pages(
             verbatim_sections=len(result.verbatim_sections),
         )
         log.info(
-            "fast page written document=%s page=%s current=%d of=%d attempts=%d score=%s verbatim=%d",
+            "ページを作成しました: 文書=%s、ページ=%s、完了数=%d、総数=%d、試行回数=%d、評価点=%s、原文使用=%d",
             source_path,
             page.filename,
             len(results),

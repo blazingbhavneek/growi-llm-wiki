@@ -54,7 +54,7 @@ class Context:
             yield
         except BaseException as exc:
             # logged before the callback: emit may be None, and a callback failure must not eat the record.
-            log.error("stage=%s document=%s failed error=%s: %s", stage, document, type(exc).__name__, exc, exc_info=True)
+            log.error("処理に失敗しました: 工程=%s、文書=%s、エラー=%s: %s", stage, document, type(exc).__name__, exc, exc_info=True)
             self.event(stage, "error", document=document, error=f"{type(exc).__name__}: {exc}", elapsed_seconds=round(time.monotonic() - started, 3))
             raise
         else:

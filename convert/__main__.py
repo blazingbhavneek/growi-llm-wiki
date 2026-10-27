@@ -21,7 +21,7 @@ def main() -> int:
     args = parser.parse_args()
     settings = load_settings(args.config) if args.config else None
     log.info(
-        "convert phase started config=%s project=%s source=%s out=%s relative=%s",
+        "変換を開始します: 設定=%s、プロジェクト=%s、変換元=%s、出力先=%s、相対パス=%s",
         args.config or "(no config given)",
         getattr(settings, "target_name", "") or "(no project selected)",
         args.source,
@@ -31,7 +31,7 @@ def main() -> int:
     result = run(Config.from_settings(settings) if settings is not None else Config(), Input(Path(args.source), args.relative), Path(args.out))
     print(json.dumps({"raw": str(result.raw_path), "relative": result.relative, "changed": result.changed}, ensure_ascii=False))
     log.info(
-        "convert result raw=%s relative=%s changed=%s",
+        "変換結果: テキスト=%s、相対パス=%s、変更有無=%s",
         result.raw_path,
         result.relative,
         result.changed,

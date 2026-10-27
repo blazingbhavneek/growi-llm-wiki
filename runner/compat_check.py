@@ -37,7 +37,7 @@ def tree_hash(root: Path) -> dict[str, str]:
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError as exc:
             log.error(
-                "compat check file could not be hashed path=%s error=%s: %s (disk full, unreadable, or the file vanished mid-run)",
+                "互換性確認のハッシュを計算できません: パス=%s、エラー=%s: %s（容量・読み取り権限・ファイルの存在を確認してください）",
                 path,
                 type(exc).__name__,
                 exc,
@@ -97,7 +97,7 @@ def main() -> int:
 
     settings = load_settings(args.project)
     log.info(
-        "compat check started project=%s config=%s data_root=%s commands=%d",
+        "互換性の確認を開始します: プロジェクト=%s、設定=%s、データ保存先=%s、コマンド数=%d",
         getattr(settings, "target_name", ""),
         args.project,
         args.data_root or "(from config)",
@@ -106,7 +106,7 @@ def main() -> int:
     data_root = Path(args.data_root or settings.data_root)
     source = data_root / settings.target_name
     if not source.is_dir():
-        log.error("project data folder not found path=%s project=%s error=not a directory", source, settings.target_name)
+        log.error("プロジェクトのデータフォルダーが見つからないか、フォルダーではありません: パス=%s、プロジェクト=%s", source, settings.target_name)
         parser.error(f"project data not found: {source}")
     calls: list[str] = []
     report: dict[str, object] = {"project": str(source), "commands": {}}
@@ -114,7 +114,7 @@ def main() -> int:
         temporary = tempfile.TemporaryDirectory(prefix="llm-wiki-compat-")
     except OSError as exc:
         log.error(
-            "compat check temp folder failed project=%s source=%s error=%s: %s (disk full?)",
+            "互換性確認の一時フォルダーを作成できません。ディスク容量を確認してください: プロジェクト=%s、元データ=%s、エラー=%s: %s",
             settings.target_name,
             source,
             type(exc).__name__,
@@ -128,7 +128,7 @@ def main() -> int:
             shutil.copytree(source, copy, symlinks=True)
         except OSError as exc:
             log.error(
-                "compat check data copy failed source=%s target=%s error=%s: %s (disk full, or the data tree is unreadable)",
+                "互換性確認のデータをコピーできません: コピー元=%s、コピー先=%s、エラー=%s: %s（容量・読み取り権限を確認してください）",
                 source,
                 copy,
                 type(exc).__name__,
@@ -145,7 +145,7 @@ def main() -> int:
                         report["commands"][command] = cli.main()
                     except BaseException as exc:  # noqa: BLE001 - report every command
                         log.error(
-                            "compat check command crashed command=%s project=%s error=%s: %s (the full traceback is in debug.log)",
+                            "互換性確認中にコマンドが異常終了しました。詳しい実行経路は debug.log を確認してください: コマンド=%s、プロジェクト=%s、エラー=%s: %s",
                             command,
                             settings.target_name,
                             type(exc).__name__,
@@ -160,7 +160,7 @@ def main() -> int:
     if calls or changed:
         tree = report["tree"]
         log.error(
-            "compat check failed project=%s blocked_calls=%d added=%d removed=%d changed=%d (an unchanged project must be a no-op for this code)",
+            "互換性の確認に失敗しました。変更のないプロジェクトに処理が発生しています: プロジェクト=%s、禁止呼び出し数=%d、追加数=%d、削除数=%d、変更数=%d",
             settings.target_name,
             len(calls),
             len(tree["added"]),
@@ -169,7 +169,7 @@ def main() -> int:
         )
     else:
         log.info(
-            "compat check passed project=%s commands=%d (no blocked call and no changed byte)",
+            "互換性の確認に成功しました。禁止呼び出しやデータ変更はありません: プロジェクト=%s、コマンド数=%d",
             settings.target_name,
             len(report["commands"]),
         )

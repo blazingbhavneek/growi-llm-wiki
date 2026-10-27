@@ -59,12 +59,12 @@ def _git(project: Project, *args: str, input: bytes | None = None, text: bool = 
         )
     except FileNotFoundError as exc:
         # No git at all is an install/PATH problem, not a repository problem.
-        log.error("git binary not found command=%s error=%s: %s (is git installed and on PATH?)",
+        log.error("git が見つかりません。導入状態とPATHを確認してください: コマンド=%s、エラー=%s: %s",
                   command, type(exc).__name__, exc, exc_info=True)
         raise
     except subprocess.CalledProcessError as exc:
         # The reason lives in git's stderr: a corrupt repo, .git/index.lock, a full disk.
-        log.error("git failed code=%s command=%s stderr=%s error=%s: %s",
+        log.error("Gitの実行に失敗しました: 終了コード=%s、コマンド=%s、標準エラー=%s、エラー=%s: %s",
                   exc.returncode, command, _stderr(exc), type(exc).__name__, exc, exc_info=True)
         raise
     if binary:
@@ -93,7 +93,7 @@ def _validate_legacy_state(project: Project, ledger: Any) -> None:
         if expected_source and source.is_file():
             valid = valid and expected_source == hashlib.sha256(source.read_bytes()).hexdigest()
         if not valid:
-            log.error("Git baseline refused: incomplete generated state document=%s; run a normal repair sync", rel)
+            log.error("生成状態が不完全なため、Gitの基準を作成できません: 文書=%s。通常の修復同期を実行してください", rel)
             raise RuntimeError(f"cannot create Git baseline: incomplete generated state for {rel}; run a normal repair sync")
         known_raw.add(raw_rel)
         known_wiki.add(wiki)
@@ -106,7 +106,7 @@ def _validate_legacy_state(project: Project, ledger: Any) -> None:
             if not known_state & {path.parent.parent, *path.parent.parent.parents}}
     )
     if orphaned:
-        log.error("Git baseline refused: generated data is not represented by pipeline.json count=%d; run a normal repair sync", len(orphaned))
+        log.error("pipeline.json に登録されていない生成データがあるため、Gitの基準を作成できません: 件数=%d。通常の修復同期を実行してください", len(orphaned))
         raise RuntimeError("cannot create Git baseline: generated data is not represented by pipeline.json; run a normal repair sync")
 
 
@@ -140,7 +140,7 @@ def _adopt_built_documents(project: Project) -> None:
 def _validate_empty_unledgered_state(project: Project) -> None:
     for root in (project.raw, project.wiki, project.metadata / "state"):
         if root.is_dir() and any(path.is_file() for path in root.rglob("*")):
-            log.error("Git baseline refused: generated files exist without pipeline.json path=%s; run a normal repair sync", root)
+            log.error("pipeline.json がないのに生成ファイルが存在するため、Gitの基準を作成できません: パス=%s。通常の修復同期を実行してください", root)
             raise RuntimeError(
                 "cannot create Git baseline from generated data without pipeline.json; "
                 "run a normal repair sync"
@@ -201,10 +201,10 @@ def ensure_repository(project: Project) -> str:
         try:
             subprocess.run(["git", "init", "-q", str(project.root)], check=True, capture_output=True)
         except subprocess.CalledProcessError as exc:
-            log.error("git init failed root=%s code=%s stderr=%s error=%s: %s",
+            log.error("git init に失敗しました: 保存先=%s、終了コード=%s、標準エラー=%s、エラー=%s: %s",
                       project.root, exc.returncode, _stderr(exc), type(exc).__name__, exc, exc_info=True)
             raise
-        log.info("git repository initialized root=%s", project.root)
+        log.info("Gitリポジトリを初期化しました: 保存先=%s", project.root)
         _git(project, "config", "user.name", "llm-wiki")
         _git(project, "config", "user.email", "llm-wiki@local")
         ignore = project.root / ".gitignore"
@@ -213,7 +213,7 @@ def ensure_repository(project: Project) -> str:
         try:
             ignore.write_text(existing.rstrip() + ("\n" if existing.strip() else "") + "\n".join(missing) + "\n", encoding="utf-8")
         except OSError as exc:
-            log.error("gitignore update failed path=%s error=%s: %s (the baseline would commit generated files)",
+            log.error(".gitignore を更新できません。生成ファイルが基準のコミットに含まれてしまいます: パス=%s、エラー=%s: %s",
                       ignore, type(exc).__name__, exc, exc_info=True)
             raise
         _migrate_legacy_state(project)
@@ -226,7 +226,7 @@ def ensure_repository(project: Project) -> str:
         try:
             return last_good(project)
         except subprocess.CalledProcessError:
-            log.error("last-good ref is missing root=%s; the repository is re-baselined from the current live tree", project.root)
+            log.error("前回の正常な確定状態がありません。現在の本番状態から基準を作り直します: 保存先=%s", project.root)
             from .ledger import load_ledger
 
             ignore = project.root / ".gitignore"
@@ -235,7 +235,7 @@ def ensure_repository(project: Project) -> str:
             try:
                 ignore.write_text(existing.rstrip() + ("\n" if existing.strip() else "") + "\n".join(missing) + "\n", encoding="utf-8")
             except OSError as exc:
-                log.error("gitignore update failed path=%s error=%s: %s (the baseline would commit generated files)",
+                log.error(".gitignore を更新できません。生成ファイルが基準のコミットに含まれてしまいます: パス=%s、エラー=%s: %s",
                           ignore, type(exc).__name__, exc, exc_info=True)
                 raise
             ledger_path = project.metadata / "pipeline.json"
@@ -272,11 +272,11 @@ def stage_blob(project: Project, source_path: Path) -> Blob:
         payload = source_path.read_bytes()
         after = source_path.stat()
     except OSError as exc:
-        log.error("source sample could not be read path=%s error=%s: %s (this document cannot be staged)",
+        log.error("元文書の確認用データを読めないため、この文書を準備できません: パス=%s、エラー=%s: %s",
                   source_path, type(exc).__name__, exc, exc_info=True)
         raise
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or len(payload) != after.st_size:
-        log.error("source changed while staging path=%s (another process is writing the mount file)", source_path)
+        log.error("準備中に元文書が変更されました。別の処理が入力ファイルを書き換えています: パス=%s", source_path)
         raise RuntimeError(f"source changed while staging: {source_path}")
     digest = hashlib.sha256(payload).hexdigest()
     oid = str(_git(project, "hash-object", "-w", "--stdin", input=payload))
@@ -341,7 +341,7 @@ def candidate(project: Project, operation_id: str, *, keep: bool = False) -> Ite
                 ) as target:
                     source.backup(target)
             except sqlite3.Error as exc:
-                log.error("linker database copy failed source=%s target=%s error=%s: %s (a corrupt or locked database stops this candidate)",
+                log.error("リンク情報のデータベースをコピーできません。破損または使用中のため、この候補の処理を中断します: コピー元=%s、コピー先=%s、エラー=%s: %s",
                           project.linker_database, staged.linker_database, type(exc).__name__, exc, exc_info=True)
                 raise
         yield staged
@@ -350,7 +350,7 @@ def candidate(project: Project, operation_id: str, *, keep: bool = False) -> Ite
             try:
                 _git(project, "worktree", "prune")
             except subprocess.CalledProcessError:
-                log.error("worktree prune failed operation=%s root=%s; stale worktree registrations are still listed", operation_id, root)
+                log.error("Gitの古い作業ツリー登録を整理できません。登録が残っています: 操作=%s、保存先=%s", operation_id, root)
         else:
             removed = subprocess.run(
                 ["git", "-C", str(project.root), "worktree", "remove", "--force", str(root)],
@@ -358,12 +358,12 @@ def candidate(project: Project, operation_id: str, *, keep: bool = False) -> Ite
                 capture_output=True,
             )
             if removed.returncode != 0:
-                log.error("worktree remove failed code=%s root=%s stderr=%s (git still lists this worktree)",
+                log.error("Gitの作業ツリーを削除できません。Gitの登録にも残っています: 終了コード=%s、保存先=%s、標準エラー=%s",
                           removed.returncode, root, _stderr(removed))
             shutil.rmtree(root.parent, ignore_errors=True)
             # shortcut: exists() says something survived, not which entry failed; upgrade to onerror= if the reason is ever needed.
             if root.parent.exists():
-                log.error("candidate worktree left behind operation=%s path=%s (leftover worktrees accumulate and fill the disk)", operation_id, root.parent)
+                log.error("候補の作業ツリーが残っています。蓄積するとディスク容量を使い切ります: 操作=%s、パス=%s", operation_id, root.parent)
             _git(project, "worktree", "prune")
 
 
@@ -377,16 +377,16 @@ def remove_candidate(project: Project, operation_id: str) -> None:
         capture_output=True,
     )
     if removed.returncode != 0:
-        log.error("worktree remove failed code=%s root=%s stderr=%s (git still lists this worktree)",
+        log.error("Gitの作業ツリーを削除できません。Gitの登録にも残っています: 終了コード=%s、保存先=%s、標準エラー=%s",
                   removed.returncode, root, _stderr(removed))
     shutil.rmtree(root.parent, ignore_errors=True)
     # shortcut: exists() says something survived, not which entry failed; upgrade to onerror= if the reason is ever needed.
     if root.parent.exists():
-        log.error("candidate worktree left behind operation=%s path=%s (leftover worktrees accumulate and fill the disk)", operation_id, root.parent)
+        log.error("候補の作業ツリーが残っています。蓄積するとディスク容量を使い切ります: 操作=%s、パス=%s", operation_id, root.parent)
     try:
         _git(project, "worktree", "prune")
     except subprocess.CalledProcessError:
-        log.error("worktree prune failed operation=%s root=%s; stale worktree registrations are still listed", operation_id, root)
+        log.error("Gitの古い作業ツリー登録を整理できません。登録が残っています: 操作=%s、保存先=%s", operation_id, root)
 
 
 def list_candidate_ids(project: Project) -> list[str]:
@@ -394,7 +394,7 @@ def list_candidate_ids(project: Project) -> list[str]:
     try:
         base = _candidate_base(project).resolve()
     except OSError as exc:
-        log.error("candidate directory could not be located root=%s error=%s: %s; the candidate list may be incomplete",
+        log.error("候補フォルダーを特定できません。候補一覧が不完全な場合があります: 保存先=%s、エラー=%s: %s",
                   project.root, type(exc).__name__, exc, exc_info=True)
         return []
     if not base.is_dir():
@@ -406,7 +406,7 @@ def list_candidate_ids(project: Project) -> list[str]:
     try:
         children = list(base.iterdir())
     except OSError as exc:
-        log.error("candidate directory is unreadable path=%s error=%s: %s; reported as no candidates, the list may be incomplete",
+        log.error("候補フォルダーを読めないため、候補なしとして扱います。一覧が不完全な場合があります: パス=%s、エラー=%s: %s",
                   base, type(exc).__name__, exc, exc_info=True)
         return []
     ids: list[str] = []
@@ -415,7 +415,7 @@ def list_candidate_ids(project: Project) -> list[str]:
             if child.is_dir() and (child / expected).is_dir():
                 ids.append(child.name)
         except OSError as exc:
-            log.error("candidate entry is unreadable path=%s error=%s: %s; the candidate list may be incomplete",
+            log.error("候補の項目を読めません。候補一覧が不完全な場合があります: パス=%s、エラー=%s: %s",
                       child, type(exc).__name__, exc, exc_info=True)
             continue
     return sorted(ids)
@@ -439,7 +439,7 @@ def resumed_candidate(project: Project, operation_id: str, commit: str) -> Itera
             ) as target:
                 source.backup(target)
         except sqlite3.Error as exc:
-            log.error("linker database copy failed source=%s target=%s error=%s: %s (a corrupt or locked database stops this candidate)",
+            log.error("リンク情報のデータベースをコピーできません。破損または使用中のため、この候補の処理を中断します: コピー元=%s、コピー先=%s、エラー=%s: %s",
                       project.linker_database, staged.linker_database, type(exc).__name__, exc, exc_info=True)
             raise
     try:
@@ -448,7 +448,7 @@ def resumed_candidate(project: Project, operation_id: str, commit: str) -> Itera
         try:
             _git(project, "worktree", "prune")
         except subprocess.CalledProcessError:
-            log.error("worktree prune failed operation=%s root=%s; stale worktree registrations are still listed", operation_id, staged.root)
+            log.error("Gitの古い作業ツリー登録を整理できません。登録が残っています: 操作=%s、保存先=%s", operation_id, staged.root)
 
 
 def commit_candidate(candidate_project: Project, message: str, metadata: dict[str, Any]) -> str:
@@ -459,7 +459,7 @@ def commit_candidate(candidate_project: Project, message: str, metadata: dict[st
         args.extend(["-m", body])
     _git(candidate_project, *args)
     commit = str(_git(candidate_project, "rev-parse", "HEAD"))
-    log.info("candidate committed commit=%s root=%s message=%s", commit, candidate_project.root, message)
+    log.info("候補の変更を確定しました: コミット=%s、保存先=%s、説明=%s", commit, candidate_project.root, message)
     return commit
 
 
@@ -493,7 +493,7 @@ def candidate_is_clean(candidate_project: Project, commit: str, *, allow_initial
             data = read_json(schema)
             return data == {"schema_version": VERSION} and type(data["schema_version"]) is int
         except (OSError, ValueError) as exc:
-            log.error("human store schema could not be checked path=%s error=%s: %s (the worktree is reported dirty, so the command is refused for the wrong reason)",
+            log.error("編集情報の形式を確認できません。作業ツリーに変更ありと判定され、別の理由でコマンドが拒否されます: パス=%s、エラー=%s: %s",
                       schema, type(exc).__name__, exc, exc_info=True)
             return False
     return False
@@ -515,7 +515,7 @@ def checkpoint_live(project: Project, message: str) -> str:
     _git(project, "commit", "-q", "-m", message)
     commit = str(_git(project, "rev-parse", "HEAD"))
     _git(project, "update-ref", LAST_GOOD_REF, commit, previous)
-    log.info("live checkpoint committed commit=%s previous_last_good=%s message=%s", commit, previous, message)
+    log.info("現在の状態を確定しました: コミット=%s、前回の正常な確定状態=%s、説明=%s", commit, previous, message)
     return commit
 
 
@@ -566,13 +566,13 @@ def _prune_empty_generated_dirs(project: Project) -> None:
 def promote(project: Project, candidate_project: Project, commit: str) -> None:
     _git(project, "cat-file", "-e", f"{commit}^{{commit}}")
     previous = last_good(project)
-    log.info("promoting commit=%s previous_last_good=%s root=%s", commit, previous, project.root)
+    log.info("候補を本番状態に反映します: コミット=%s、前回の正常な確定状態=%s、保存先=%s", commit, previous, project.root)
     _git(project, "update-ref", LAST_GOOD_REF, commit, previous)
     try:
         _git(project, "reset", "--hard", commit)
     except BaseException as exc:
         # One of the biggest events of a run: the accepted work is not live and last-good goes back.
-        log.error("promote failed, rolling back to last-good commit=%s last_good=%s root=%s error=%s: %s",
+        log.error("候補の反映に失敗したため、前回の正常な確定状態に戻します: コミット=%s、復元先=%s、保存先=%s、エラー=%s: %s",
                   commit, previous, project.root, type(exc).__name__, exc, exc_info=True)
         _git(project, "update-ref", LAST_GOOD_REF, previous, commit)
         raise
@@ -585,7 +585,7 @@ def promote(project: Project, candidate_project: Project, commit: str) -> None:
             shutil.copy2(source_db, temp)
             temp.replace(project.linker_database)
         except OSError as exc:
-            log.error("linker database copy failed source=%s target=%s temp=%s error=%s: %s (the commit is live but the linker database was not replaced; the temp file may be left behind)",
+            log.error("リンク情報のデータベースをコピーできません。コミットは反映済みですがデータベースは未置換で、一時ファイルが残る場合があります: コピー元=%s、コピー先=%s、一時ファイル=%s、エラー=%s: %s",
                       source_db, project.linker_database, temp, type(exc).__name__, exc, exc_info=True)
             raise
     else:
@@ -607,7 +607,7 @@ def prune_candidates(project: Project) -> None:
         shutil.rmtree(base, ignore_errors=True)
         # shortcut: exists() says something survived, not which entry failed; upgrade to onerror= if the reason is ever needed.
         if base.exists():
-            log.error("candidate worktrees left behind path=%s (leftover worktrees accumulate and fill the disk)", base)
+            log.error("候補の作業ツリーが残っています。蓄積するとディスク容量を使い切ります: パス=%s", base)
         _git(project, "worktree", "prune")
 
 

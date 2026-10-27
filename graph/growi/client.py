@@ -130,7 +130,7 @@ class GrowiClient:
                 )
         except httpx.RequestError as exc:
             log.error(
-                "GROWI network request failed (%s %s): %s - check server URL and network url=%s error=%s",
+                "GROWIへの通信に失敗しました（%s %s）: %s。サーバーURLとネットワークを確認してください: URL=%s、エラー=%s",
                 method, path, type(exc).__name__, self.url, exc, exc_info=True,
             )
             raise
@@ -141,7 +141,7 @@ class GrowiClient:
             )
             if response.status_code not in expected_statuses:
                 log.error(
-                    "GROWI request failed (%s %s): HTTP %s%s url=%s detail=%.120s",
+                    "GROWIへの要求に失敗しました（%s %s）: HTTP %s%s、URL=%s、詳細=%.120s",
                     method, path, response.status_code, hint, self.url, detail,
                 )
             raise GrowiAPIError(response.status_code, method, path, detail)
@@ -192,12 +192,12 @@ class GrowiClient:
         except (GrowiAPIError, httpx.HTTPError) as exc:
             # The caller only receives a bare False, so this is the caller-visible reason.
             log.error(
-                "GROWI health check reports unreachable url=%s error=%s: %s",
+                "GROWIに接続できません: URL=%s、エラー=%s: %s",
                 self.url, type(exc).__name__, exc, exc_info=True,
             )
             return False
         if not response.is_success:
-            log.error("GROWI health check reports unreachable url=%s status=%s", self.url, response.status_code)
+            log.error("GROWIに接続できません: URL=%s、応答コード=%s", self.url, response.status_code)
         return response.is_success
 
     async def get_page(
@@ -346,7 +346,7 @@ class GrowiClient:
             # The remote write already happened: an unreadable body leaves the ledger
             # prepared-but-unconfirmed, so the page ID has to be on the record.
             log.error(
-                "GROWI page update response could not be read after the write succeeded page=%s error=%s: %s",
+                "GROWIのページ更新は成功しましたが、応答を読み取れません: ページ=%s、エラー=%s: %s",
                 page_id, type(exc).__name__, exc, exc_info=True,
             )
             raise
@@ -501,7 +501,7 @@ async def _publish_images(client: GrowiClient, body: str, page_id: str) -> str:
             content = base64.b64decode("".join(data.group("data").split()), validate=True)
         except (ValueError, binascii.Error) as exc:
             log.error(
-                "embedded image is invalid page=%s image=%s error=%s: %s",
+                "埋め込み画像が不正です: ページ=%s、画像=%s、エラー=%s: %s",
                 page_id, hashlib.sha256(match.src.encode("utf-8")).hexdigest()[:12],
                 type(exc).__name__, exc, exc_info=True,
             )
@@ -788,7 +788,7 @@ async def publish_pages(
             )
         except Exception as exc:
             log.error(
-                "GROWI preflight check failed, no page was published page=%s error=%s: %s",
+                "GROWIの事前確認に失敗しました。ページは公開されていません: ページ=%s、エラー=%s: %s",
                 item.get("local_path") or item.get("path") or "<page>", type(exc).__name__, exc, exc_info=True,
             )
             await report_page(
@@ -856,7 +856,7 @@ async def publish_pages(
         failed_index = len(results)
         failed_item = pages[failed_index] if failed_index < len(pages) else pages[-1]
         log.error(
-            "GROWI publish stopped, the remaining pages were not published page=%s published=%d of=%d error=%s: %s",
+            "GROWIへの公開を中断しました。残りのページは公開されていません: ページ=%s、公開済み=%d、総数=%d、エラー=%s: %s",
             failed_item.get("local_path") or failed_item.get("path") or "<page>", len(results), len(pages),
             type(exc).__name__, exc, exc_info=True,
         )
@@ -872,7 +872,7 @@ def _save_publish_ledger(store: Any, data: dict[str, Any], *, page: str, step: s
         store.save_page(data)
     except Exception as exc:
         log.error(
-            "GROWI publish ledger write failed page=%s step=%s error=%s: %s",
+            "GROWIの公開台帳を書き込めません: ページ=%s、工程=%s、エラー=%s: %s",
             page, step, type(exc).__name__, exc, exc_info=True,
         )
         raise
@@ -914,7 +914,7 @@ class GrowiPublisher:
             # A corrupt or unreadable seed is not a missing one: without the file name the
             # page only ever reports "source mapping is missing" or a changed stamp ID.
             log.error(
-                "GROWI page marker seed could not be read document=%s file=%s error=%s: %s",
+                "GROWIページの識別情報を読み込めません: 文書=%s、ファイル=%s、エラー=%s: %s",
                 document, seed_file, type(exc).__name__, exc, exc_info=True,
             )
             raise
@@ -935,7 +935,7 @@ class GrowiPublisher:
                 body = strip_reader_references(md.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError) as exc:
                 log.error(
-                    "local wiki page could not be read for publish document=%s file=%s error=%s: %s",
+                    "公開するWikiページを読み込めません: 文書=%s、ファイル=%s、エラー=%s: %s",
                     doc_path, md, type(exc).__name__, exc, exc_info=True,
                 )
                 raise
@@ -1289,7 +1289,7 @@ class GrowiPublisher:
                     # Without the file name this surfaces later as a misleading
                     # "source mapping is missing" block reason.
                     log.error(
-                        "GROWI page marker seed could not be read document=%s file=%s error=%s: %s",
+                        "GROWIページの識別情報を読み込めません: 文書=%s、ファイル=%s、エラー=%s: %s",
                         document, stamp_file, type(exc).__name__, exc, exc_info=True,
                     )
                     raise
@@ -1307,7 +1307,7 @@ class GrowiPublisher:
                 if baseline and baseline.get("accepted_revision") == row.get("revision_id") == page.revision_id:
                     decisions["unchanged"] += 1
                     log.debug(
-                        "human_sync event=unchanged document=%s page=%s revision=%s",
+                        "人による編集に変更はありません: 文書=%s、ページ=%s、リビジョン=%s",
                         document, local_path, page.revision_id,
                     )
                     continue
@@ -1323,7 +1323,7 @@ class GrowiPublisher:
                     # The original failure is dropped here, so it has to be on the record:
                     # our prepared body never landed on the page.
                     log.error(
-                        "GROWI publish attempt did not land on the page document=%s page=%s attempt=%s error=%s: %s",
+                        "GROWIへの公開がページに反映されませんでした: 文書=%s、ページ=%s、試行=%s、エラー=%s: %s",
                         document, local_path, str(prepared.get("prepared_attempt_id") or ""),
                         type(exc).__name__, exc, exc_info=True,
                     )
@@ -1333,11 +1333,11 @@ class GrowiPublisher:
                     # The page holds our own unrecorded write: bot intent, not human.
                     decisions["recovered"] += 1
                     log.info(
-                        "GROWIパブリッシュ状態を復旧しました: ドキュメント=%s ページ=%s",
+                        "GROWIの公開状態を復旧しました: 文書=%s、ページ=%s",
                         document, local_path,
                     )
                     log.debug(
-                        "human_sync event=recovered_exact document=%s page=%s revision=%s",
+                        "人による編集を一致する記録から復旧しました: 文書=%s、ページ=%s、リビジョン=%s",
                         document, local_path, page.revision_id,
                     )
                     continue
@@ -1346,7 +1346,7 @@ class GrowiPublisher:
                         local = target.read_text(encoding="utf-8")
                     except (OSError, UnicodeDecodeError) as exc:
                         log.error(
-                            "local wiki page could not be read for pull document=%s file=%s error=%s: %s",
+                            "取り込み先のWikiページを読み込めません: 文書=%s、ファイル=%s、エラー=%s: %s",
                             raw_rel, target, type(exc).__name__, exc, exc_info=True,
                         )
                         raise
@@ -1379,7 +1379,7 @@ class GrowiPublisher:
                     row["revision_id"] = page.revision_id
                     store.remember_page(local_path, row, markdown, local, published=False)
                     log.debug(
-                        "human_sync event=baseline_registered document=%s page=%s revision=%s",
+                        "編集比較の基準を登録しました: 文書=%s、ページ=%s、リビジョン=%s",
                         raw_rel, local_path, page.revision_id,
                     )
                     continue
@@ -1387,7 +1387,7 @@ class GrowiPublisher:
                     raise ValueError("published revision and human baseline disagree")
                 if page.revision_id == row.get("revision_id"):
                     log.debug(
-                        "human_sync event=revision_unchanged document=%s page=%s revision=%s",
+                        "ページのリビジョンに変更はありません: 文書=%s、ページ=%s、リビジョン=%s",
                         raw_rel, local_path, page.revision_id,
                     )
                     continue
@@ -1407,7 +1407,7 @@ class GrowiPublisher:
                 if status == "conflict":
                     page_name = Path(local_path).name
                     log.info(
-                        "GROWIユーザー編集の複雑な差分をマージしています: ドキュメント=%s ページ=%s",
+                        "GROWIでの複雑な編集差分を統合しています: 文書=%s、ページ=%s",
                         raw_rel, local_path,
                     )
                     try:
@@ -1424,7 +1424,7 @@ class GrowiPublisher:
                         # A model outage is outside that tuple: it aborts the whole pull and
                         # skips every remaining page, so name the page before it propagates.
                         log.error(
-                            "GROWI human-edit merge model call failed document=%s page=%s error=%s: %s",
+                            "GROWIの編集を統合するモデルを呼び出せません: 文書=%s、ページ=%s、エラー=%s: %s",
                             raw_rel, local_path, type(exc).__name__, exc, exc_info=True,
                         )
                         raise
@@ -1433,11 +1433,11 @@ class GrowiPublisher:
                         if entry.strip() and entry not in canonical:
                             canonical = canonical.rstrip() + "\n\n" + entry.strip() + "\n"
                     log.info(
-                        "GROWIユーザー編集の複雑な差分をマージしました: ドキュメント=%s ページ=%s",
+                        "GROWIでの複雑な編集差分を統合しました: 文書=%s、ページ=%s",
                         raw_rel, local_path,
                     )
                     log.debug(
-                        "human_sync event=transport_rebased document=%s page=%s revision=%s appendix_entries=%d",
+                        "転送時の変更に合わせて編集情報を更新しました: 文書=%s、ページ=%s、リビジョン=%s、付記件数=%d",
                         raw_rel, local_path, page.revision_id, len(entries),
                     )
                 canonical = restore_page_links(canonical, local_path, page_paths)
@@ -1450,7 +1450,7 @@ class GrowiPublisher:
                         else "replace"
                     )
                     log.debug(
-                        "human_sync event=user_edit_detected document=%s page=%s revision=%s operation=%s mode=%s",
+                        "GROWIでの編集を検出しました: 文書=%s、ページ=%s、リビジョン=%s、操作=%s、方式=%s",
                         raw_rel, local_path, page.revision_id, proposed_operation, mode,
                     )
                     if policy.observes:
@@ -1490,7 +1490,7 @@ class GrowiPublisher:
                     except Exception as exc:
                         # Outside the pull handler's tuple: the whole pull aborts here.
                         log.error(
-                            "GROWI human-edit capture model call failed document=%s page=%s error=%s: %s",
+                            "GROWIの編集を記録するモデルを呼び出せません: 文書=%s、ページ=%s、エラー=%s: %s",
                             raw_rel, local_path, type(exc).__name__, exc, exc_info=True,
                         )
                         raise
@@ -1498,20 +1498,20 @@ class GrowiPublisher:
                     decisions["captured"] += 1
                     operation_ja = {"add": "追加", "delete": "削除", "replace": "更新"}[proposed_operation]
                     log.info(
-                        "GROWIユーザー編集を取り込みました: ドキュメント=%s ページ=%s 操作=%s",
+                        "GROWIでの編集を取り込みました: 文書=%s、ページ=%s、操作=%s",
                         raw_rel, local_path, operation_ja,
                     )
                     log.debug(
-                        "human_sync event=captured document=%s page=%s revision=%s operation=%s rewritten=%s",
+                        "GROWIでの編集を記録しました: 文書=%s、ページ=%s、リビジョン=%s、操作=%s、書き換え有無=%s",
                         raw_rel, local_path, page.revision_id, proposed_operation, rewritten,
                     )
                 else:
                     log.info(
-                        "GROWIページ更新を確認しました（ユーザー編集なし）: ドキュメント=%s ページ=%s",
+                        "GROWIのページ更新を確認しました。人による編集はありません: 文書=%s、ページ=%s",
                         raw_rel, local_path,
                     )
                     log.debug(
-                        "human_sync event=accepted_without_user_edit document=%s page=%s revision=%s",
+                        "人による編集のない更新を受け入れました: 文書=%s、ページ=%s、リビジョン=%s",
                         raw_rel, local_path, page.revision_id,
                     )
                 row["revision_id"] = page.revision_id
@@ -1527,9 +1527,9 @@ class GrowiPublisher:
                 # deleted or moved, ownership markers removed, no source mapping); anything
                 # else, including corrupt-JSON and encoding subclasses, is unexpected.
                 if type(exc) is ValueError:
-                    log.error("GROWIのプルをブロックしました: ページ=%s 理由=%s", local_path, reason)
+                    log.error("GROWIからの取り込みを停止しました: ページ=%s、理由=%s", local_path, reason)
                 else:
-                    log.exception("GROWIのプルに失敗: %s", local_path)
+                    log.exception("GROWIからの取り込みに失敗しました: %s", local_path)
                 store.block_page(local_path, row, reason, page)
                 blocked.add(document)
                 conflicts.append(f"{local_path}: {reason}")

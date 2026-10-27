@@ -37,7 +37,7 @@ def has_vba(path: Path) -> bool:
             return "xl/vbaProject.bin" in archive.namelist()
     except (OSError, zipfile.BadZipFile) as exc:
         # The caller treats this as "not a macro file" and publishes the workbook unchecked.
-        log.error("workbook is unreadable, treated as a workbook without macros workbook=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        log.error("Excelブックを読めないため、マクロなしとして扱います: ブック=%s、エラー=%s: %s", path, type(exc).__name__, exc, exc_info=True)
         return False
 
 
@@ -47,7 +47,7 @@ def _sheet_refs(text: str, names: set[str], workbook: Any = None) -> set[str]:
         tokens = Tokenizer(text).items if text.startswith("=") else ()
     except Exception as exc:
         # The formula keeps no lineage dependencies, so the sheet graph loses this edge.
-        log.error("formula lineage lost, the formula could not be parsed workbook=%s formula=%s error=%s: %s", workbook, text, type(exc).__name__, exc, exc_info=True)
+        log.error("数式を解析できないため、参照関係を取得できません: ブック=%s、数式=%s、エラー=%s: %s", workbook, text, type(exc).__name__, exc, exc_info=True)
         tokens = ()
     for token in tokens:
         if token.type != "OPERAND" or token.subtype != "RANGE" or "!" not in token.value:
@@ -128,7 +128,7 @@ def _buttons(path: Path, workbook: Any) -> list[dict[str, str]]:
                         if macro:
                             cells = _anchor_cells(anchor)
                             if cells == "unknown":
-                                log.error("button cell anchor unresolved workbook=%s sheet=%s macro=%s", path, name, macro.rsplit("!", 1)[-1])
+                                log.error("ボタンのセル位置を特定できません: ブック=%s、シート=%s、マクロ=%s", path, name, macro.rsplit("!", 1)[-1])
                             output.append({"sheet": name, "cells": cells, "procedure": macro.rsplit("!", 1)[-1]})
                     continue
                 for client in (node for node in root.iter() if _local(node.tag) == "ClientData"):
@@ -140,7 +140,7 @@ def _buttons(path: Path, workbook: Any) -> list[dict[str, str]]:
                         end = f"{get_column_letter(anchor[4] + 1)}{anchor[6] + 1}"
                     except (KeyError, ValueError, IndexError) as exc:
                         if macro:
-                            log.error("button cell anchor unresolved workbook=%s sheet=%s macro=%s error=%s: %s", path, name, macro, type(exc).__name__, exc, exc_info=True)
+                            log.error("ボタンのセル位置を特定できません: ブック=%s、シート=%s、マクロ=%s、エラー=%s: %s", path, name, macro, type(exc).__name__, exc, exc_info=True)
                         start = end = "unknown"
                     if macro:
                         output.append({"sheet": name, "cells": start if start == end else f"{start}:{end}", "procedure": macro})
@@ -370,7 +370,7 @@ def build_manifest(path: Path) -> dict[str, Any] | None:
     try:
         workbook = load_workbook(path, data_only=False, keep_vba=True, keep_links=False)
     except Exception as exc:
-        log.error("workbook open failed workbook=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        log.error("Excelブックを開けません: ブック=%s、エラー=%s: %s", path, type(exc).__name__, exc, exc_info=True)
         raise
     try:
         names = {sheet.title for sheet in workbook.worksheets}
@@ -478,7 +478,7 @@ def build_manifest(path: Path) -> dict[str, Any] | None:
         }
     except Exception as exc:
         # openpyxl and the drawing parts report no workbook path of their own.
-        log.error("xlsm lineage inspection failed workbook=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        log.error("XLSMの参照関係を調査できません: ブック=%s、エラー=%s: %s", path, type(exc).__name__, exc, exc_info=True)
         raise
     finally:
         workbook.close()

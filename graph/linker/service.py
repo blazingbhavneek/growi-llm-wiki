@@ -58,7 +58,7 @@ def _catalog_lock(catalog: Catalog, project: Any, *, stage: str):
     try:
         lock.__enter__()
     except OSError as exc:
-        log.error("linker lock unavailable stage=%s project=%s error=%s: %s (another linker run holds it, or the lock folder is unwritable)",
+        log.error("リンク処理のロックを取得できません。他の処理による使用中か、フォルダーに書き込めません: 工程=%s、プロジェクト=%s、エラー=%s: %s",
                   stage, project.metadata, type(exc).__name__, exc, exc_info=True)
         raise
     try:
@@ -169,7 +169,7 @@ def _big_document(project: Any, document: str) -> bool:
     try:
         return sum(len(page.read_text(encoding="utf-8").splitlines()) for page in originals.glob("*.md")) >= BIG_DOCUMENT_LINES
     except (OSError, UnicodeDecodeError) as exc:
-        log.error("document pages could not be measured for the render limit document=%s path=%s error=%s: %s",
+        log.error("整形対象の上限を確認するためのページ数を取得できません: 文書=%s、パス=%s、エラー=%s: %s",
                   document, originals, type(exc).__name__, exc, exc_info=True)
         raise
 
@@ -233,7 +233,7 @@ async def _curate_page(
             selected = set(selected)
             candidates = [edge for edge in candidates if edge.source in {"use", "define"} or edge.edge_id in selected]
         except Exception as exc:
-            log.warning("Jev page curation failed for %s: %s", page_rel, exc)
+            log.warning("Jevでページの参照先を選別できません: ページ=%s、エラー=%s", page_rel, exc)
     inline_limit, footer_limit = render_limits(mode, big_document, settings)
     current = _valid_choices(current, candidates, inline_limit=inline_limit, footer_limit=footer_limit)
     current_ids = {choice["edge_id"] for choice in current}
@@ -280,7 +280,7 @@ async def _curate_page(
         return _valid_choices(proposed, pool, inline_limit=inline_limit, footer_limit=footer_limit), candidate_ids
     except Exception as exc:
         # A transient curator failure must not erase good links already visible to readers.
-        log.error("page reference curator failed page=%s kept_references=%d error=%s: %s (the page keeps its previous references, so new links stay invisible and stale ones stay visible)",
+        log.error("参照先の選別に失敗しました。新しいリンクは表示されず、古い参照先が残ります: ページ=%s、維持する参照先数=%d、エラー=%s: %s",
                   page_rel, len(current), type(exc).__name__, exc, exc_info=True)
         return (current or [{"edge_id": edge.edge_id, "placement": "footer", "anchor": "", "summary": edge.summary or edge.peer_summary} for edge in pool[:3]]), candidate_ids
 
@@ -300,7 +300,7 @@ async def render_pages(
             from jev import get_engine_for
             jev_engine = get_engine_for(settings)
         except Exception as exc:
-            log.warning("Jev linker engine unavailable for page curation: %s", exc)
+            log.warning("ページの参照先選別にJevを利用できません: %s", exc)
     semaphore = asyncio.Semaphore(concurrency)
     jobs: list[tuple[str, str, Path, str, list[RenderEdge], dict[str, Any], bool]] = []
     navigation_by_doc: dict[str, dict[str, Any]] = {}
@@ -310,7 +310,7 @@ async def render_pages(
         original_path = Path(project.wiki) / doc / "_planning" / "pages" / filename
         if not original_path.exists():
             # a page removed from the document lands here on every incremental run
-            log.debug("page source missing, its references are not updated page=%s path=%s", page_rel, original_path)
+            log.debug("ページの元テキストがないため、参照先を更新しません: ページ=%s、パス=%s", page_rel, original_path)
             continue
         nav = navigation_by_doc.setdefault(doc, _navigation(project, doc))
         page_state = nav.setdefault("pages", {}).get(filename, {})
@@ -318,7 +318,7 @@ async def render_pages(
         try:
             original = strip_reader_references(original_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError) as exc:
-            log.error("page source could not be read page=%s path=%s error=%s: %s (the page is not re-rendered, its links stay as they are)",
+            log.error("ページの元テキストを読めないため、リンクを更新しません: ページ=%s、パス=%s、エラー=%s: %s",
                       page_rel, original_path, type(exc).__name__, exc, exc_info=True)
             raise
         jobs.append((page_rel, doc, original_path, original, edges, page_state, _big_document(project, doc)))
@@ -349,7 +349,7 @@ async def render_pages(
         try:
             changed = write_if_changed(page_path, rendered)
         except OSError as exc:
-            log.error("rendered page could not be written page=%s path=%s error=%s: %s (readers keep the previous links for this page)",
+            log.error("整形済みページを書き込めません。以前のリンクが表示され続けます: ページ=%s、パス=%s、エラー=%s: %s",
                       page_rel, page_path, type(exc).__name__, exc, exc_info=True)
             raise
         if changed:
@@ -360,7 +360,7 @@ async def render_pages(
         try:
             write_json_atomic(navigation_path, navigation)
         except OSError as exc:
-            log.error("page reference state could not be written document=%s path=%s error=%s: %s (the next run re-plans every page of this document)",
+            log.error("参照先の状態を保存できません。次回はこの文書の全ページの構成を作り直します: 文書=%s、パス=%s、エラー=%s: %s",
                       doc, navigation_path, type(exc).__name__, exc, exc_info=True)
             raise
     return touched
@@ -422,7 +422,7 @@ async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_:
                 write_text_atomic(artifact_dir / f"{artifact_name}-error.txt", f"{type(exc).__name__}: {exc}")
             if strict:
                 raise
-            log.error("edge model call failed stage=edges document=%s target=%s group=%s mode=%s error=%s: %s (the candidate group is dropped, no links are judged from it)",
+            log.error("リンク判定のモデル呼び出しに失敗しました。この候補の組は判定せず除外します: 文書=%s、対象=%s、組=%s、方式=%s、エラー=%s: %s",
                       target.document, target.chunk_id, artifact_name, mode, type(exc).__name__, exc, exc_info=True)
             continue
         allowed = {item.chunk_id for item, _row in pairs}
@@ -458,7 +458,7 @@ async def _filter_target(catalog, model, target, candidates_, *, mode, version, 
         except Exception as exc:
             # graph/linker/jev_judge.py already logged the failure itself at ERROR with the
             # document; this line is only the fallback notice.
-            log.warning("Jev edge judge unavailable for %s; using the LLM judge instead: %s", target.chunk_id, exc)
+            log.warning("Jevを利用できないため、LLMでリンクを判定します: 対象=%s、エラー=%s", target.chunk_id, exc)
             accepted, calls = await _filter_groups(
                 catalog, model, target, candidates_, mode, version,
                 artifact_dir, stop_check, output_language, strict=strict, settings=settings,
@@ -504,7 +504,7 @@ async def link_document(
     try:
         planning.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        log.error("planning folder could not be created document=%s path=%s error=%s: %s (disk full, read-only, or the volume is not mounted?)",
+        log.error("構成保存用フォルダーを作成できません: 文書=%s、パス=%s、エラー=%s: %s（容量・書き込み権限・接続状態を確認してください）",
                   document, planning, type(exc).__name__, exc, exc_info=True)
         raise
     run_id = "lrun-" + uuid.uuid4().hex[:20]
@@ -517,10 +517,10 @@ async def link_document(
     try:
         write_json_atomic(pending_marker, policy.stamp({"schema_version": 2, "status": "pending", "mode": mode, "run_id": run_id}))
     except OSError as exc:
-        log.error("linker start marker could not be written document=%s path=%s run=%s error=%s: %s (the run is not visible to publishing and cannot be resumed)",
+        log.error("リンク開始情報を書き込めません。公開処理から認識されず、再開もできません: 文書=%s、パス=%s、実行ID=%s、エラー=%s: %s",
                   rel, pending_marker, run_id, type(exc).__name__, exc, exc_info=True)
         raise
-    log.info("linker run started document=%s run=%s mode=%s judge=%s render=%s", rel, run_id, mode, judge, render)
+    log.info("リンク処理を開始します: 文書=%s、実行ID=%s、方式=%s、判定=%s、整形=%s", rel, run_id, mode, judge, render)
     if on_progress:
         on_progress({"stage": "linker", "step": "pending", "document": rel})
     catalog: Catalog | None = None
@@ -536,7 +536,7 @@ async def link_document(
                 from jev import get_engine_for
                 jev_engine = get_engine_for(settings)
             except Exception as exc:
-                log.warning("Jev linker engine unavailable; using LLM: %s", exc)
+                log.warning("Jevを利用できないため、LLMでリンクを処理します: %s", exc)
                 jev_fallbacks += 1
         catalog = Catalog.open(project.linker_database, mode=mode, edge_version=edge_version)
         with _catalog_lock(catalog, project, stage="link-document"):
@@ -552,7 +552,7 @@ async def link_document(
             original_hashes = chunks.snapshot_originals(project.wiki_dir(rel))
             if on_progress:
                 on_progress({"stage": "linker-entities", "step": "start", "document": rel})
-            log.info("chunk metadata stage started document=%s run=%s", rel, run_id)
+            log.info("分割部分の解析を開始します: 文書=%s、実行ID=%s", rel, run_id)
             all_chunks = _page_chunks(planning, document, team, id_seed)
             old_rows = {row["chunk_id"]: row for row in catalog.chunks_for_document(document)}
             old_titles = {
@@ -615,7 +615,7 @@ async def link_document(
                     "current": reported_chunks, "total": reported_chunks,
                     "catalog_total": len(all_chunks),
                 })
-            log.info("chunk scope resolved document=%s run=%s chunks=%d to_describe=%d scope=%s",
+            log.info("分割部分の解析範囲を決定しました: 文書=%s、実行ID=%s、分割部分数=%d、解析対象数=%d、範囲=%s",
                      rel, run_id, len(all_chunks), reported_chunks, "incremental" if incremental_scope else "full")
             run_dir = Path(project.state_dir(rel)) / "work" / "linker" / run_id
             meta_calls, meta_fallbacks = (0, 0)
@@ -650,7 +650,7 @@ async def link_document(
             try:
                 write_json_atomic(planning / "chunks.json", chunk_data)
             except OSError as exc:
-                log.error("chunk metadata cache could not be written document=%s path=%s run=%s error=%s: %s (the next run describes every chunk again)",
+                log.error("分割部分の情報を保存できません。次回は全体を再解析します: 文書=%s、パス=%s、実行ID=%s、エラー=%s: %s",
                           rel, planning / "chunks.json", run_id, type(exc).__name__, exc, exc_info=True)
                 raise
             known_team_names = {name_norm for name_norm, _name in catalog.entity_names(team)}
@@ -665,7 +665,7 @@ async def link_document(
                 except Exception as exc:
                     jev_fallbacks += 1
                     jev_failed_chunks.update(item.chunk_id for item in all_chunks)
-                    log.warning("Jev alias resolution failed for %s: %s", document, exc)
+                    log.warning("Jevで別名を解決できません: 対象=%s、エラー=%s", document, exc)
             # A rebuilt catalog has no edges for this document yet; links.json (kept
             # across republish) restores the ones whose endpoint text is unchanged.
             catalog.restore_edges(planning / "links.json")
@@ -682,7 +682,7 @@ async def link_document(
                     "current": metadata_total, "total": metadata_total,
                     "chunks": len(all_chunks), "meta_calls": meta_calls,
                 })
-            log.info("chunk metadata done document=%s run=%s chunks=%d meta_calls=%d meta_fallbacks=%d",
+            log.info("分割部分の解析が完了しました: 文書=%s、実行ID=%s、分割部分数=%d、モデル呼び出し数=%d、簡易処理数=%d",
                      rel, run_id, len(all_chunks), meta_calls, meta_fallbacks)
             changed_ids = stale_ids | revised_ids
             affected_ids = changed_ids | set(diff["removed"])
@@ -715,7 +715,7 @@ async def link_document(
 
             if on_progress:
                 on_progress({"stage": "linker-edges", "step": "start", "document": rel})
-            log.info("edge stage started document=%s run=%s", rel, run_id)
+            log.info("関連リンクの判定を開始します: 文書=%s、実行ID=%s", rel, run_id)
             edge_rows: list[dict[str, Any]] = []
             incremental_candidate_edges: dict[tuple[str, str], dict[str, Any]] = {}
             candidates_for: list[tuple[Any, list[Candidate]]] = []
@@ -809,7 +809,7 @@ async def link_document(
                         except Exception as exc:
                             jev_fallbacks += 1
                             jev_failed_chunks.add(item.chunk_id)
-                            log.warning("Jev primary definer failed for %s: %s", canon, exc)
+                            log.warning("Jevで主な定義元を判定できません: 対象=%s、エラー=%s", canon, exc)
             if incremental_scope and on_progress:
                 on_progress({
                     "stage": "linker", "step": "incremental_scope", "document": rel,
@@ -818,7 +818,7 @@ async def link_document(
                     "checked_edges": sum(len(found) for _item, found in candidates_for),
                 })
             if incremental_scope:
-                log.info("incremental edge scope document=%s run=%s changed_chunks=%d existing_edges=%d checked_edges=%d",
+                log.info("リンクの差分判定範囲: 文書=%s、実行ID=%s、変更された分割部分=%d、既存リンク数=%d、確認したリンク数=%d",
                          rel, run_id, len(changed_ids), len(relevant_edges), sum(len(found) for _item, found in candidates_for))
             unresolved: list[tuple[chunks.Chunk, list[Candidate]]] = []
             for item, found in candidates_for:
@@ -849,7 +849,7 @@ async def link_document(
                     "stage": "linker-edges", "step": "targets", "document": rel,
                     "current": 0, "total": len(unresolved),
                 })
-            log.info("edge targets queued document=%s run=%s targets=%d", rel, run_id, len(unresolved))
+            log.info("関連リンクの判定対象を登録しました: 文書=%s、実行ID=%s、対象数=%d", rel, run_id, len(unresolved))
             concurrency = _concurrency(settings)
             semaphore = asyncio.Semaphore(concurrency)
             completed = 0
@@ -954,7 +954,7 @@ async def link_document(
                     "current": len(unresolved), "total": len(unresolved),
                     "pages": len(pages), "edge_calls": edge_calls,
                 })
-            log.info("edge stage done document=%s run=%s pages=%d edge_calls=%d", rel, run_id, len(pages), edge_calls)
+            log.info("関連リンクの判定が完了しました: 文書=%s、実行ID=%s、ページ数=%d、モデル呼び出し数=%d", rel, run_id, len(pages), edge_calls)
             all_docs = {
                 document,
                 *{page.rsplit("/", 1)[0] for page in pages},
@@ -971,21 +971,21 @@ async def link_document(
             try:
                 write_json_atomic(planning / "linker.json", policy.stamp(complete))
             except OSError as exc:
-                log.error("linker completion marker could not be written document=%s path=%s run=%s error=%s: %s (the links are computed but the document stays marked incomplete and is linked again)",
+                log.error("リンク完了情報を書き込めません。判定済みですが未完了扱いとなり、次回もう一度リンクを処理します: 文書=%s、パス=%s、実行ID=%s、エラー=%s: %s",
                           rel, planning / "linker.json", run_id, type(exc).__name__, exc, exc_info=True)
                 raise
             if on_progress:
                 on_progress({"stage": "linker", "step": "done", "document": rel, "edges": len(edge_rows)})
-            log.info("linker run finished document=%s run=%s scope=%s edges_added=%d edges_removed=%d pages=%d touched=%d",
+            log.info("リンク処理が完了しました: 文書=%s、実行ID=%s、範囲=%s、追加数=%d、削除数=%d、ページ数=%d、更新数=%d",
                      rel, run_id, complete["scope"], inserted_edges, int(diff.get("edges_removed", 0)), len(pages), len(touched_docs))
             return LinkResult(sorted(touched_docs), inserted_edges, int(diff.get("edges_removed", 0)), meta_calls, edge_calls, meta_fallbacks, sorted(pages), jev_fallbacks)
     except Exception as exc:
-        log.error("linker failed for document %s (run %s): %s: %s", rel, run_id, type(exc).__name__, exc, exc_info=True)
+        log.error("文書のリンク処理に失敗しました: 文書=%s、実行ID=%s、エラー=%s: %s", rel, run_id, type(exc).__name__, exc, exc_info=True)
         failed_marker = planning / "linker.json"
         try:
             write_json_atomic(failed_marker, policy.stamp({"schema_version": 2, "status": "failed", "mode": mode, "run_id": run_id, "error": f"{type(exc).__name__}: {exc}"[:500]}))
         except Exception as marker_exc:  # noqa: BLE001 - the marker must not become the only error on disk
-            log.error("linker failure marker could not be written document=%s path=%s run=%s error=%s: %s (the error logged above is the real one)",
+            log.error("リンクの失敗情報を書き込めません。元のエラーは直前のログを確認してください: 文書=%s、パス=%s、実行ID=%s、エラー=%s: %s",
                       rel, failed_marker, run_id, type(marker_exc).__name__, marker_exc, exc_info=True)
             raise
         if on_progress:
@@ -1029,7 +1029,7 @@ async def link_documents(
                 catalog.write_links_json(project, {page.rsplit("/", 1)[0] for page in pages})
         finally:
             catalog.close()
-        log.info("linker batch rendered documents=%d pages=%d touched=%d", len(rels), len(pages), len(aggregate.touched_documents))
+        log.info("リンクをまとめて整形しました: 文書数=%d、ページ数=%d、更新数=%d", len(rels), len(pages), len(aggregate.touched_documents))
     for rel in rels:
         marker = Path(project.wiki_dir(rel)) / "_planning" / "linker.json"
         data = read_json(marker, default={})
@@ -1038,7 +1038,7 @@ async def link_documents(
             try:
                 write_json_atomic(marker, data)
             except OSError as exc:
-                log.error("linker completion marker could not be written document=%s path=%s error=%s: %s (the document stays marked render_pending and is linked again)",
+                log.error("リンク完了情報を書き込めません。整形待ちのままとなり、次回もう一度リンクを処理します: 文書=%s、パス=%s、エラー=%s: %s",
                           rel, marker, type(exc).__name__, exc, exc_info=True)
                 raise
     aggregate.affected_pages = sorted(pages)
@@ -1049,7 +1049,7 @@ def remove_document(project: Any, rel: str, *, settings: Any = None) -> list[str
     """Drop a document's chunks/edges and re-render every peer it was linked to."""
     document = _document(project, rel)
     if not Path(project.linker_database).exists():
-        log.warning("linker catalog is missing, nothing was unlinked document=%s path=%s (its links stay in every peer page; on a fresh project this is expected)",
+        log.warning("リンク情報がないため、リンクを解除しませんでした。新規プロジェクトでは正常です。他のページのリンクは残ります: 文書=%s、パス=%s",
                     document, project.linker_database)
         return []
     catalog = Catalog.open(project.linker_database, mode=Catalog.stored_mode(project.linker_database) or "legacy")
@@ -1073,7 +1073,7 @@ def remove_document(project: Any, rel: str, *, settings: Any = None) -> list[str
                     try:
                         source = original.read_text(encoding="utf-8")
                     except (OSError, UnicodeDecodeError) as exc:
-                        log.error("page source could not be read page=%s path=%s error=%s: %s (the links to the removed document stay on the page)",
+                        log.error("ページの元テキストを読めません。削除した文書へのリンクが残ります: ページ=%s、パス=%s、エラー=%s: %s",
                                   page_rel, original, type(exc).__name__, exc, exc_info=True)
                         raise
                     rendered = render_page(source, page_rel=page_rel, edges=edges, mode=page_mode, big_document=big_document, choices=choices, settings=settings)
@@ -1081,7 +1081,7 @@ def remove_document(project: Any, rel: str, *, settings: Any = None) -> list[str
                     try:
                         changed = write_if_changed(page_path, rendered)
                     except OSError as exc:
-                        log.error("rendered page could not be written page=%s path=%s error=%s: %s (the links to the removed document stay on the page)",
+                        log.error("整形済みページを書き込めません。削除した文書へのリンクが残ります: ページ=%s、パス=%s、エラー=%s: %s",
                                   page_rel, page_path, type(exc).__name__, exc, exc_info=True)
                         raise
                     if changed:
@@ -1090,7 +1090,7 @@ def remove_document(project: Any, rel: str, *, settings: Any = None) -> list[str
                 try:
                     write_json_atomic(navigation_path, navigation)
                 except OSError as exc:
-                    log.error("page reference state could not be written document=%s path=%s error=%s: %s (the next run re-plans every page of this document)",
+                    log.error("参照先の状態を保存できません。次回はこの文書の全ページの構成を作り直します: 文書=%s、パス=%s、エラー=%s: %s",
                               peer, navigation_path, type(exc).__name__, exc, exc_info=True)
                     raise
                 catalog.write_links_json(project, [peer])

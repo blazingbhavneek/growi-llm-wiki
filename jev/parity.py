@@ -41,7 +41,7 @@ def main():
         rows = [json.loads(line) for line in open(args.fixture, encoding="utf-8") if line.strip()]
     except Exception as exc:
         # json's own message carries the line and column; it never names the file.
-        log.error("Jev parity fixture could not be read file=%s error=%s: %s", args.fixture, type(exc).__name__, exc, exc_info=True)
+        log.error("Jevの比較用データを読み込めません: ファイル=%s、エラー=%s: %s", args.fixture, type(exc).__name__, exc, exc_info=True)
         raise
     if args.limit: rows = rows[:args.limit]
     reference, actual = [], []
@@ -55,12 +55,12 @@ def main():
         except Exception as exc:
             # A KeyError names the missing fixture key; blank lines are filtered out, so the
             # identity here is the fixture row number, not the raw file line.
-            log.error("Jev parity fixture row failed file=%s row=%d error=%s: %s", args.fixture, row_number, type(exc).__name__, exc, exc_info=True)
+            log.error("Jevの比較用データの行処理に失敗しました: ファイル=%s、行=%d、エラー=%s: %s", args.fixture, row_number, type(exc).__name__, exc, exc_info=True)
             raise
     summary = compare(reference, actual, args.max_abs)
     print(json.dumps(summary, indent=2)); engine.close()
     if not summary["passed"]:
-        log.error("Jev parity FAILED, the engine regressed against the reference fixture=%s items=%d max_abs=%s answer_flips=%d hard_flips=%d threshold=%s (the only other signal is exit code 1)", args.fixture, summary["items"], summary["max_abs"], summary["answer_flips"], summary["hard_flips"], args.max_abs)
+        log.error("Jevの基準結果との比較に失敗しました。参照実装から結果が悪化しています: 検証データ=%s、項目数=%d、最大絶対差=%s、回答の反転数=%d、大きな反転数=%d、しきい値=%s（終了コードは1です）", args.fixture, summary["items"], summary["max_abs"], summary["answer_flips"], summary["hard_flips"], args.max_abs)
     raise SystemExit(0 if summary["passed"] else 1)
 
 

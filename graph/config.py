@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 # going on code defaults and fails later as an opaque auth or connection error.
 if not load_dotenv():
     log.error(
-        "env file not found or unreadable, using process env and code defaults file=%s",
+        "環境設定ファイルが存在しないか読めません。環境変数と既定値を使います: ファイル=%s",
         Path(__file__).resolve().parents[1] / ".env",
     )
 
@@ -40,7 +40,7 @@ def _env_number(cast: Callable[[Any], Any], name: str, default: Any) -> Any:
         return cast(value)
     except (TypeError, ValueError) as exc:
         log.error(
-            "env setting is not a number setting=%s value=%r error=%s: %s",
+            "環境変数の値を数値に変換できません: 設定=%s、値=%r、エラー=%s: %s",
             name,
             value,
             type(exc).__name__,
@@ -106,7 +106,7 @@ def _project_value(parser: configparser.ConfigParser, config_path: Path, key: st
         return parser.get("project", key)
     except (configparser.NoSectionError, configparser.NoOptionError) as exc:
         log.error(
-            "project config is missing a key file=%s setting=%s error=%s: %s",
+            "プロジェクト設定に必要な項目がありません: ファイル=%s、設定=%s、エラー=%s: %s",
             config_path,
             key,
             type(exc).__name__,
@@ -120,19 +120,19 @@ def _project_paths(selector: str) -> tuple[str, str, str, str, str, dict[str, st
     value = selector.strip()
     if not value:
         log.error(
-            "project config not selected setting=WIKI_PROJECT error=--project is required"
+            "プロジェクト設定が選択されていません。--project または WIKI_PROJECT を指定してください"
         )
         raise ValueError("--project is required (config name from configs/ or absolute INI path)")
     selected = Path(value).expanduser()
     if selected.is_absolute():
         if selected.suffix != ".ini":
-            log.error("project config path must end in .ini file=%s", selected)
+            log.error("プロジェクト設定ファイルの拡張子は .ini にしてください: ファイル=%s", selected)
             raise ValueError("absolute project config path must end in .ini")
         config_path = selected.resolve()
     else:
         if selected.name != value or selected.suffix not in ("", ".ini"):
             log.error(
-                "project must be a name from configs/ or an absolute INI path project=%s", value
+                "configs/ 内の設定名またはINIファイルの絶対パスを指定してください: プロジェクト=%s", value
             )
             raise ValueError("project must be a name from configs/ or an absolute INI path")
         config_path = resolve_project_path(f"configs/{selected.stem}.ini")
@@ -141,7 +141,7 @@ def _project_paths(selector: str) -> tuple[str, str, str, str, str, dict[str, st
         read_files = parser.read(config_path, encoding="utf-8")
     except UnicodeDecodeError as exc:
         log.error(
-            "project config is not valid UTF-8 file=%s error=%s: %s",
+            "プロジェクト設定がUTF-8形式ではありません: ファイル=%s、エラー=%s: %s",
             config_path,
             type(exc).__name__,
             exc,
@@ -152,12 +152,12 @@ def _project_paths(selector: str) -> tuple[str, str, str, str, str, dict[str, st
         # shortcut: parser.read() swallows OSError, so a permission-denied INI lands here
         # too; exists() only splits the log wording, the raise below is unchanged.
         reason = "unreadable" if os.path.exists(config_path) else "missing"
-        log.error("project config could not be read file=%s reason=%s", config_path, reason)
+        log.error("プロジェクト設定を読み込めません: ファイル=%s、理由=%s", config_path, reason)
         raise FileNotFoundError(f"project config not found: {config_path}")
     target_name = _project_value(parser, config_path, "target_name").strip()
     if target_name in {"", ".", ".."} or Path(target_name).name != target_name:
         log.error(
-            "target_name must be one folder name file=%s setting=target_name value=%r",
+            "target_name には単一のフォルダー名を指定してください: ファイル=%s、値=%r",
             config_path,
             target_name,
         )
@@ -166,7 +166,7 @@ def _project_paths(selector: str) -> tuple[str, str, str, str, str, dict[str, st
     mount = Path(_project_value(parser, config_path, "source_mount")).expanduser()
     if not mount.is_absolute():
         log.error(
-            "source_mount must be absolute file=%s setting=source_mount value=%s", config_path, mount
+            "source_mount には絶対パスを指定してください: ファイル=%s、値=%s", config_path, mount
         )
         raise ValueError(f"source_mount must be absolute: {mount}")
     overrides = dict(parser.items("project"))
@@ -415,7 +415,7 @@ class Settings(BaseModel):
             return cls._from_env(project)
         except ValidationError as exc:
             log.error(
-                "project settings failed validation project=%s error=%s: %s",
+                "プロジェクト設定の検証に失敗しました: プロジェクト=%s、エラー=%s: %s",
                 project or os.environ.get("WIKI_PROJECT", ""),
                 type(exc).__name__,
                 exc,
@@ -650,7 +650,7 @@ class Settings(BaseModel):
         unknown = sorted(set(project_overrides) - set(cls.model_fields) - {"source_mount"})
         if unknown:
             log.error(
-                "unknown project setting(s) project=%s setting=%s", selector, ", ".join(unknown)
+                "不明なプロジェクト設定があります: プロジェクト=%s、設定=%s", selector, ", ".join(unknown)
             )
             raise ValueError(f"unknown project setting(s): {', '.join(unknown)}")
         overrides = {
@@ -1544,7 +1544,7 @@ def _mermaid_temp_dir() -> tempfile.TemporaryDirectory:
         return tempfile.TemporaryDirectory()
     except OSError as exc:
         log.error(
-            "mermaid temp folder failed error=%s: %s", type(exc).__name__, exc, exc_info=True
+            "Mermaidの一時フォルダーを作成できません: エラー=%s: %s", type(exc).__name__, exc, exc_info=True
         )
         raise
 
@@ -1553,7 +1553,7 @@ def validate_mermaid(code: str, settings: Settings) -> tuple[bool, str]:
     """Render the code to SVG with mmdc; True if it parses + renders."""
     mmdc = shutil.which(settings.mermaid_cli_bin)
     if mmdc is None:
-        log.error("mermaid CLI not found in PATH binary=%s", settings.mermaid_cli_bin)
+        log.error("Mermaidの実行コマンドがPATHにありません: コマンド=%s", settings.mermaid_cli_bin)
         return False, f"mermaid CLI '{settings.mermaid_cli_bin}' not found in PATH"
     config = Path(settings.mermaid_puppeteer_config).expanduser()
     cmd_prefix = [mmdc] + (["-p", str(config)] if config.exists() else [])
@@ -1564,7 +1564,7 @@ def validate_mermaid(code: str, settings: Settings) -> tuple[bool, str]:
             in_file.write_text(code, encoding="utf-8")
         except OSError as exc:
             log.error(
-                "mermaid diagram write failed file=%s error=%s: %s",
+                "Mermaidの図を書き込めません: ファイル=%s、エラー=%s: %s",
                 in_file,
                 type(exc).__name__,
                 exc,
@@ -1579,14 +1579,14 @@ def validate_mermaid(code: str, settings: Settings) -> tuple[bool, str]:
             )
         except subprocess.TimeoutExpired:
             log.error(
-                "mmdc timed out binary=%s timeout=%s",
+                "mmdc の実行が制限時間を超えました: コマンド=%s、制限時間=%s",
                 mmdc,
                 settings.mermaid_render_timeout,
             )
             return False, f"mmdc timed out after {settings.mermaid_render_timeout}s"
         except Exception as exc:  # noqa: BLE001 - mmdc failed to start
             log.error(
-                "mmdc failed to start binary=%s error=%s: %s",
+                "mmdc を開始できません: コマンド=%s、エラー=%s: %s",
                 mmdc,
                 type(exc).__name__,
                 exc,
@@ -1600,14 +1600,14 @@ def validate_mermaid(code: str, settings: Settings) -> tuple[bool, str]:
             # A signal kill (usually OOM) leaves no stderr, so the empty reason below is
             # handed to the repair model as if the diagram itself were malformed.
             log.error(
-                "mmdc killed by signal binary=%s returncode=%s (out of memory?) stderr=%s",
+                "mmdc がシグナルで終了しました。メモリ残量を確認してください: コマンド=%s、終了コード=%s、標準エラー=%s",
                 mmdc,
                 proc.returncode,
                 stderr[:300] or "-",
             )
         else:
             log.error(
-                "mmdc render failed binary=%s returncode=%s stderr=%s",
+                "mmdc で図を作成できません: コマンド=%s、終了コード=%s、標準エラー=%s",
                 mmdc,
                 proc.returncode,
                 stderr[:300] or "-",
@@ -1624,7 +1624,7 @@ def repair_answer_mermaid(
         return answer
     if shutil.which(settings.mermaid_cli_bin) is None:
         log.error(
-            "mermaid CLI not found in PATH, all diagrams skipped binary=%s",
+            "Mermaidの実行コマンドがPATHにないため、すべての図を省略します: コマンド=%s",
             settings.mermaid_cli_bin,
         )
         emit({"type": "diagram_skipped", "reason": "mermaid CLI not installed"})
@@ -1651,7 +1651,7 @@ def repair_answer_mermaid(
             except Exception as exc:  # noqa: BLE001 - repair is best-effort
                 # Without this a dead endpoint reads as "the model could not fix the diagram".
                 log.error(
-                    "mermaid repair model call failed attempt=%s error=%s: %s",
+                    "Mermaid修復用のモデル呼び出しに失敗しました: 試行=%s、エラー=%s: %s",
                     attempt,
                     type(exc).__name__,
                     exc,
@@ -1671,7 +1671,7 @@ def repair_answer_mermaid(
         all_ok = all_ok and ok
         if not ok:
             log.error(
-                "mermaid diagram could not be repaired attempts=%s error=%s",
+                "Mermaidの図を修復できません: 試行回数=%s、エラー=%s",
                 attempt,
                 (error or "")[:300] or "-",
             )
@@ -1927,7 +1927,7 @@ def _sanitize_message(message: Any) -> Any:
         return cloned
     except Exception as exc:  # noqa: BLE001 - an unsanitizable message still goes to the model
         log.error(
-            "message sanitize failed, sending unsanitized content error=%s: %s",
+            "メッセージを整形できないため、そのまま送信します: エラー=%s: %s",
             type(exc).__name__,
             exc,
             exc_info=True,

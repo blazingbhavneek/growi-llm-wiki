@@ -23,7 +23,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from publisher import failure_logs  # noqa: E402
-from publisher.progress import LiveJapaneseFormatter  # noqa: E402
+from publisher.progress import LiveLogFormatter  # noqa: E402
 from runner import cli  # noqa: E402
 
 TRACE_HEAD = "Traceback (most recent call last)"
@@ -71,7 +71,7 @@ class TempLogCase(unittest.TestCase):
         live = cli._ProjectLogHandler(self.tmp / "live.log", maxBytes=live_bytes,
                                       backupCount=99, encoding="utf-8")
         live.setLevel(logging.INFO)
-        live.setFormatter(LiveJapaneseFormatter(run_id=run_id))
+        live.setFormatter(LiveLogFormatter(run_id=run_id))
         debug = cli._ProjectLogHandler(self.tmp / "debug.log", maxBytes=debug_bytes,
                                        backupCount=99, encoding="utf-8")
         debug.setLevel(logging.DEBUG)
@@ -111,7 +111,7 @@ class TracebackSeparationTests(TempLogCase):
             self.assertRegex(live.strip(), LIVE_LINE.pattern)
             self.assertNotIn(TRACE_HEAD, live)
             self.assertIn("team/a.docx", live)
-            self.assertIn("error=ValueError: broken source", live)
+            self.assertIn("エラー=ValueError: broken source", live)
             self.assertIn(TRACE_HEAD, debug)
             self.assertIn("ValueError: broken source", debug)
 
@@ -151,7 +151,7 @@ class TracebackSeparationTests(TempLogCase):
 
     def test_live_redacts_credentials(self):
         live, debug = self.handlers(run_id="r1")
-        live.setFormatter(LiveJapaneseFormatter(
+        live.setFormatter(LiveLogFormatter(
             run_id="r1",
             redact=lambda text: failure_logs.redact_log_text(text, settings_for(self.tmp))))
         self.log.addHandler(live)
@@ -202,25 +202,28 @@ class LevelAndShapeTests(TempLogCase):
         self.log.addHandler(debug)
         for level, name in ((logging.DEBUG, "debug"), (logging.INFO, "info"), (logging.WARNING, "warning"),
                             (logging.ERROR, "error"), (logging.CRITICAL, "critical")):
-            self.log.log(level, "stage=publish path=%s level=%s", "team/a.docx", name)
+            self.log.log(level, "公開処理: パス=%s、レベル=%s", "team/a.docx", name)
         live_text, debug_text = self.text("live.log"), self.text("debug.log")
         self.assertEqual(len(live_text.splitlines()), 4, live_text)
         self.assertEqual(len(debug_text.splitlines()), 5, debug_text)
         lines = live_text.splitlines()
         self.assertTrue(all(LIVE_LINE.match(line) for line in lines), lines)
-        self.assertIn("パブリッシュ", " ".join(lines))
+        self.assertIn("公開処理", " ".join(lines))
         self.assertNotIn("\x1b", " ".join(lines))
         self.close(live, debug)
 
-    def test_known_templates_render_in_japanese(self):
+    def test_messages_are_written_as_supplied_in_both_files(self):
         live, debug = self.handlers()
         self.log.addHandler(live)
-        self.log.error("document failed: %s", "team/docs/Broken.docx")
-        self.log.error("a message nobody translated")
+        self.log.addHandler(debug)
+        self.log.error("処理に失敗した文書: %s", "team/docs/Broken.docx")
+        self.log.info("processed path=%s status=%s", "team/a.docx", "unchanged")
         self.close(live, debug)
-        live_text = self.text("live.log")
-        self.assertIn("失敗ドキュメント: team/docs/Broken.docx", live_text)
-        self.assertIn("ログ詳細（原文）", live_text)
+        for name in ("live.log", "debug.log"):
+            body = self.text(name)
+            self.assertIn("処理に失敗した文書: team/docs/Broken.docx", body)
+            self.assertIn("processed path=team/a.docx status=unchanged", body)
+            self.assertNotIn("ログ詳細（原文）", body)
 
 
 class RotationAndRetentionTests(TempLogCase):
@@ -290,7 +293,7 @@ class HardeningTests(TempLogCase):
 
     def test_unopenable_destination_is_skipped_and_the_other_is_kept(self):
         broken = cli._open_log_handler(self.tmp / "missing-dir" / "live.log", level=logging.INFO,
-                                       max_bytes=1000, formatter=LiveJapaneseFormatter())
+                                       max_bytes=1000, formatter=LiveLogFormatter())
         healthy = cli._open_log_handler(self.tmp / "debug.log", level=logging.DEBUG,
                                         max_bytes=1000, formatter=logging.Formatter("%(message)s"))
         self.assertIsNone(broken)
@@ -310,7 +313,7 @@ class HardeningTests(TempLogCase):
         finally:
             notice, sys.__stderr__ = sys.__stderr__.buffer, original
         self.assertTrue(live.broken)
-        self.assertEqual(notice.count("logging disabled:"), 1, notice)
+        self.assertEqual(notice.count("ログの保存を停止しました:"), 1, notice)
         self.assertNotIn(TRACE_HEAD, notice)
         self.assertEqual(self.text("live.log"), "")  # a failed destination gets no more writes
         self.assertEqual(len(self.text("debug.log").splitlines()), 3)
@@ -327,7 +330,7 @@ class HardeningTests(TempLogCase):
             notice, sys.__stderr__ = sys.__stderr__.buffer, original
             os.rename = original_rename
         self.assertTrue(live.broken)
-        self.assertEqual(notice.count("logging disabled:"), 1, notice)
+        self.assertEqual(notice.count("ログの保存を停止しました:"), 1, notice)
         self.assertNotIn(TRACE_HEAD, notice)
         self.close(live, debug)
 
@@ -452,7 +455,7 @@ class SummaryTests(TempLogCase):
         self.assertIn("理由: ValueError: broken source", body)
         self.assertIn("debug.log", body)
         self.assertNotIn(TRACE_HEAD, body)
-        self.assertIn("ERROR document failed: team/docs/Broken.docx", seen)
+        self.assertIn("ERROR 処理に失敗した文書: team/docs/Broken.docx", seen)
 
     def test_summary_reset_failure_is_reported_and_the_run_continues(self):
         settings = settings_for(self.tmp)
@@ -470,7 +473,7 @@ class SummaryTests(TempLogCase):
             summary.chmod(0o644)
             root.removeHandler(capture)
         if os.geteuid() != 0:
-            self.assertTrue(any("failed to reset failure summary" in line for line in seen), seen)
+            self.assertTrue(any("失敗一覧を初期化できません" in line for line in seen), seen)
 
     def test_legacy_traceback_in_failure_string_goes_only_to_debug(self):
         trace = TRACE_HEAD + ':\n  File "parse.py", line 1, in run\nValueError: broken source\n'

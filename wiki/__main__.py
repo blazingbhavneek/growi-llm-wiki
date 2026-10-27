@@ -27,13 +27,13 @@ def main() -> int:
         name, _separator, value = item.partition("=")
         if name != "policy" or not value.strip():
             log.warning(
-                "--set entry is ignored here setting=%s config=%s reason=this entry point reads the policy key only (the value was not applied)",
+                "この起動方法では policy のみ読むため、設定の上書きを無視します。値は適用されていません: 設定=%s、設定ファイル=%s",
                 item,
                 args.config or "(no config given)",
             )
     settings = load_settings(args.config) if args.config else None
     log.info(
-        "wiki phase started config=%s project=%s source=%s out=%s mode=%s force=%s",
+        "Wikiの生成を開始します: 設定=%s、プロジェクト=%s、元文書=%s、出力先=%s、方式=%s、強制実行=%s",
         args.config or "(no config given)",
         getattr(settings, "target_name", "") or "(no project selected)",
         args.source,
@@ -48,7 +48,7 @@ def main() -> int:
     result = run(cfg, Input(Path(args.source), args.relative, args.force), Path(args.out))
     print(json.dumps(result.__dict__, ensure_ascii=False, default=str))
     log.info(
-        "wiki result document=%s raw=%s tier=%s reason=%s pages=%d policy=%s",
+        "Wikiの生成結果: 文書=%s、変換テキスト=%s、更新段階=%s、理由=%s、ページ数=%d、処理方式=%s",
         result.document,
         result.raw,
         result.tier,

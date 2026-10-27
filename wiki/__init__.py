@@ -75,7 +75,7 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
     source = Path(inp.raw)
     if not source.is_file():
         log.error(
-            "wiki source file is missing path=%s out=%s error=not a file (check --in and that the convert step wrote the raw Markdown)",
+            "Wikiの元ファイルが見つからないか、ファイルではありません。--in と変換済みMarkdownの出力を確認してください: パス=%s、出力先=%s",
             source,
             out,
         )
@@ -87,7 +87,7 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
         raw_target.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         log.error(
-            "raw folder could not be created path=%s document=%s error=%s: %s (disk full, read-only, or the volume is not mounted?)",
+            "変換テキストのフォルダーを作成できません: パス=%s、文書=%s、エラー=%s: %s（容量・書き込み権限・接続状態を確認してください）",
             raw_target.parent,
             raw_rel,
             type(exc).__name__,
@@ -100,7 +100,7 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
             shutil.copyfile(source, raw_target)
         except OSError as exc:
             log.error(
-                "raw copy failed source=%s target=%s document=%s error=%s: %s (disk full, or the output volume is read-only)",
+                "変換テキストをコピーできません: コピー元=%s、コピー先=%s、文書=%s、エラー=%s: %s（容量・書き込み権限を確認してください）",
                 source,
                 raw_target,
                 raw_rel,
@@ -138,7 +138,7 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
     pages = tuple(str(item.get("filename")) for item in plan.get("pages", []) if item.get("filename"))
     if not pages:
         log.error(
-            "build claimed success with no pages document=%s plan=%s mode=%s policy=%s (the plan is missing or empty: the published wiki folder keeps its previous content)",
+            "生成成功と報告されましたがページがありません。構成がないか空のため、公開用Wikiの内容は以前のままです: 文書=%s、構成=%s、方式=%s、処理方式=%s",
             document,
             state_dir / "state" / "plan.json",
             cfg.mode,

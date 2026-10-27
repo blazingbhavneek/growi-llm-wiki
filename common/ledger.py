@@ -37,15 +37,15 @@ def load_ledger(path: Path) -> Ledger:
         reason = _missing_reason(target)
         if reason != "not found":
             # an empty ledger on a permission error means every document looks unpublished.
-            log.error("pipeline ledger could not be read file=%s reason=%s; continuing with an empty ledger, so published documents may be republished", target, reason)
+            log.error("処理台帳を読めないため空の台帳で続行します。公開済み文書が再公開される場合があります: ファイル=%s、理由=%s", target, reason)
         return Ledger({}, {})
     data = read_json(target)
     if not isinstance(data, dict):
-        log.error("pipeline ledger is not a json object file=%s found=%s", target, type(data).__name__)
+        log.error("処理台帳のJSONがオブジェクト形式ではありません: ファイル=%s、形式=%s", target, type(data).__name__)
         raise ValueError(f"invalid pipeline ledger: {target}")
     version = data.get("schema_version")
     if version not in (1, 2, 3, 4):
-        log.error("unsupported pipeline ledger schema_version file=%s version=%s (supported 1-4)", target, version)
+        log.error("処理台帳のバージョンに対応していません: ファイル=%s、バージョン=%s（対応範囲: 1〜4）", target, version)
         raise ValueError(f"invalid pipeline ledger: {target}")
     return Ledger(
         dict(data.get("sources") or {}),

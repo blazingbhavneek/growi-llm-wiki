@@ -79,7 +79,7 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
     source = Path(inp.source)
     if not source.is_file():
         # is_file() is also False when the file or a parent directory cannot be read
-        log.error("convert source is missing or not a readable file path=%s", source)
+        log.error("変換元が存在しないか、読み込み可能なファイルではありません: パス=%s", source)
         raise FileNotFoundError(source)
     layout = DataLayout(Path(out)).ensure()
     relative = inp.relative or source.name

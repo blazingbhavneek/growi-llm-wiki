@@ -321,7 +321,7 @@ def hierarchy(pages: Sequence[Any], lines: Sequence[str], *, checkpoint: Path, v
         # `default={}` only covers a missing file: a corrupt checkpoint raises here.
         # graph/wiki/storage logs the file error (path + errno, or corrupt-vs-missing) on the line above.
         log.error(
-            "page hierarchy checkpoint is unusable; the hierarchy is rebuilt from the plan path=%s",
+            "ページ階層の保存情報を使えないため、構成から作り直します: パス=%s",
             checkpoint,
             exc_info=True,
         )
@@ -341,7 +341,7 @@ def hierarchy(pages: Sequence[Any], lines: Sequence[str], *, checkpoint: Path, v
         write_json_atomic(checkpoint, {"parents": parents, "pages": summaries, "policy": version})
     except OSError as exc:
         log.error(
-            "page hierarchy checkpoint could not be written; the next run repeats the hierarchy work path=%s",
+            "ページ階層の保存情報を書き込めません。次回も階層を作り直します: パス=%s",
             checkpoint,
             exc_info=True,
         )

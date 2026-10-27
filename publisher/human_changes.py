@@ -67,7 +67,7 @@ def footer_span(text: str) -> tuple[int, int] | None:
     if not markers:
         return None
     if len(markers) != 2 or [item[0] for item in markers] != [LINKS_FOOTER_START, LINKS_FOOTER_END]:
-        log.error("managed link footer is damaged: expected one start and one end marker, found=%d", len(markers))
+        log.error("管理対象の関連リンクが破損しています。開始・終了マーカーは各1個必要です: 検出数=%d", len(markers))
         raise ValueError("damaged managed link footer")
     return markers[0][1], markers[1][2]
 
@@ -353,11 +353,11 @@ def _merge_window(model: Any, old_w: str, cur_w: str, new_w: str, guidance: list
             return None
         except Exception as exc:  # a failed call is a rejected attempt
             failure = f"{type(exc).__name__}: {exc}"
-            log.debug("human_sync event=merge_rejected attempt=%d reason=%s", attempt, failure)
+            log.debug("編集内容の統合が検証に通りません: 試行=%d、理由=%s", attempt, failure)
             continue
         stats[f"merge_ok_{attempt}"] += 1
         return got
-    log.error("human model merge gave up attempts=%d page=%s last_error=%s (the page keeps the human text with the new source text quoted under it)", 2, page, failure)
+    log.error("人による編集の統合に失敗しました。編集済み本文を維持し、新しい元文書をその下に引用します: 試行回数=%d、ページ=%s、最後のエラー=%s", 2, page, failure)
     return None
 
 
@@ -381,7 +381,7 @@ def classify(model: Any, pairs: list[tuple[str, str]]) -> list[str]:
         items = model.classify(pairs)
     except Exception as exc:
         # The next generation then ignores what the human asked for, so the skip has to be visible.
-        log.error("human change classify failed; structure guidance is skipped for this revision error=%s: %s", type(exc).__name__, exc, exc_info=True)
+        log.error("編集内容を分類できないため、この版では構造に関する指示を省略します: エラー=%s: %s", type(exc).__name__, exc, exc_info=True)
         return []
     return [str(i["instruction"]).strip() for i in items if i.get("kind") == "structure" and str(i.get("instruction") or "").strip()]
 
@@ -671,10 +671,10 @@ class HumanStore:
         self.root = Path(project.metadata) / "human-sync"
         schema = self.root / "schema.json"
         if self.root.exists() and not schema.exists():
-            log.error("human store schema is missing path=%s; human edits cannot be read or written", schema)
+            log.error("編集情報の形式定義がないため、人による編集を読み書きできません: パス=%s", schema)
             raise ValueError("human store schema is missing")
         if schema.exists() and read_json(schema) != {"schema_version": VERSION}:
-            log.error("human store schema is unsupported path=%s; the store was written by another version", schema)
+            log.error("編集情報の形式に対応していません。別の版で保存されたデータです: パス=%s", schema)
             raise ValueError("unsupported human store schema")
 
     def _initialize(self) -> None:
@@ -693,17 +693,17 @@ class HumanStore:
 
     def get(self, digest: str) -> str:
         if not _HEX.fullmatch(digest):
-            log.error("human snapshot hash is invalid snapshot=%s", digest[:12])
+            log.error("編集内容の保存用コピーのハッシュが不正です: 識別値=%s", digest[:12])
             raise ValueError("invalid human snapshot hash")
         path = self.root / "snapshots" / f"{digest}.md"
         try:
             with path.open(encoding="utf-8", newline="") as stream:
                 text = stream.read()
         except (OSError, UnicodeDecodeError) as exc:
-            log.error("human snapshot could not be read path=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+            log.error("編集内容の保存用コピーを読み込めません: パス=%s、エラー=%s: %s", path, type(exc).__name__, exc, exc_info=True)
             raise
         if sha256_text(text) != digest:
-            log.error("human snapshot checksum mismatch path=%s (the stored text is not what the hash recorded)", path)
+            log.error("編集内容の保存用コピーが記録されたハッシュと一致しません: パス=%s", path)
             raise ValueError(f"human snapshot checksum mismatch: {digest}")
         return text
 
@@ -724,7 +724,7 @@ class HumanStore:
             for path in self.root.glob(pattern):
                 data = read_json(path)
                 if not isinstance(data, dict) or data.get("schema_version") != VERSION:
-                    log.error("human store record is invalid path=%s (publishing is stopped before any remote change)", path)
+                    log.error("保存済みの編集記録が不正です。GROWIを変更する前に公開を停止します: パス=%s", path)
                     raise ValueError(f"invalid human store record: {path.name}")
                 self.validate(data)
 
@@ -748,7 +748,7 @@ class HumanStore:
         try:
             return {p.name: p.read_text(encoding="utf-8") for p in sorted(directory.glob("*.md"))}
         except (OSError, UnicodeDecodeError) as exc:
-            log.error("human store pages could not be read directory=%s error=%s: %s", directory, type(exc).__name__, exc, exc_info=True)
+            log.error("保存済みの編集ページを読み込めません: フォルダー=%s、エラー=%s: %s", directory, type(exc).__name__, exc, exc_info=True)
             raise
 
     def state(self, raw_rel: str) -> dict | None:
@@ -770,7 +770,7 @@ class HumanStore:
             try:
                 pages[page.name] = (original if original.exists() else page).read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as exc:
-                log.error("wiki page could not be read path=%s error=%s: %s", original if original.exists() else page,
+                log.error("Wikiページを読み込めません: パス=%s、エラー=%s: %s", original if original.exists() else page,
                           type(exc).__name__, exc, exc_info=True)
                 raise
         doc = {"schema_version": VERSION, "source_id": self.identity(raw_rel)[1]["source_id"],
@@ -807,22 +807,22 @@ class HumanStore:
     def check(self, raw_rel: str) -> None:
         """Documents that cannot be handled safely are blocked (legacy journal; another source's human text)."""
         if self._legacy(raw_rel):
-            log.error("document is blocked: the legacy human journal still holds a live edit document=%s", raw_rel)
+            log.error("古い編集記録に有効な編集が残っているため、文書の処理を停止します: 文書=%s", raw_rel)
             raise ValueError("legacy human journal")
         key = self.identity(raw_rel)[0]
         for path in (self.root / "doc").glob("*/doc.json"):
             if (path.parent.name != key and read_json(path, default={}).get("raw_rel") == raw_rel
                     and self._information(path.parent)):
-                log.error("document is blocked: another source at this path holds human information document=%s store=%s", raw_rel, path.parent.name)
+                log.error("同じパスの別の元文書に人による編集があるため、処理を停止します: 文書=%s、保存先=%s", raw_rel, path.parent.name)
                 raise ValueError("a different source at this path holds human information")
 
     def assert_deletable(self, raw_rel: str) -> None:
         if self._legacy(raw_rel):
-            log.error("document is blocked: the legacy human journal still holds a live edit document=%s", raw_rel)
+            log.error("古い編集記録に有効な編集が残っているため、文書の処理を停止します: 文書=%s", raw_rel)
             raise ValueError("legacy human journal")
         directory = self._dir(raw_rel)
         if (directory / "doc.json").exists() and self._information(directory):
-            log.error("delete refused: the document holds human information document=%s; remove or move that text in GROWI first", raw_rel)
+            log.error("人による編集があるため、文書を削除できません: 文書=%s。先にGROWIで該当テキストを削除または移動してください", raw_rel)
             raise ValueError("document has human information; remove or move that text in GROWI first")
 
     def _finish(self, doc: dict, pages: dict[str, str], appendix: str, entries: list[str]) -> dict[str, str]:
@@ -863,7 +863,7 @@ class HumanStore:
                 write_text_atomic(path, text)
             except OSError as exc:
                 # graph/wiki/storage.py already names the path and errno; only the consequence is ours.
-                log.error("human page write failed document=%s path=%s error=%s%s", raw_rel, path, type(exc).__name__,
+                log.error("編集済みページを書き込めません: 文書=%s、パス=%s、エラー=%s%s", raw_rel, path, type(exc).__name__,
                           "; the live wiki page and GROWI now disagree until the next run" if path.parent == folder
                           else "; the human store copy of this page is not updated")
                 raise
@@ -896,7 +896,7 @@ class HumanStore:
         try:
             write_json_atomic(directory / "doc.json", doc)
         except OSError as exc:
-            log.error("human store state not committed document=%s path=%s error=%s (the pages above are written but the merge is not recorded, so the next run repeats it)",
+            log.error("編集状態を確定できません。ページは保存済みですが統合の記録がないため、次回もう一度実行します: 文書=%s、パス=%s、エラー=%s",
                       raw_rel, directory / "doc.json", type(exc).__name__)
             raise
         if changed:
@@ -960,7 +960,7 @@ class HumanStore:
         try:
             write_json_atomic(self._dir(raw_rel) / "captures" / f"{name}.json", record)
         except OSError as exc:
-            log.error("human revision capture lost document=%s page=%s error=%s (this revision cannot be replayed after a rollback)",
+            log.error("編集の版を記録できません。巻き戻し後にこの版を再適用できません: 文書=%s、ページ=%s、エラー=%s",
                       raw_rel, page, type(exc).__name__)
             raise
         return self._commit(raw_rel, doc, pages, current, pure=pure if fresh else None)
@@ -1221,7 +1221,7 @@ class HumanStore:
             self.save_page(data)
             row.update({"page_id": page.page_id, "growi_path": page.path, "revision_id": page.revision_id})
             self.remember_page(local_path, row, remote or page.body, local, published=True)
-            log.debug("human_sync event=adopt_exact_prepared_write page=%s revision=%s", page.page_id, page.revision_id)
+            log.debug("準備済み書き込みと一致するページを採用しました: ページ=%s、リビジョン=%s", page.page_id, page.revision_id)
             return {"exact": True}
         confirmation = data.get("publication_confirmation") or {}
         # Records written by the accepted TODO-1 implementation predate
@@ -1234,10 +1234,10 @@ class HumanStore:
             and confirmation.get("path") == page.path
             and confirmation.get("remote_blob") == data.get("prepared_remote_blob")
         ):
-            log.error("prepared publication outcome is ambiguous page=%s revision=%s path=%s (neither rebase nor adopt is safe)",
+            log.error("準備済みの公開結果が不明です。状態の合わせ直しも採用も安全に実行できません: ページ=%s、リビジョン=%s、パス=%s",
                       page.page_id, page.revision_id, page.path)
             raise ValueError("ambiguous prepared publication outcome")
-        log.debug("human_sync event=rebase_prepared_write page=%s revision=%s", page.page_id, page.revision_id)
+        log.debug("準備済み書き込みを最新状態に合わせました: ページ=%s、リビジョン=%s", page.page_id, page.revision_id)
         return {"exact": False, "remote": body, "local": local, "attempt_id": data.get("prepared_attempt_id")}
 
     def remember_page(self, local_path: str, row: dict, remote: str, local: str, *, published: bool) -> None:
@@ -1285,7 +1285,7 @@ def apply_generated(project: Any, raw_rel: str, *, model: Any = None) -> Applied
     try:
         new = {page.name: page.read_text(encoding="utf-8") for page in sorted(folder.glob("*.md"))}
     except (OSError, UnicodeDecodeError) as exc:
-        log.error("generated pages could not be read folder=%s error=%s: %s (human changes cannot be re-applied)",
+        log.error("生成済みページを読めないため、人による編集を再適用できません: フォルダー=%s、エラー=%s: %s",
                   folder, type(exc).__name__, exc, exc_info=True)
         raise
     store = HumanStore(project)
@@ -1293,13 +1293,13 @@ def apply_generated(project: Any, raw_rel: str, *, model: Any = None) -> Applied
     applied = store.generate(raw_rel, new, model=model)
     if has_human_state and applied.changed_pages:
         log.info(
-            "GROWIユーザー編集を新しいドキュメントへ再適用しました: ドキュメント=%s ページ数=%d",
+            "GROWIでの編集を新しい文書に再適用しました: 文書=%s、ページ数=%d",
             raw_rel, len(applied.changed_pages),
         )
         log.debug(
-            "human_sync event=reapplied document=%s pages=%s",
+            "人による編集を再適用しました: 文書=%s、ページ数=%s",
             raw_rel, sorted(applied.changed_pages),
         )
     elif has_human_state:
-        log.debug("human_sync event=reapply_unchanged document=%s", raw_rel)
+        log.debug("人による編集の再適用に変更はありません: 文書=%s", raw_rel)
     return applied

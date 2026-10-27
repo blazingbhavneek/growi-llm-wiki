@@ -29,13 +29,13 @@ def clean_workdir(path: Path | str) -> Path:
         try:
             shutil.rmtree(directory)
         except OSError as exc:
-            log.error("workdir delete failed path=%s error=%s: %s (the directory may be half-deleted)",
+            log.error("作業フォルダーを削除できません。一部だけ削除されている場合があります: パス=%s、エラー=%s: %s",
                       directory, type(exc).__name__, exc, exc_info=True)
             raise
     try:
         directory.mkdir(parents=True)
     except OSError as exc:
-        log.error("workdir create failed path=%s error=%s: %s (the old contents are already deleted: half-deleted state)",
+        log.error("作業フォルダーを作成できません。以前の内容は削除済みです: パス=%s、エラー=%s: %s",
                   directory, type(exc).__name__, exc, exc_info=True)
         raise
     return directory
@@ -125,13 +125,13 @@ def _atomic_write(path: Path, payload: str | bytes) -> None:
             try:
                 Path(temporary).unlink(missing_ok=True)
             except OSError as cleanup_exc:
-                log.error("temp file left behind path=%s temp=%s error=%s: %s (the failed write below is the real error)",
+                log.error("一時ファイルが残っています。元の書き込みエラーは後続のログを確認してください: パス=%s、一時ファイル=%s、エラー=%s: %s",
                           path, temporary, type(cleanup_exc).__name__, cleanup_exc, exc_info=True)
                 raise
         code = getattr(exc, "errno", None)
         reason = type(exc).__name__ if code is None else f"{type(exc).__name__} errno={code} ({os.strerror(code)})"
         # mkdir/mkstemp/write/flush/fsync/os.replace all land here: the errno names which step failed.
-        log.error("atomic write failed path=%s error=%s: %s (disk full, permissions, or file locked?)",
+        log.error("ファイルを安全に書き込めません: パス=%s、エラー=%s: %s（容量・権限・ファイルの使用状況を確認してください）",
                   path, reason, exc, exc_info=True)
         raise
 
@@ -148,7 +148,7 @@ def write_json_atomic(path: Path | str, data: Any) -> Path:
     try:
         text = json.dumps(payload, indent=2, ensure_ascii=False)
     except (TypeError, ValueError) as exc:
-        log.error("json serialize failed path=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        log.error("JSONに変換できません: パス=%s、エラー=%s: %s", path, type(exc).__name__, exc, exc_info=True)
         raise
     _atomic_write(path, text + "\n")
     return path
@@ -172,20 +172,20 @@ def read_json(path: Path | str, default: Any = None) -> Any:
         if default is None:
             # A missing file with no default is the documented cache-miss contract: the
             # caller that REQUIRES this file logs its own ERROR with that context.
-            log.debug("json file is absent file=%s reason=%s", path, reason)
+            log.debug("JSONファイルがありません: ファイル=%s、理由=%s", path, reason)
             raise FileNotFoundError(str(path))
         if reason != "not found":
-            log.error("json file could not be read file=%s reason=%s; the default value was used instead", path, reason)
+            log.error("JSONファイルを読めないため既定値を使います: ファイル=%s、理由=%s", path, reason)
         return default
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        log.error("json file could not be read file=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        log.error("JSONファイルを読み込めません: ファイル=%s、エラー=%s: %s", path, type(exc).__name__, exc, exc_info=True)
         raise
     try:
         return json.loads(text)
     except ValueError as exc:
-        log.error("json file is corrupt, not missing file=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        log.error("JSONファイルが破損しています: ファイル=%s、エラー=%s: %s", path, type(exc).__name__, exc, exc_info=True)
         raise
 
 
@@ -194,10 +194,10 @@ def read_text(path: Path | str, default: str = "") -> str:
     if not path.exists():
         reason = _missing_reason(path)
         if reason != "not found":
-            log.error("text file could not be read file=%s reason=%s; the default value was used instead", path, reason)
+            log.error("テキストファイルを読めないため既定値を使います: ファイル=%s、理由=%s", path, reason)
         return default
     try:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        log.error("text file could not be read file=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        log.error("テキストファイルを読み込めません: ファイル=%s、エラー=%s: %s", path, type(exc).__name__, exc, exc_info=True)
         raise

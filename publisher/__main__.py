@@ -23,23 +23,23 @@ def main() -> int:
     if args.command == "assemble":
         result = assemble(root)
         print({"action": result.action, "pages": list(result.pages)})
-        log.info("assemble finished action=%s pages=%d", result.action, len(result.pages))
+        log.info("公開用データの組み立てが完了しました: 処理=%s、ページ数=%d", result.action, len(result.pages))
         return 0
     if not args.config:
         parser.error("publish requires --config")
     try:
         settings = load_settings(args.config)
     except Exception as exc:
-        log.error("project config could not be loaded setting=%s error=%s: %s (nothing was published)",
+        log.error("プロジェクト設定を読み込めません。公開は行っていません: 設定=%s、エラー=%s: %s",
                   args.config or "(not given)", type(exc).__name__, exc, exc_info=True)
         raise
     if args.dry_run:
         print(json.dumps({"action": "publish", "dry_run": True, "out": str(root)}, ensure_ascii=False))
-        log.info("publish dry run out=%s (nothing was written)", root)
+        log.info("公開の試行確認を実行しました。書き込みはしていません: 出力先=%s", root)
         return 0
     result = run(Config(action="publish", publish=True, settings=settings), Input(root), root)
     print(json.dumps(result.__dict__, ensure_ascii=False, default=str))
-    log.info("publish finished action=publish out=%s failures=%d", root, len(result.failures))
+    log.info("公開処理が完了しました: 出力先=%s、失敗数=%d", root, len(result.failures))
     return 1 if result.failures else 0
 
 

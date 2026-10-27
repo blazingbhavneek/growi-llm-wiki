@@ -38,14 +38,14 @@ def load_ledger(path: Path) -> Ledger:
         return Ledger({}, {})
     data = read_json(path)
     if not isinstance(data, dict) or data.get("schema_version") not in (1, 2, 3, 4):
-        log.error("pipeline ledger has no usable schema file=%s found=%r expected=1,2,3,4",
+        log.error("処理台帳の形式を使えません: ファイル=%s、形式=%r、対応バージョン=1,2,3,4",
                   path, data.get("schema_version") if isinstance(data, dict) else type(data).__name__)
         raise ValueError(f"invalid pipeline ledger: {path}")
     sources = data.get("sources", {})
     published = data.get("published_documents", {})
     pages = data.get("published_pages", {})
     if not isinstance(sources, dict) or not isinstance(published, dict) or not isinstance(pages, dict):
-        log.error("pipeline ledger maps are not objects file=%s sources=%s published_documents=%s published_pages=%s",
+        log.error("処理台帳の各一覧がオブジェクト形式ではありません: ファイル=%s、元文書一覧=%s、公開文書一覧=%s、公開ページ一覧=%s",
                   path, type(sources).__name__, type(published).__name__, type(pages).__name__)
         raise ValueError(f"invalid pipeline ledger maps: {path}")
     return Ledger(
@@ -61,7 +61,7 @@ def save_ledger(path: Path, ledger: Ledger) -> None:
     try:
         write_json_atomic(path, ledger.as_json())
     except Exception as exc:  # noqa: BLE001 - the caller cannot tell a lost state write from a saved one
-        log.error("publisher state write failed file=%s error=%s: %s; the next run may create duplicate or orphan pages",
+        log.error("公開状態を保存できません。次回の実行で重複ページや管理外のページができる場合があります: ファイル=%s、エラー=%s: %s",
                   path, type(exc).__name__, exc, exc_info=True)
         raise
 

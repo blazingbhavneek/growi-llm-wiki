@@ -31,14 +31,14 @@ def _raw_rel(project: Project, document: str) -> str:
         try:
             return str(__import__("json").loads(marker.read_text(encoding="utf-8")).get("raw", document))
         except (OSError, ValueError) as exc:
-            log.error("source stamp could not be read document=%s path=%s error=%s: %s", document, marker, type(exc).__name__, exc, exc_info=True)
+            log.error("元文書の更新情報を読み込めません: 文書=%s、パス=%s、エラー=%s: %s", document, marker, type(exc).__name__, exc, exc_info=True)
             raise
     chunks = project.wiki / document / "_planning" / "chunks.json"
     if chunks.exists():
         try:
             cached = str(__import__("json").loads(chunks.read_text(encoding="utf-8")).get("raw_rel") or "")
         except (OSError, ValueError) as exc:
-            log.error("chunk index could not be read document=%s path=%s error=%s: %s", document, chunks, type(exc).__name__, exc, exc_info=True)
+            log.error("分割部分の一覧を読み込めません: 文書=%s、パス=%s、エラー=%s: %s", document, chunks, type(exc).__name__, exc, exc_info=True)
             raise
         if cached:
             return cached
@@ -58,7 +58,7 @@ def _model_and_embedder(settings: Settings, project: Project, document: str):
         from graph.clients.embeddings import Embedder
         embedder = Embedder(settings)
     except Exception as exc:  # noqa: BLE001 - vector search is optional, but losing it silently is not
-        log.error("embedder unavailable, vector candidate search is off document=%s model=%s backend=%s endpoint=%s settings=WIKI_EMBED_BACKEND,embed_model,embed_api_key error=%s: %s",
+        log.error("検索用ベクトルを作成できないため、ベクトルによる候補検索を停止します: 文書=%s、モデル=%s、実行方式=%s、接続先=%s、設定=WIKI_EMBED_BACKEND,embed_model,embed_api_key、エラー=%s: %s",
                   document, getattr(settings, "embed_model", ""), getattr(settings, "embed_backend", ""),
                   getattr(settings, "embed_base_url", ""), type(exc).__name__, exc, exc_info=True)
         embedder = None
@@ -103,7 +103,7 @@ def calibrate_jev(project: Project, settings: Settings, sample: int) -> None:
         catalog.close()
     if not rows:
         print("No LLM edge decisions available for calibration")
-        log.info("no stored LLM edge decisions to calibrate against mode=neo path=%s", project.linker_database)
+        log.info("Jevの調整と比較するLLMのリンク判定が保存されていません: 方式=neo、パス=%s", project.linker_database)
         return
     from jev import get_engine_for
     results = run_async_blocking(_calibrate(get_engine_for(settings), rows))
@@ -111,7 +111,7 @@ def calibrate_jev(project: Project, settings: Settings, sample: int) -> None:
     pairs = [(float(result.p_yes), bool(row["accepted"])) for result, row in zip(results, rows)
              if not isinstance(result, BaseException)]
     if failures:
-        log.error("Jev calibration ran on a partial sample asked=%d answered=%d failed=%d first_error=%s: %s (the precision/recall numbers below describe a subset of the sample)",
+        log.error("一部の標本のみでJevを調整しました。以降の精度・再現率はその標本に対する値です: 質問数=%d、回答数=%d、失敗数=%d、最初のエラー=%s: %s",
                   len(rows), len(pairs), len(failures), type(failures[0]).__name__, str(failures[0])[:120])
     positives = sum(actual for _probability, actual in pairs)
     best = None
@@ -124,9 +124,9 @@ def calibrate_jev(project: Project, settings: Settings, sample: int) -> None:
         if precision >= .9 and (best is None or recall > best[1]): best = (threshold, recall)
     if best:
         print(f"best_precision_at_least_0.9={best[0]:.1f} recall={best[1]:.3f}")
-        log.info("Jev calibration best threshold=%s recall=%s sample=%d positives=%d", f"{best[0]:.1f}", f"{best[1]:.3f}", len(pairs), positives)
+        log.info("Jevの最適なしきい値を決定しました: しきい値=%s、再現率=%s、標本数=%d、正例数=%d", f"{best[0]:.1f}", f"{best[1]:.3f}", len(pairs), positives)
     else:
-        log.error("Jev calibration reached no threshold at 0.9 precision sample=%d positives=%d (Jev is not a usable replacement for the LLM judge on this sample)", len(pairs), positives)
+        log.error("適合率0.9を満たすしきい値がありません。この標本ではJevをLLM判定の代わりに使えません: 標本数=%d、正例数=%d", len(pairs), positives)
         print("no threshold reached 0.9 precision")
 
 
@@ -148,12 +148,12 @@ def main() -> None:
     if args.data_root:
         settings.data_root = str(resolve_project_path(args.data_root).resolve())
     project = open_project(settings)
-    log.info("linker command started command=%s project=%s data_root=%s wiki=%s database=%s",
+    log.info("リンク処理を開始します: コマンド=%s、プロジェクト=%s、データ保存先=%s、Wiki=%s、データベース=%s",
              args.command, args.project, settings.data_root, project.wiki, project.linker_database)
     if args.command == "status":
         if not project.linker_database.exists():
             print({"mode": None, "documents": 0, "chunks": 0, "edges": 0})
-            log.info("linker catalog not built yet, status is empty path=%s", project.linker_database)
+            log.info("リンク情報が未作成のため、状態は空です: パス=%s", project.linker_database)
             return
         with sqlite3.connect(project.linker_database) as conn:
             mode = conn.execute("SELECT value FROM meta WHERE key='mode'").fetchone()
@@ -163,7 +163,7 @@ def main() -> None:
             }
         status = {"mode": mode[0] if mode else None, **counts}
         print(status)
-        log.info("linker catalog status path=%s mode=%s documents=%d chunks=%d edges=%d",
+        log.info("リンク情報の状態: パス=%s、方式=%s、文書数=%d、分割部分数=%d、リンク数=%d",
                  project.linker_database, status["mode"], counts["documents"], counts["chunks"], counts["edges"])
         return
     if args.command == "rebuild":
@@ -176,7 +176,7 @@ def main() -> None:
     if rel in _documents(project):
         rel = _raw_rel(project, rel)
     elif not project.raw_file(rel).exists():
-        log.error("unknown document project=%s document=%s wiki=%s (expected a wiki folder under the wiki tree or a raw rel path)",
+        log.error("対象文書が見つかりません。Wiki内のフォルダーまたは変換済みテキストの相対パスを指定してください: プロジェクト=%s、文書=%s、Wiki=%s",
                   settings.target_name, args.document, project.wiki)
         raise SystemExit(f"unknown document: {args.document} (expected a wiki folder or raw rel path)")
     model, embedder = _model_and_embedder(settings, project, Path(rel).parent.as_posix())

@@ -57,7 +57,7 @@ def _raw_rel(layout: DataLayout, document: Path) -> str:
         return str(source["raw"])
     # read_json already names the file when it is unreadable or corrupt; this is the consequence.
     log.error(
-        "source stamp is missing document=%s path=%s (the raw path below is guessed from the wiki folder name; a half-written _planning folder can link the wrong raw file)",
+        "元文書の更新情報がありません。Wikiフォルダー名から元テキストのパスを推定します。不完全な _planning では別ファイルを参照する場合があります: 文書=%s、パス=%s",
         document.name,
         document / "_planning" / "source.json",
     )
@@ -92,21 +92,21 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
     touched = tuple(getattr(linked, "touched_documents", ()) or ())
     if not hasattr(linked, "touched_documents"):
         log.error(
-            "linker returned no touched_documents contract result=%s documents=%d wiki=%s (the touched count below is a broken return contract, not an empty run)",
+            "リンク処理の戻り値に touched_documents がありません。処理件数が0なのではなく、戻り値の形式が不正です: 結果=%s、文書数=%d、Wiki=%s",
             type(linked).__name__,
             len(documents),
             layout.wiki,
         )
     elif not touched and documents:
         log.info(
-            "linker touched no documents documents=%d catalog=%s policy=%s (every scanned document was linked and needed no new link)",
+            "リンクの更新対象はありません。確認した文書はすべて処理済みです: 文書数=%d、リンク情報=%s、処理方式=%s",
             len(documents),
             layout.linker_database,
             cfg.policy.name,
         )
     elif not touched:
         log.error(
-            "linker touched no documents wiki=%s catalog=%s reason=no built document found under the wiki tree (nothing was linked; is --out the project root that the wiki build wrote?)",
+            "生成済み文書がないため、リンクを更新しませんでした。--out が生成先のプロジェクトフォルダーか確認してください: Wiki=%s、リンク情報=%s",
             layout.wiki,
             layout.linker_database,
         )
@@ -127,7 +127,7 @@ def status(root: Path) -> dict[str, Any]:
             return {"mode": mode[0] if mode else None, **{table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in ("documents", "chunks", "edges")}}
     except sqlite3.Error as exc:
         log.error(
-            "linker catalog could not be read path=%s error=%s: %s (database locked, permission denied, or an old schema that needs a linker rebuild)",
+            "リンク情報を読み込めません: パス=%s、エラー=%s: %s（使用状況・権限・古い形式による再構築の必要性を確認してください）",
             database,
             type(exc).__name__,
             exc,

@@ -62,7 +62,7 @@ async def check_roles(engine, chunks, settings):
         except Exception as exc:
             fallback += len(entities)
             complete = False
-            log.error("Jev role check failed stage=roles chunk=%s document=%s entities=%d error=%s: %s (entity roles stay the LLM guess, related-page edges are dropped)",
+            log.error("Jevで用語の役割を確認できません。LLMの推定を維持し、関連リンクを除外します: 分割部分=%s、文書=%s、用語数=%d、エラー=%s: %s",
                       item.chunk_id, item.document, len(entities), type(exc).__name__, exc, exc_info=True)
         if complete:
             item.meta.role_judge = "jev-1"
@@ -94,7 +94,7 @@ async def resolve_aliases(catalog, engine, team, new_names, settings):
             try:
                 result = (await engine.adecide_many(state, [question]))[0]
             except Exception as exc:
-                log.error("Jev alias check failed stage=alias team=%s pair=%s|%s error=%s: %s (the two names stay unmerged)",
+                log.error("Jevで別名を確認できません。2つの名前は統合しません: チーム=%s、名前の組=%s|%s、エラー=%s: %s",
                           team, a, b, type(exc).__name__, exc, exc_info=True)
                 raise
             cached = _p(result)
@@ -136,7 +136,7 @@ async def primary_definer(catalog, engine, team, canon, definers, settings):
     try:
         results = await engine.adecide_batch(requests)
     except Exception as exc:
-        log.error("Jev primary definer call failed stage=primary-definer team=%s name=%s definers=%d error=%s: %s (no definer is picked, the candidates stay unresolved)",
+        log.error("Jevで主な定義元を判定できません。候補は未解決のままです: チーム=%s、名前=%s、定義元候補数=%d、エラー=%s: %s",
                   team, canon, len(requests), type(exc).__name__, exc, exc_info=True)
         raise
     return max(results, key=_p).key if results else ""
@@ -226,7 +226,7 @@ async def judge_edges(catalog, engine, target, candidates, settings, model=None)
     try:
         screened = await engine.adecide_batch([JevRequest(screen_state, q) for _candidate, q in screen])
     except Exception as exc:
-        log.error("Jev screening call failed stage=screen target=%s document=%s candidates=%d error=%s: %s (no related-page edges are kept for this chunk)",
+        log.error("Jevで候補を絞り込めないため、この部分の関連リンクをすべて除外します: 対象=%s、文書=%s、候補数=%d、エラー=%s: %s",
                   target.chunk_id, target.document, len(screen), type(exc).__name__, exc, exc_info=True)
         raise
     top.extend((candidate, q, _p(result), rows[candidate.chunk_id]) for (candidate, q), result in zip(screen, screened)
@@ -249,7 +249,7 @@ async def judge_edges(catalog, engine, target, candidates, settings, model=None)
     try:
         verified = await engine.adecide_batch(verify_reqs)
     except Exception as exc:
-        log.error("Jev verify call failed stage=verify target=%s document=%s questions=%d error=%s: %s (no related-page edges are kept for this chunk)",
+        log.error("Jevで候補を検証できないため、この部分の関連リンクをすべて除外します: 対象=%s、文書=%s、質問数=%d、エラー=%s: %s",
                   target.chunk_id, target.document, len(verify_reqs), type(exc).__name__, exc, exc_info=True)
         raise
     best = {}
@@ -280,7 +280,7 @@ async def _llm_says_yes(model, target, row) -> bool:
     try:
         reply = await model.text(messages, max_output_tokens=TIEBREAK_MAX_TOKENS)
     except Exception as exc:  # noqa: BLE001 - no second opinion means Jev's "no" stands
-        log.error("LLM tie-break failed stage=tiebreak target=%s candidate=%s error=%s: %s (Jev's no stands, the related-page edge is dropped)",
+        log.error("LLMの再判定に失敗しました。Jevの否定判定を維持し、関連リンクを除外します: 対象=%s、候補=%s、エラー=%s: %s",
                   target.chunk_id, row["page_rel"], type(exc).__name__, exc, exc_info=True)
         return False
     last = next((line.strip() for line in reversed(str(reply).splitlines()) if line.strip()), "")
@@ -296,7 +296,7 @@ async def curate(engine, page_text, edges, settings):
                                        peer_summary=edge.get('summary', '')), key=edge["edge_id"])
             for edge in edges])
     except Exception as exc:
-        log.error("Jev page curation call failed stage=curate edges=%d first_edge=%s error=%s: %s (the page keeps all of its uncurated references)",
+        log.error("Jevで参照先を選別できません。ページの参照先をすべて維持します: リンク数=%d、最初のリンク=%s、エラー=%s: %s",
                   len(edges), edges[0]["edge_id"], type(exc).__name__, exc, exc_info=True)
         raise
     ranked = [key for _probability, key in sorted(((_p(result), result.key) for result in results if _p(result) >= .5), reverse=True)]
@@ -312,7 +312,7 @@ async def related_documents(engine, doc_cards, settings):
     try:
         results = await engine.adecide_batch(requests)
     except Exception as exc:
-        log.error("Jev document relation call failed stage=related-documents pairs=%d first=%s error=%s: %s (no related documents are listed)",
+        log.error("Jevで文書間の関係を判定できません。関連文書は表示されません: 組数=%d、最初の組=%s、エラー=%s: %s",
                   len(requests), requests[0].key if requests else "", type(exc).__name__, exc, exc_info=True)
         raise
     return {result.key for result in results if _p(result) >= .5}

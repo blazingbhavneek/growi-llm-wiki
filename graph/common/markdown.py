@@ -93,7 +93,7 @@ def chunk_text(text: str, size: int, overlap: int) -> list[tuple[int, int, str]]
     if size <= 0:
         caller = traceback.extract_stack()[-2]
         log.error(
-            "chunk size must be positive size=%s overlap=%s characters=%d caller=%s:%d",
+            "分割サイズには正の数が必要です: サイズ=%s、重複幅=%s、文字数=%d、呼び出し元=%s:%d",
             size,
             overlap,
             len(text),

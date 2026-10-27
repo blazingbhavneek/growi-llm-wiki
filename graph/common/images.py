@@ -113,7 +113,7 @@ def image_source_identity(src: str) -> tuple[str, str, str]:
         if len(compact) > MAX_INLINE_IMAGE_CHARACTERS:
             _report_image_once(
                 f"oversized:{mime}:{len(compact)}",
-                "inline image data uri is oversized before decoding mime=%s characters=%d decoded_bytes~%d (one embedded image can exhaust memory)",
+                "埋め込み画像が大きすぎます。1枚の画像でメモリ不足になる場合があります: 種類=%s、文字数=%d、変換後の推定バイト数=%d",
                 mime,
                 len(compact),
                 len(compact) * 3 // 4,
@@ -126,7 +126,7 @@ def image_source_identity(src: str) -> tuple[str, str, str]:
             digest = hashlib.sha256(compact.encode("ascii", "replace")).hexdigest()
             _report_image_once(
                 f"invalid:{digest}",
-                "inline image payload is not valid base64 mime=%s characters=%d identity=invalid-sha256:%s error=%s: %s",
+                "埋め込み画像が正しいBase64形式ではありません: 種類=%s、文字数=%d、識別値=invalid-sha256:%s、エラー=%s: %s",
                 mime,
                 len(compact),
                 digest,

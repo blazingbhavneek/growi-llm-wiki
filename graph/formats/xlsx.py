@@ -198,7 +198,7 @@ async def _append_story(
         write_text_atomic(story_source, story_text)
     except OSError as exc:
         # graph/wiki/storage logs the file error (path + errno, or corrupt-vs-missing) on the line above.
-        log.error("excel story source could not be written workbook=%s file=%s", source_path.name, story_source, exc_info=True)
+        log.error("Excelの構成作成用テキストを書き込めません: ブック=%s、ファイル=%s", source_path.name, story_source, exc_info=True)
         raise
     story_config = config.model_copy(
         update={
@@ -221,7 +221,7 @@ async def _append_story(
     try:
         plan = read_json(plan_path)
     except (OSError, ValueError) as exc:
-        log.error("excel story plan could not be read, the story run did not finish workbook=%s run=%s file=%s", source_path.name, story_run, plan_path, exc_info=True)
+        log.error("Excel構成を読めません。前回の構成作成が完了していません: ブック=%s、実行ID=%s、ファイル=%s", source_path.name, story_run, plan_path, exc_info=True)
         raise
     try:
         if on_progress:
@@ -241,7 +241,7 @@ async def _append_story(
             for number, page in enumerate(plan["pages"], 1)
         }
     except (KeyError, TypeError) as exc:
-        log.error("excel story plan has an unexpected shape workbook=%s run=%s file=%s key=%s", source_path.name, story_run, plan_path, exc, exc_info=True)
+        log.error("Excel構成の形式が不正です: ブック=%s、実行ID=%s、ファイル=%s、項目=%s", source_path.name, story_run, plan_path, exc, exc_info=True)
         raise
     for story_number, page in enumerate(plan["pages"], 1):
         old_name = page["filename"]
@@ -249,7 +249,7 @@ async def _append_story(
         try:
             body = (story_run / "wiki" / old_name).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            log.error("excel story page file could not be read workbook=%s run=%s file=%s error=%s: %s", source_path.name, story_run, story_run / "wiki" / old_name, type(exc).__name__, exc, exc_info=True)
+            log.error("Excelから生成したページを読み込めません: ブック=%s、実行ID=%s、ファイル=%s、エラー=%s: %s", source_path.name, story_run, story_run / "wiki" / old_name, type(exc).__name__, exc, exc_info=True)
             raise
         ranges = page.get("owner_ranges", [])
         used_spans = [
@@ -280,7 +280,7 @@ async def _append_story(
         try:
             write_text_atomic(run_dir / "docs" / new_name, body)
         except OSError as exc:
-            log.error("excel story page write failed workbook=%s file=%s", source_path.name, run_dir / "docs" / new_name, exc_info=True)
+            log.error("Excelから生成したページを書き込めません: ブック=%s、ファイル=%s", source_path.name, run_dir / "docs" / new_name, exc_info=True)
             raise
         files.append(
             {
@@ -330,24 +330,24 @@ def decide_update(state_root: Path, new_text: str, wiki_dir: Path) -> tuple[Any,
     try:
         plan = read_json(plan_path, default={})
     except (OSError, ValueError) as exc:
-        log.error("stored excel story plan is corrupt or unreadable, so the workbook cannot be decided incrementally run=%s file=%s", story_run, plan_path, exc_info=True)
+        log.error("保存済みExcel構成が破損しているか読めないため、差分更新の要否を判定できません: 実行ID=%s、ファイル=%s", story_run, plan_path, exc_info=True)
         raise
     if not old_path.exists() or not plan.get("pages"):
-        log.debug("no previous excel story run to update from, the workbook is rebuilt file=%s plan=%s", old_path, plan_path)
+        log.debug("前回のExcel構成がないため、全体を作り直します: ファイル=%s、構成=%s", old_path, plan_path)
         return None
     new_story, _spans = _story_source(split_sheets(new_text.splitlines()))
     marker_path = Path(wiki_dir) / "_planning" / "source.json"
     try:
         marker = read_json(marker_path, default={})
     except (OSError, ValueError) as exc:
-        log.error("workbook source marker is corrupt or unreadable file=%s", marker_path, exc_info=True)
+        log.error("Excelの元文書情報が破損しているか読めません: ファイル=%s", marker_path, exc_info=True)
         raise
     if marker.get("sha256") == hashlib.sha256(new_text.encode("utf-8")).hexdigest():
         return UpdateDecision(tier=0, reason="unchanged"), new_story
     try:
         old_story = old_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        log.error("previous excel story text could not be read file=%s error=%s: %s", old_path, type(exc).__name__, exc, exc_info=True)
+        log.error("前回のExcel構成用テキストを読み込めません: ファイル=%s、エラー=%s: %s", old_path, type(exc).__name__, exc, exc_info=True)
         raise
 
     def shape(text: str) -> list[tuple[str, tuple[int, int]]]:
@@ -368,7 +368,7 @@ def decide_update(state_root: Path, new_text: str, wiki_dir: Path) -> tuple[Any,
                 or int(plan.get("source_line_count", -1)) != len(old_lines)):
             return UpdateDecision(tier=3, reason="sheets-or-columns-changed"), new_story
     except (KeyError, TypeError, ValueError) as exc:
-        log.error("stored excel story plan has an unexpected shape run=%s file=%s error=%s: %s", story_run, plan_path, type(exc).__name__, exc, exc_info=True)
+        log.error("保存済みExcel構成の形式が不正です: 実行ID=%s、ファイル=%s、エラー=%s: %s", story_run, plan_path, type(exc).__name__, exc, exc_info=True)
         raise
     # Same sheets in the same order, one story line each: lines map one to one, so a
     # changed sheet regenerates every 解説 page that covers or quotes it (no stale value).
@@ -381,7 +381,7 @@ def decide_update(state_root: Path, new_text: str, wiki_dir: Path) -> tuple[Any,
         stale = {str(page["filename"]) for page in plan["pages"] if touches(page.get("reference_ranges", []))}
         regenerate = stale | {str(page["filename"]) for page in plan["pages"] if touches(page.get("owner_ranges", []))}
     except (KeyError, TypeError, ValueError) as exc:
-        log.error("stored excel story plan has an unexpected shape run=%s file=%s error=%s: %s", story_run, plan_path, type(exc).__name__, exc, exc_info=True)
+        log.error("保存済みExcel構成の形式が不正です: 実行ID=%s、ファイル=%s、エラー=%s: %s", story_run, plan_path, type(exc).__name__, exc, exc_info=True)
         raise
     if len(regenerate) > FULL_MIN_REGEN_SHARE * len(plan["pages"]):
         return UpdateDecision(tier=3, reason="most-pages-changed"), new_story
@@ -395,7 +395,7 @@ async def run(source_path: Path, *, run_dir: Path, model: Any, config: Any, on_p
     try:
         lines = source_path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError) as exc:
-        log.error("excel source file could not be read file=%s error=%s: %s", source_path, type(exc).__name__, exc, exc_info=True)
+        log.error("Excelの元ファイルを読み込めません: ファイル=%s、エラー=%s: %s", source_path, type(exc).__name__, exc, exc_info=True)
         raise
     sheets = split_sheets(lines)
     files = await write_tables(

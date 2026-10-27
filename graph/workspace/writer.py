@@ -255,10 +255,10 @@ def _apply_incremental_edits(
                     raise ValueError("; ".join(errors))
                 return final if final == original else final.rstrip() + "\n"
             except (ValueError, TypeError) as exc:
-                log.warning("incremental patch rejected page=%s attempt=%s/%s error=%s: %s",
+                log.warning("ページの差分修正が検証に通りません: ページ=%s、試行=%s/%s、エラー=%s: %s",
                             filename, _attempt + 1, attempts, type(exc).__name__, str(exc)[:200])
                 feedback = [str(exc)]
-        log.error("incremental page edit failed page=%s attempts=%s error=RuntimeError: %s",
+        log.error("ページの差分編集に失敗しました: ページ=%s、試行回数=%s、エラー=RuntimeError: %s",
                   filename, attempts, feedback[-1][:200])
         raise RuntimeError(f"model could not apply incremental edits to {filename}: {feedback[-1]}")
 
@@ -288,7 +288,7 @@ def _apply_incremental_edits(
             write_text_atomic(path, outcome)
         except OSError:
             # graph/wiki/storage.py already logged the path and errno; only the consequence is ours.
-            log.error("patched page was not saved page=%s; the page keeps its previous content", path)
+            log.error("修正したページが保存されていません。以前の内容が残ります: ページ=%s", path)
             raise
         state_path = state_root / "state" / "pages" / f"{int(pages[filename]['number']):03d}.json"
         state = read_json(state_path, default={})
@@ -297,7 +297,7 @@ def _apply_incremental_edits(
             try:
                 write_json_atomic(state_path, state)
             except OSError:
-                log.error("page state hash was not saved path=%s; the page will look out of date on the next run", state_path)
+                log.error("ページの状態ハッシュを保存できません。次回は未更新として扱われます: パス=%s", state_path)
                 raise
         changed.add(filename)
     return changed, failed
@@ -509,8 +509,7 @@ def publish_output(staged: Path, target: Path) -> int:
         try:
             shutil.rmtree(target)
         except OSError as exc:
-            log.error("PUBLISHED WIKI IS HALF-DELETED path=%s error=%s: %s "
-                      "(the delete stopped partway: the published wiki at this path is incomplete and the new pages were not published)",
+            log.error("公開用Wikiの削除が途中で止まりました。フォルダーは不完全で、新しいページは公開されていません: パス=%s、エラー=%s: %s",
                       target, type(exc).__name__, exc, exc_info=True)
             raise
     count = 0
@@ -528,8 +527,7 @@ def publish_output(staged: Path, target: Path) -> int:
     except Exception as exc:
         # shortcut: the old tree is already deleted here, so shutil gives no errno-free
         # "how much survived" answer; count names how far the copy got.
-        log.error("PUBLISHED WIKI IS INCOMPLETE path=%s pages_copied=%s error=%s: %s "
-                  "(the previous output was already deleted: this wiki directory is deleted or half-published and must be rebuilt)",
+        log.error("公開用Wikiが不完全です。以前の出力は削除済みで、フォルダーがないか一部のみ保存されています。再生成が必要です: パス=%s、コピー済みページ数=%s、エラー=%s: %s",
                   target, count, type(exc).__name__, exc, exc_info=True)
         raise
     return count
@@ -645,8 +643,7 @@ def write_wiki_pages(
     wiki_document = Path(project.wiki_dir(rel)).relative_to(project.wiki)
     # Old reverse-sync versions put human text into generator state; a rebuild would drop it.
     if _human_edited(state_root):
-        log.error("legacy human state blocks the rebuild document=%s state_pages=%s "
-                  "(an older reverse-sync stored human text inside the generator state; a rebuild would drop it, so this document is not built)",
+        log.error("古い形式の編集情報があるため、文書を再生成しません。再生成すると保存済みの人による編集が失われます: 文書=%s、状態ページ=%s",
                   rel, state_root / "state" / "pages")
         raise ValueError("legacy human state")
     from publisher.human_changes import HumanStore, LlmHumanModel, apply_generated
@@ -706,12 +703,12 @@ def write_wiki_pages(
                     settings=settings, llm=llm, stop_check=stop_check, guidance=guidance,
                 )
             if failed:
-                log.error("incremental page patches failed document=%s failed_pages=%s; those pages are rebuilt instead of patched",
+                log.error("差分修正に失敗したページを再生成します: 文書=%s、対象ページ=%s",
                           rel, len(failed))
                 try:
                     plan_pages = read_json(state_root / "state" / "plan.json")["pages"]
                 except KeyError as exc:
-                    log.error("wiki plan has no page list file=%s key=%s document=%s error=%s: %s",
+                    log.error("Wiki構成にページ一覧がありません: ファイル=%s、項目=%s、文書=%s、エラー=%s: %s",
                               state_root / "state" / "plan.json", exc, rel, type(exc).__name__, exc, exc_info=True)
                     raise
                 human += drop_pages(state_root, plan_pages, set(failed), research=set())
@@ -730,7 +727,7 @@ def write_wiki_pages(
                         source_kind=kind, resume=True, require_resume=True, human_guidance=guidance,
                     ).out_dir
                 except ResumeUnavailable as exc:
-                    log.error("wiki resume unavailable document=%s error=%s: %s; a full rebuild redoes every page",
+                    log.error("Wikiの生成を再開できないため、全ページを作り直します: 文書=%s、エラー=%s: %s",
                               rel, type(exc).__name__, exc, exc_info=True)
                     decision = UpdateDecision(tier=3, reason="resume-failed")
             else:
@@ -746,7 +743,7 @@ def write_wiki_pages(
                 shutil.rmtree(state_root, ignore_errors=True)
                 if state_root.exists():
                     # shortcut: ignore_errors=True swallows the errno, so a leftover tree is the only evidence.
-                    log.error("wiki state delete failed path=%s document=%s; the full rebuild starts on top of leftover state", state_root, rel)
+                    log.error("Wikiの状態情報を削除できません。残った情報がある状態で全体を再生成します: パス=%s、文書=%s", state_root, rel)
             out_dir = build_wiki_output(
                 source_path=project.raw_file(rel), document_name=rel, out_dir=work / "out",
                 mode=mode, settings=settings, llm=llm, embedder=embedder,
@@ -808,7 +805,7 @@ def write_wiki_pages(
         shutil.rmtree(work, ignore_errors=True)
         if work.exists():
             # shortcut: ignore_errors=True swallows the errno, so a leftover tree is the only evidence.
-            log.error("build work directory cleanup failed path=%s document=%s; leftover build output stays on disk", work, rel)
+            log.error("生成用の作業フォルダーを削除できません。生成物がディスクに残っています: パス=%s、文書=%s", work, rel)
 def write_wiki(
     project: Any, rel: str, *, mode: str, settings: Any, llm: Any, embedder: Any,
     on_progress: Progress = None, stop_check: StopCheck = None,
@@ -865,7 +862,7 @@ def run_linker(
             embedder = Embedder(settings)
         except Exception as exc:
             embedder = None
-            log.error("embedder unavailable, vector candidate search is off document=%s model=%s backend=%s endpoint=%s settings=WIKI_EMBED_BACKEND,embed_model,embed_api_key error=%s: %s",
+            log.error("検索用ベクトルを作成できないため、ベクトルによる候補検索を停止します: 文書=%s、モデル=%s、実行方式=%s、接続先=%s、設定=WIKI_EMBED_BACKEND,embed_model,embed_api_key、エラー=%s: %s",
                       rel, getattr(settings, "embed_model", ""), getattr(settings, "embed_backend", ""),
                       getattr(settings, "embed_base_url", ""), type(exc).__name__, exc, exc_info=True)
             if on_progress:
@@ -928,7 +925,7 @@ def write_source_stamp(target: Path, raw_file: Path, rel: str, *, identity_seed:
         tmp.write_text(json.dumps({"raw": rel, "sha256": _sha256_file(raw_file), "id_seed": identity_seed or rel}), encoding="utf-8")
         tmp.replace(planning / "source.json")
     except OSError as exc:
-        log.error("source stamp write failed path=%s document=%s error=%s: %s (the file may be locked, or the mount cannot rename-over; without the stamp the document is rebuilt on every run)",
+        log.error("元文書の更新情報を保存できません。毎回再生成されます: パス=%s、文書=%s、エラー=%s: %s（ファイルの使用状況・入力元での置換可否を確認してください）",
                   planning / "source.json", rel, type(exc).__name__, exc, exc_info=True)
         raise
 
@@ -946,19 +943,19 @@ def wiki_up_to_date(project: Any, rel: str) -> bool:
             except FileNotFoundError:
                 continue
             except OSError as exc:
-                log.error("up-to-date stamp is unreadable file=%s document=%s error=%s: %s; the document is rebuilt",
+                log.error("更新確認ファイルを読めないため、文書を再生成します: ファイル=%s、文書=%s、エラー=%s: %s",
                           path, rel, type(exc).__name__, exc, exc_info=True)
                 continue
-            log.debug("up-to-date stamp reported missing but stat succeeded file=%s document=%s", path, rel)
+            log.debug("更新確認ファイルが未検出ですが、ファイル情報の取得には成功しました: ファイル=%s、文書=%s", path, rel)
             continue
         try:
             stamp = json.loads(path.read_text(encoding="utf-8"))
         except OSError as exc:
-            log.error("up-to-date stamp is unreadable file=%s document=%s error=%s: %s; the document is rebuilt",
+            log.error("更新確認ファイルを読めないため、文書を再生成します: ファイル=%s、文書=%s、エラー=%s: %s",
                       path, rel, type(exc).__name__, exc, exc_info=True)
             return False
         except ValueError as exc:
-            log.error("up-to-date stamp is corrupt, not missing file=%s document=%s error=%s: %s; the document is rebuilt",
+            log.error("更新確認ファイルが破損しているため、文書を再生成します: ファイル=%s、文書=%s、エラー=%s: %s",
                       path, rel, type(exc).__name__, exc, exc_info=True)
             return False
         if stamp.get(key) != current:
@@ -972,14 +969,14 @@ def links_up_to_date(project: Any, rel: str, *, mode: str | None = None) -> bool
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        log.debug("linker marker is absent file=%s document=%s", marker, rel)
+        log.debug("リンク処理の記録がありません: ファイル=%s、文書=%s", marker, rel)
         return False
     except OSError as exc:
-        log.error("linker marker is unreadable file=%s document=%s error=%s: %s; the links are re-run",
+        log.error("リンク処理の記録を読めないため、やり直します: ファイル=%s、文書=%s、エラー=%s: %s",
                   marker, rel, type(exc).__name__, exc, exc_info=True)
         return False
     except ValueError as exc:
-        log.error("linker marker is corrupt, not missing file=%s document=%s error=%s: %s; the links are re-run",
+        log.error("リンク処理の記録が破損しているため、やり直します: ファイル=%s、文書=%s、エラー=%s: %s",
                   marker, rel, type(exc).__name__, exc, exc_info=True)
         return False
     if data.get("status") not in ("complete", "disabled"):
@@ -1006,6 +1003,6 @@ def write_index(project: Any) -> None:
             "\n".join(lines).rstrip() + "\n", encoding="utf-8"
         )
     except OSError as exc:
-        log.error("wiki index write failed path=%s error=%s: %s (the published wiki index page is missing or stale)",
+        log.error("Wikiの目次を書き込めません。公開用の目次がないか古いままです: パス=%s、エラー=%s: %s",
                   project.wiki / "index.md", type(exc).__name__, exc, exc_info=True)
         raise

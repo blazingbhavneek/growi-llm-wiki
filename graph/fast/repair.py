@@ -187,7 +187,7 @@ def _emit(callback: Any, step: str, **details: Any) -> None:
             # Progress reporting is advisory.  A broken logger/UI callback
             # must not turn a page-local repair into a pipeline failure.
             log.exception(
-                "fast repair progress callback failed step=%s error=%s: %s",
+                "修復の進捗通知に失敗しました: 工程=%s、エラー=%s: %s",
                 step,
                 type(exc).__name__,
                 exc,
@@ -665,7 +665,7 @@ async def _judge(
             last_error = f"{type(exc).__name__}: {exc}"[:1000]
             last_exc = exc
             log.debug(
-                "fast repair judge attempt failed document=%s page=%s stage=%s attempt=%d/%d error=%s",
+                "修復ページの判定に失敗しました: 文書=%s、ページ=%s、工程=%s、試行=%d/%d、エラー=%s",
                 page.document,
                 page.filename,
                 stem,
@@ -675,7 +675,7 @@ async def _judge(
             )
             artifacts.append(_Artifact(f"{stem}-call-{call:02d}-error.txt", last_error + "\n"))
     log.error(
-        "fast repair judge call failed; the page has no verdict document=%s page=%s stage=%s attempts=%d error=%s",
+        "修復ページの判定を取得できません: 文書=%s、ページ=%s、工程=%s、試行回数=%d、エラー=%s",
         page.document,
         page.filename,
         stem,
@@ -720,7 +720,7 @@ async def _writer(
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"[:1000]
         log.error(
-            "fast repair writer call failed document=%s page=%s attempt=%d error=%s",
+            "修復用の本文生成モデルを呼び出せません: 文書=%s、ページ=%s、試行=%d、エラー=%s",
             page.document,
             page.filename,
             attempt,
@@ -738,7 +738,7 @@ async def _writer(
         # of aborting every other page in the document.
         error = f"{type(exc).__name__}: {exc}"[:1000]
         log.error(
-            "fast repair writer answer is unusable document=%s page=%s attempt=%d error=%s",
+            "修復用の本文生成モデルの回答を使えません: 文書=%s、ページ=%s、試行=%d、エラー=%s",
             page.document,
             page.filename,
             attempt,
@@ -793,7 +793,7 @@ def _review_session(session: _RepairSession, *, on_progress: Any) -> _PageOutcom
         or [f"{MAX_REWRITE_ATTEMPTS}回の修復で承認されなかった。"]
     )
     log.error(
-        "fast repair rewrite budget exhausted; the page needs human review document=%s page=%s attempts=%d selected_attempt=%d score=%d",
+        "修復回数の上限に達しました。人による確認が必要です: 文書=%s、ページ=%s、試行回数=%d、採用した試行=%d、評価点=%d",
         session.page.document,
         session.page.filename,
         session.attempts,
@@ -1254,7 +1254,7 @@ def _update_review(state_root: Path, version: str) -> bool:
         previous = path.read_text(encoding="utf-8") if path.exists() else ""
     except (OSError, UnicodeDecodeError) as exc:
         log.error(
-            "review list could not be read after all model work; the pages that need human review are not recorded path=%s error=%s: %s",
+            "モデル処理後に確認一覧を読めません。人による確認が必要なページを記録できませんでした: パス=%s、エラー=%s: %s",
             path,
             type(exc).__name__,
             exc,
@@ -1361,7 +1361,7 @@ class FastRepair:
                     # Keep malformed documents eligible; repair_document will
                     # report the actual state error when this target is reached.
                     log.error(
-                        "fast repair page count is unavailable; the document is queued in the fallback order document=%s error=%s: %s",
+                        "修復対象のページ数を取得できないため、既定の順序で処理します: 文書=%s、エラー=%s: %s",
                         raw_rel,
                         type(exc).__name__,
                         exc,
@@ -1412,7 +1412,7 @@ class FastRepair:
         raw_path = Path(self.project.raw_file(raw_rel))
         if not snapshot.is_file() or not raw_path.is_file():
             log.error(
-                "fast repair cannot start; the source snapshot or source file is missing document=%s path=%s file=%s",
+                "元文書の保存データまたはファイルがないため、修復を開始できません: 文書=%s、保存データ=%s、元ファイル=%s",
                 raw_rel,
                 snapshot,
                 raw_path,
@@ -1422,7 +1422,7 @@ class FastRepair:
         current_raw = raw_path.read_text(encoding="utf-8")
         if not source_text.strip():
             log.error(
-                "fast repair cannot start; the source snapshot is empty; check conversion/extraction first document=%s path=%s",
+                "元文書の保存データが空のため、修復を開始できません。変換・抽出結果を確認してください: 文書=%s、パス=%s",
                 raw_rel,
                 snapshot,
             )
@@ -1432,7 +1432,7 @@ class FastRepair:
         source_hash = sha256_text(source_text)
         if sha256_text(current_raw) != source_hash:
             log.error(
-                "fast repair cannot start; the source changed since the wiki was generated; run a normal sync first document=%s file=%s",
+                "Wiki生成後に元文書が変更されたため、修復を開始できません。先に通常の同期を実行してください: 文書=%s、ファイル=%s",
                 raw_rel,
                 raw_path,
             )
@@ -1445,7 +1445,7 @@ class FastRepair:
         ):
             if value and value != source_hash:
                 log.error(
-                    "fast repair cannot start; a state file source hash is stale; run a normal sync first document=%s file=%s",
+                    "状態ファイルの元文書ハッシュが古いため、修復を開始できません。先に通常の同期を実行してください: 文書=%s、ファイル=%s",
                     raw_rel,
                     state_root / "state" / f"{label}.json",
                 )
@@ -1472,7 +1472,7 @@ class FastRepair:
             resume_checkpoint = state_rel in self.resume_page_states
             if not state or not page_path.is_file():
                 log.error(
-                    "fast repair cannot start; the planned page has no state or no published page file document=%s page=%s path=%s",
+                    "構成にあるページの状態情報または公開用ファイルがないため、修復を開始できません: 文書=%s、ページ=%s、パス=%s",
                     raw_rel,
                     filename,
                     page_path,
@@ -1480,14 +1480,14 @@ class FastRepair:
                 raise RuntimeError(f"{raw_rel}: incomplete generated page state for {filename}")
             if state.get("human_edited"):
                 log.error(
-                    "fast repair cannot start; the page still carries legacy human state; a normal sync is required document=%s page=%s",
+                    "古い形式の編集情報が残っているため、修復を開始できません。通常の同期が必要です: 文書=%s、ページ=%s",
                     raw_rel,
                     filename,
                 )
                 raise RuntimeError(f"{raw_rel}: {filename} contains legacy human state; normal sync is required")
             if state.get("filename") not in (None, filename):
                 log.error(
-                    "fast repair cannot start; the page state names a different filename document=%s page=%s state_filename=%s",
+                    "状態情報のファイル名が一致しないため、修復を開始できません: 文書=%s、ページ=%s、記録されたファイル名=%s",
                     raw_rel,
                     filename,
                     state.get("filename"),
@@ -1498,7 +1498,7 @@ class FastRepair:
             ).get("sha256")
             if provenance_hash and provenance_hash != source_hash:
                 log.error(
-                    "fast repair cannot start; the page provenance is stale for the current source; run a normal sync first document=%s page=%s",
+                    "ページの生成元情報が古いため、修復を開始できません。先に通常の同期を実行してください: 文書=%s、ページ=%s",
                     raw_rel,
                     filename,
                 )
@@ -1507,7 +1507,7 @@ class FastRepair:
             content_hash = sha256_text(text)
             if state.get("content_sha256") and state.get("content_sha256") != content_hash:
                 log.error(
-                    "fast repair cannot start; the published page no longer matches its recorded hash document=%s page=%s path=%s",
+                    "公開用ページのハッシュが記録と一致しないため、修復を開始できません: 文書=%s、ページ=%s、パス=%s",
                     raw_rel,
                     filename,
                     page_path,
@@ -1518,7 +1518,7 @@ class FastRepair:
                 state_title = str(state.get("title") or shell.title)
                 if state_title != shell.title:
                     log.error(
-                        "fast repair cannot start; the repaired page title no longer matches its state document=%s page=%s",
+                        "修復済みページの題名が状態情報と一致しないため、修復を開始できません: 文書=%s、ページ=%s",
                         raw_rel,
                         filename,
                     )
@@ -1540,7 +1540,7 @@ class FastRepair:
             planned_owner = _valid_ranges(item.get("owner_ranges"), len(source_lines))
             if owner != planned_owner:
                 log.error(
-                    "fast repair cannot start; the page source ranges no longer match the plan document=%s page=%s",
+                    "ページの参照範囲が構成と一致しないため、修復を開始できません: 文書=%s、ページ=%s",
                     raw_rel,
                     filename,
                 )
@@ -1825,7 +1825,7 @@ class FastRepair:
                         error=error,
                     )
                     log.exception(
-                        "fast repair page commit failed document=%s page=%s error=%s: %s",
+                        "修復ページを確定できません: 文書=%s、ページ=%s、エラー=%s: %s",
                         raw_rel,
                         outcome.page.filename,
                         type(exc).__name__,
@@ -1863,7 +1863,7 @@ class FastRepair:
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"[:1000]
                     log.exception(
-                        "fast repair pending checkpoint failed document=%s page=%s error=%s: %s",
+                        "修復の再開情報を保存できません: 文書=%s、ページ=%s、エラー=%s: %s",
                         raw_rel,
                         session.page.filename,
                         type(exc).__name__,
@@ -1889,7 +1889,7 @@ class FastRepair:
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"[:1000]
                     log.exception(
-                        "fast repair initial judge failed document=%s page=%s error=%s: %s",
+                        "修復前のページを判定できません: 文書=%s、ページ=%s、エラー=%s: %s",
                         raw_rel,
                         page.filename,
                         type(exc).__name__,
@@ -1910,7 +1910,7 @@ class FastRepair:
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"[:1000]
                     log.exception(
-                        "fast repair writer phase failed document=%s page=%s error=%s: %s",
+                        "修復用の本文生成処理に失敗しました: 文書=%s、ページ=%s、エラー=%s: %s",
                         raw_rel,
                         session.page.filename,
                         type(exc).__name__,
@@ -1931,7 +1931,7 @@ class FastRepair:
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"[:1000]
                     log.exception(
-                        "fast repair candidate judge failed document=%s page=%s error=%s: %s",
+                        "修復候補を判定できません: 文書=%s、ページ=%s、エラー=%s: %s",
                         raw_rel,
                         session.page.filename,
                         type(exc).__name__,
@@ -1950,7 +1950,7 @@ class FastRepair:
                 except ValueError:
                     state_rel = ""
                     log.error(
-                        "fast repair page state is outside the project; resume is disabled for this page and its completed model work is repeated document=%s page=%s path=%s",
+                        "ページの状態ファイルがプロジェクト外にあるため、このページの再開を無効にします。完了済みのモデル処理もやり直します: 文書=%s、ページ=%s、パス=%s",
                         raw_rel,
                         page.filename,
                         page.state_path,
@@ -2077,7 +2077,7 @@ class FastRepair:
         if pages:
             run_async_blocking(run())
         for failure in page_failures:
-            log.error("fast repair page failed document=%s failure=%s", raw_rel, failure)
+            log.error("ページの修復に失敗しました: 文書=%s、理由=%s", raw_rel, failure)
         changed_pages.update(self._apply_title_changes(state_root, plan, manifest, title_changes))
         write_json_atomic(state_root / "state" / "plan.json", plan)
         write_json_atomic(state_root / "state" / "manifest.json", manifest)

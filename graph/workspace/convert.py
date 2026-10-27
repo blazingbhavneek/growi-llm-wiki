@@ -23,7 +23,7 @@ def convert_mount(project: Project, *, parser_base_url: str, settings: Any, on_p
         try:
             seen = json.loads(log_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            log.error("convert state is corrupt, the run stops before converting anything path=%s error=%s: %s", log_path, type(exc).__name__, exc, exc_info=True)
+            log.error("変換状態が破損しているため、変換を始める前に中断します: パス=%s、エラー=%s: %s", log_path, type(exc).__name__, exc, exc_info=True)
             raise
     present: set[str] = set(); converted: list[str] = []; removed: list[str] = []; unsupported: list[str] = []; failed: list[str] = []
     failures: list[str] = []
@@ -38,13 +38,13 @@ def convert_mount(project: Project, *, parser_base_url: str, settings: Any, on_p
         needs_parser = sum(1 for path in paths if path.suffix.lower() not in VERBATIM)
         if needs_parser:
             # shortcut: counts every supported non-Markdown file, not only the changed ones.
-            log.error("WIKI_PARSER_BASE_URL is not set, non-Markdown documents will not convert files=%d setting=WIKI_PARSER_BASE_URL mount=%s", needs_parser, project.mount)
+            log.error("WIKI_PARSER_BASE_URL が未設定のため、Markdown以外の文書を変換できません: ファイル数=%d、入力フォルダー=%s", needs_parser, project.mount)
     for path in paths:
         rel = path.relative_to(project.mount).as_posix(); present.add(rel)
         try:
             stat = path.stat()
         except OSError as exc:
-            log.error("stat failed, the convert run aborted file=%s path=%s error=%s: %s", rel, path, type(exc).__name__, exc, exc_info=True)
+            log.error("ファイル情報を取得できないため、変換を中断しました: ファイル=%s、パス=%s、エラー=%s: %s", rel, path, type(exc).__name__, exc, exc_info=True)
             raise
         key = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
         if seen.get(rel, {}).get("mtime_ns") == key["mtime_ns"] and seen.get(rel, {}).get("size") == key["size"]:
@@ -62,7 +62,7 @@ def convert_mount(project: Project, *, parser_base_url: str, settings: Any, on_p
                         previous = target.read_text(encoding="utf-8")
                     except (OSError, UnicodeDecodeError) as exc:
                         # The previous raw output, not the mount source, is what cannot be read here.
-                        log.error("previous raw output is unreadable path=%s encoding=utf-8 error=%s: %s", target, type(exc).__name__, exc, exc_info=True)
+                        log.error("以前の変換テキストをUTF-8で読み込めません: パス=%s、エラー=%s: %s", target, type(exc).__name__, exc, exc_info=True)
                         raise
                 markdown = parse_document(
                     path,
@@ -74,22 +74,22 @@ def convert_mount(project: Project, *, parser_base_url: str, settings: Any, on_p
             # TEMPORARY: report the skip, but do not persist an exclusion in convert.json.
             unsupported.append(rel)
             failures.append(f"{rel}: {type(exc).__name__}: {exc}")
-            log.warning("ドキュメントをスキップ: %s: %s", rel, exc, exc_info=True)
+            log.warning("文書の処理を省略します: %s: %s", rel, exc, exc_info=True)
             continue
         except UnsupportedDocument as exc:
-            log.error("parser rejected the document, it will never publish file=%s error=%s: %s", rel, type(exc).__name__, exc, exc_info=True)
+            log.error("解析サービスが文書を拒否したため、公開できません: ファイル=%s、エラー=%s: %s", rel, type(exc).__name__, exc, exc_info=True)
             seen[rel] = {**key, "unsupported": str(exc)}; unsupported.append(rel); continue
         except Exception as exc:
             failures.append(f"{rel}: {type(exc).__name__}: {exc}")
             failed.append(rel)
             # A missing WIKI_PARSER_BASE_URL is reported once, above, with the affected file count.
             if parser_base_url or path.suffix.lower() in VERBATIM:
-                log.error("convert failed file=%s error=%s: %s", rel, type(exc).__name__, exc, exc_info=True)
+                log.error("変換に失敗しました: ファイル=%s、エラー=%s: %s", rel, type(exc).__name__, exc, exc_info=True)
             continue
         try:
             target.parent.mkdir(parents=True, exist_ok=True); target.write_text(markdown, encoding="utf-8")
         except OSError as exc:
-            log.error("raw output write failed, the run aborts and convert.json is never saved so every file re-parses next run file=%s path=%s error=%s: %s", rel, target, type(exc).__name__, exc, exc_info=True)
+            log.error("変換テキストを書き込めないため中断します。convert.json は保存されず、次回は全ファイルを再解析します: ファイル=%s、パス=%s、エラー=%s: %s", rel, target, type(exc).__name__, exc, exc_info=True)
             raise
         seen[rel] = key; converted.append(rel)
         if on_progress:
@@ -104,7 +104,7 @@ def convert_mount(project: Project, *, parser_base_url: str, settings: Any, on_p
         project.metadata.mkdir(parents=True, exist_ok=True)
         log_path.write_text(json.dumps(seen, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
-        log.error("convert state write failed, every file re-parses next run path=%s error=%s: %s", log_path, type(exc).__name__, exc, exc_info=True)
+        log.error("変換状態を保存できません。次回はすべてのファイルを再解析します: パス=%s、エラー=%s: %s", log_path, type(exc).__name__, exc, exc_info=True)
         raise
     return {"converted": converted, "removed": removed, "unsupported": unsupported, "failed": failed, "failures": failures}
 

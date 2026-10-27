@@ -127,7 +127,7 @@ def render_limits(mode: str, big_document: bool = False, settings: Any = None) -
         try:
             limits.append(int(value))
         except (TypeError, ValueError) as exc:
-            log.error("link limit is not a number setting=%s value=%r mode=%s error=%s: %s (the page cannot be rendered)",
+            log.error("リンク数の上限が数値ではないため、ページを整形できません: 設定=%s、値=%r、方式=%s、エラー=%s: %s",
                       setting, value, mode, type(exc).__name__, exc, exc_info=True)
             raise
     return limits[0], limits[1]
@@ -192,7 +192,7 @@ def render_page(
             failed_inline.append((edge, summary))
     footer: list[tuple[RenderEdge, str]] = failed_inline
     if failed_inline:
-        log.info("inline anchors moved to the footer page=%s count=%d inline_budget=%d", page_rel, len(failed_inline), inline_budget)
+        log.info("本文内のリンクをページ末尾に移しました: ページ=%s、件数=%d、本文内の上限=%d", page_rel, len(failed_inline), inline_budget)
     footer.extend((edge, summary) for edge, placement, _anchor, summary in selected if placement != "inline")
     seen_paths: set[str] = set(inline_paths) | entity_paths
     unique_footer: list[tuple[RenderEdge, str]] = []
@@ -224,7 +224,7 @@ def parse_footer(text: str) -> list[FooterLink]:
     end = text.find(FOOTER_END, start + len(FOOTER_START)) if start >= 0 else -1
     if start < 0 or end < 0:
         if start >= 0:
-            log.warning("managed links footer has no end marker, every existing reference is read as none text=%s",
+            log.warning("関連リンクの終了マーカーがありません。既存の参照先は空として扱われます: テキスト=%s",
                         text[start:start + 120].replace("\n", " "))
         return []
     result: list[FooterLink] = []
@@ -240,7 +240,7 @@ def parse_footer(text: str) -> list[FooterLink]:
         elif line.strip().startswith("- ["):
             unreadable += 1
     if unreadable:
-        log.warning("managed links footer lines are unreadable, their references are lost on the next render count=%d", unreadable)
+        log.warning("管理対象の関連リンクを読み取れません。次回の整形で参照先が失われます: 行数=%d", unreadable)
     return result
 
 
@@ -249,7 +249,7 @@ def write_if_changed(path: Path, text: str) -> bool:
     if path.exists() and path.read_bytes() == text.encode("utf-8"):
         return False
     write_text_atomic(path, text)
-    log.info("wrote page path=%s", path)
+    log.info("ページを書き込みました: パス=%s", path)
     return True
 
 
