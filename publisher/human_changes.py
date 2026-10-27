@@ -489,6 +489,8 @@ class LlmHumanModel:
             if origin in outgoing and target != origin:
                 outgoing[origin].append({**obligation, "destination": target})
 
+        stop = threading.Event()  # one failed page fails the document: the other pages stop calling the model
+
         def review(page: str) -> str:
             origins = sorted(source for source in set(old) | set(human) if remap.get(source, source) == page)
             before = "\n".join(old.get(source, "") for source in origins)
@@ -500,19 +502,22 @@ class LlmHumanModel:
                     return self._finalize_page(
                         page, {page: before}, {page: current}, {page: new.get(page, "")}, {page: result[page]},
                         assigned[page], context={"DOCUMENT_METADATA": metadata or {}, "PAGE_INDEX": sorted(result),
-                                                 "OUTGOING": outgoing[page]},
+                                                 "OUTGOING": outgoing[page]}, stop=stop,
                     )[page]
                 finally:
                     self._local.runner = self._local.port = None
 
+        # A page with no human edit, no relocated edit and exactly the generator's text has nothing to verify.
+        pages = [page for page in sorted(result) if assigned[page] or outgoing[page] or result[page] != new.get(page)]
         candidate = dict(result)
-        log.info("human_sync event=final_pages_start pages=%d", len(result))
+        log.info("human_sync event=final_pages_start pages=%d skipped=%d", len(pages), len(result) - len(pages))
         with ThreadPoolExecutor(max_workers=max(1, getattr(self, "concurrency", 1))) as pool:
-            futures = {pool.submit(review, page): page for page in sorted(result)}
+            futures = {pool.submit(review, page): page for page in pages}
             try:
                 for future in as_completed(futures):
                     candidate[futures[future]] = future.result()
             except BaseException:
+                stop.set()
                 for future in futures:
                     future.cancel()
                 raise
@@ -520,7 +525,7 @@ class LlmHumanModel:
 
     def _finalize_page(self, page: str, old: dict[str, str], human: dict[str, str], new: dict[str, str],
                        result: dict[str, str], obligations: list[dict[str, Any]], *,
-                       context: dict[str, Any]) -> dict[str, str]:
+                       context: dict[str, Any], stop: threading.Event | None = None) -> dict[str, str]:
         """A page candidate always goes through mechanical checks and the judge before acceptance."""
         candidate, history, repair_errors = dict(result), [], []
         audit_old, audit_human = dict(old), dict(human)
@@ -533,37 +538,45 @@ class LlmHumanModel:
             ensure_ascii=False, sort_keys=True,
         ))[:20]
         root = Path(self.project.metadata) / "state" / "human-merge" / "final" / sha256_text(page)[:12] / identity
+
+        def stopped() -> None:
+            if stop is not None and stop.is_set():
+                raise RuntimeError(f"final merge of {page} stopped: another page of the document failed")
+
         for attempt in range(self.final_rewrite_attempts + 1):
-            errors, suspicions = _final_checks(audit_old, audit_human, new, candidate)
-            errors.extend(f"Missing required navigation: {link}"
-                          for link in context.get("DOCUMENT_METADATA", {}).get("navigation", {}).get(page, [])
-                          if link not in _table_text(candidate[page]))
-            links = {unquote(match.group().split("](", 1)[1][:-1].split("#", 1)[0]).removeprefix("./")
-                     for match in _LINK.finditer(_table_text(re.sub(r"<!--.*?-->", "", candidate[page], flags=re.S)))}
-            errors.extend(f"Relocated edit {item['id']}: add an explanation and link to {item['destination']}"
-                          " beside the affected site, stating which version governs"
-                          for item in context.get("OUTGOING", []) if item["destination"] not in links)
-            data = {"PAGE": page, "OLD": old, "HUMAN": human, "NEW": new, "RESULT": candidate,
-                    "OBLIGATIONS": obligations, "MECHANICAL_ERRORS": errors,
-                    "FINDINGS": suspicions, **context}
-            write_json_atomic(root / f"checks-{attempt + 1:02d}.json",
-                              {"errors": errors, "findings": suspicions})
-            verdict = self._ask(
-                _FinalVerdict, _FINAL_JUDGE, data, role="judge", attempts=2,
-                artifact=root / f"judge-{attempt + 1:02d}",
-                validate=lambda value: _final_findings(value, obligations, candidate, verdict_only=True),
-            )
-            findings = list(dict.fromkeys(errors + repair_errors + _final_findings(verdict, obligations, candidate)))
-            if not findings:
-                log.info("human_sync event=final_merge_approved page=%s attempt=%d obligations=%d",
-                         page, attempt + 1, len(obligations))
-                return candidate
-            log.info("human_sync event=final_merge_rejected page=%s attempt=%d findings=%d",
-                     page, attempt + 1, len(findings))
+            stopped()
+            if repair_errors:
+                # The rejected repair left the candidate as judged; another verdict could not approve it.
+                findings = repair_errors
+            else:
+                errors, suspicions = _final_checks(audit_old, audit_human, new, candidate)
+                links = {unquote(match.group().split("](", 1)[1][:-1].split("#", 1)[0]).removeprefix("./")
+                         for match in _LINK.finditer(_table_text(re.sub(r"<!--.*?-->", "", candidate[page], flags=re.S)))}
+                errors.extend(f"Relocated edit {item['id']}: add an explanation and link to {item['destination']}"
+                              " beside the affected site, stating which version governs"
+                              for item in context.get("OUTGOING", []) if item["destination"] not in links)
+                data = {"PAGE": page, "OLD": old, "HUMAN": human, "NEW": new, "RESULT": candidate,
+                        "OBLIGATIONS": obligations, "MECHANICAL_ERRORS": errors,
+                        "FINDINGS": suspicions, **context}
+                write_json_atomic(root / f"checks-{attempt + 1:02d}.json",
+                                  {"errors": errors, "findings": suspicions})
+                verdict = self._ask(
+                    _FinalVerdict, _FINAL_JUDGE, data, role="judge", attempts=2,
+                    artifact=root / f"judge-{attempt + 1:02d}",
+                    validate=lambda value: _final_findings(value, obligations, candidate, verdict_only=True),
+                )
+                findings = list(dict.fromkeys(errors + _final_findings(verdict, obligations, candidate)))
+                if not findings:
+                    log.info("human_sync event=final_merge_approved page=%s attempt=%d obligations=%d",
+                             page, attempt + 1, len(obligations))
+                    return candidate
+                log.info("human_sync event=final_merge_rejected page=%s attempt=%d findings=%d",
+                         page, attempt + 1, len(findings))
             if attempt >= self.final_rewrite_attempts:
                 raise ValueError(f"final merge verification failed for {page}: " + "; ".join(findings)[:1000])
             earlier = [item for item in history if item not in findings]
             history.extend(item for item in findings if item not in history)
+            stopped()
             try:
                 rewrite = self._ask(
                     _FinalRewrite, _FINAL_REWRITE,
@@ -576,7 +589,7 @@ class LlmHumanModel:
                     raise ValueError("repair produced no applicable change")
             except Exception as exc:
                 error = f"final repair rejected: {type(exc).__name__}: {exc}"[:1000]
-                repair_errors = findings + [error]
+                repair_errors = list(dict.fromkeys(findings + [error]))
                 continue
             candidate = repaired
             repair_errors = []
@@ -653,8 +666,9 @@ def _final_findings(verdict: dict[str, Any], obligations: list[dict[str, Any]],
             if obligation["kind"] != "delete" or not reason:
                 findings.append(f"{identity} has an unevidenced deletion verdict")
             continue
-        page, evidence = str(row.get("page") or ""), str(row.get("evidence") or "")
-        if not page or page not in candidate or not evidence or evidence not in candidate[page]:
+        # Compared as plain text: full/half width, spacing and markup are not missing evidence.
+        page, evidence = str(row.get("page") or ""), _plain(str(row.get("evidence") or ""))
+        if not page or page not in candidate or not evidence or evidence not in _plain(candidate[page]):
             findings.append(f"{identity} has no exact evidence in its claimed RESULT page")
     if verdict.get("approved") is not True and not verdict_only:
         findings.append(str(verdict.get("notes") or "final judge did not approve the merge").strip())
@@ -867,10 +881,12 @@ def _attempt(model: Any, old_w: str, cur_w: str, new_w: str, guidance: list[str]
         result += "\n"
     result = _current_notes(result, new_w + "\n" + cur_w, existing=cur_w, render=True)
     errors, findings = _merge_checks(old_w, cur_w, new_w, result, fragment=not bool(_TABLE.search(new_w)))
+    if errors:  # already rejected; a verify call could not change that
+        raise ValueError(f"mechanical errors: {errors}; suspected differences: {findings}")
     stats["model_calls"] += 1
-    verdict = model.verify(old_w, cur_w, new_w, result, appendix, findings=errors + findings)
-    if errors or verdict.get("human_kept") is not True or verdict.get("source_kept") is not True:
-        raise ValueError(f"verification failed: {verdict}; mechanical errors: {errors}; suspected differences: {findings}")
+    verdict = model.verify(old_w, cur_w, new_w, result, appendix, findings=findings)
+    if verdict.get("human_kept") is not True or verdict.get("source_kept") is not True:
+        raise ValueError(f"verification failed: {verdict}; suspected differences: {findings}")
     return result, appendix
 
 
@@ -1074,6 +1090,11 @@ def classify(model: Any, pairs: list[tuple[str, str]]) -> list[str]:
         log.warning("human_sync event=classify_failed reason=%s: %s", type(exc).__name__, exc)
         return []
     return [str(i["instruction"]).strip() for i in items if i.get("kind") == "structure" and str(i.get("instruction") or "").strip()]
+
+
+def learn(model: Any, base: str, human: str) -> list[str]:
+    """classify() of one page's base -> human difference; pure, so pages can be learned in parallel."""
+    return classify(model, _pairs(base, human))
 
 
 # --------------------------------------------------------------------------
@@ -1633,61 +1654,6 @@ class HumanStore:
         doc["appendix"] = name
         return {**pages, name: text}
 
-    def _publication(self, raw_rel: str, doc: dict, pages: dict[str, str]) -> dict[str, Any]:
-        """Register the merge-created appendix without claiming it covers source lines."""
-        from graph.wiki.export import canonical_name
-        from graph.wiki.pipeline import SeedPage, _nav_footer
-
-        folder = self.project.wiki_dir(raw_rel) / "_planning"
-        metadata = {name: read_json(folder / name, default={})
-                    for name in ("coverage.json", "metadata.json")}
-        appendix = doc.get("appendix")
-        if appendix not in pages or not pages[appendix].strip():
-            return metadata
-        metadata["manifest.json"] = read_json(folder / "manifest.json", default={})
-        names = sorted(name for name, text in pages.items() if text.strip())
-        index = names.index(appendix)
-        seeds = [SeedPage(number=i, title=next((line[2:].strip() for line in pages[name].splitlines()
-                                              if line.startswith("# ")), Path(name).stem),
-                          chapter="", summary="", owner_ranges=[], filename=name, page_id="")
-                 for i, name in enumerate(names[max(0, index - 1):index + 1], 1)]
-        metadata["navigation"] = {}
-        for seed in seeds:
-            footer = _nav_footer(seed, seeds)
-            if not footer:
-                continue
-            link = footer.strip().split("\n")[-1]
-            text = pages[seed.filename]
-            matches = list(re.finditer(r"(?m)^(?:親|前のページ|次のページ): \[[^\n]*$", _table_text(text)))
-            if matches:
-                match = matches[-1]
-                if seed.filename == appendix:
-                    start = match.start() - (6 if text[:match.start()].endswith("\n---\n\n") else 0)
-                    pages[seed.filename] = (text[:start] + text[match.end():]).rstrip("\n") + "\n" + footer
-                else:
-                    parts = [part for part in text[match.start():match.end()].split(" ｜ ")
-                             if not part.startswith("次のページ:")]
-                    pages[seed.filename] = text[:match.start()] + " ｜ ".join(parts + [link]) + text[match.end():]
-            else:
-                pages[seed.filename] = text.rstrip("\n") + "\n" + footer
-            metadata["navigation"][seed.filename] = [link]
-        name, title = canonical_name(appendix), seeds[-1].title
-        for filename, field, record in (
-            ("coverage.json", "filename", {"filename": name, "title": title, "header": APPENDIX,
-                                           "summary": "ユーザー編集の保存先", "origin": "human"}),
-            ("metadata.json", "name", {"name": name, "header": APPENDIX, "origin": "human"}),
-            ("manifest.json", "filename", {"filename": appendix, "title": title, "source_ranges": [],
-                                           "reference_ranges": [], "origin": "human"}),
-        ):
-            data = metadata[filename]
-            data["files"] = [row for row in data.get("files", [])
-                             if row.get("origin") != "human" or canonical_name(row[field]) != name] + [record]
-            if filename == "coverage.json":
-                data["file_count"] = len(data["files"])
-            elif filename == "manifest.json":
-                data.setdefault("planning", {})["file_count"] = len(data["files"])
-        return metadata
-
     def _commit(self, raw_rel: str, doc: dict, current: dict[str, str], before: dict[str, str], *,
                 pure: dict[str, str] | None = None, sweep: bool = False) -> set[str]:
         """Write state and mirror it to the live pages; returns the wiki paths whose live page changed.
@@ -1699,8 +1665,6 @@ class HumanStore:
         directory, folder = self._dir(raw_rel), self.project.wiki_dir(raw_rel)
         prefix = folder.relative_to(self.project.wiki).as_posix()
         planning = folder / "_planning" / "pages"
-        current = dict(current)
-        metadata = self._publication(raw_rel, doc, current)
         self._initialize()
         doc["raw_rel"] = raw_rel
         changed: set[str] = set()
@@ -1739,9 +1703,6 @@ class HumanStore:
             put(directory / "current" / name, text)
         for name in set(before) - set(current):
             (directory / "current" / name).unlink(missing_ok=True)
-        for name, data in metadata.items():
-            if name != "navigation" and read_json(planning.parent / name, default={}) != data:
-                write_json_atomic(planning.parent / name, data)
         write_json_atomic(directory / "doc.json", doc)
         if changed:
             self._drop_inline_rows(changed)
@@ -1776,11 +1737,14 @@ class HumanStore:
         return unlinked(previous, links), unlinked(editable(canonical), links)
 
     def accept(self, raw_rel: str, local_path: str, marker_id: str, revision: str, base: str, human: str,
-               *, model: Any = None) -> set[str]:
-        """Accept one remote revision of one page (base -> human); returns the rewritten wiki paths."""
+               *, model: Any = None, learned: list[str] | None = None) -> set[str]:
+        """Accept one remote revision of one page (base -> human); returns the rewritten wiki paths.
+
+        ``learned`` is learn(model, base, human) when the caller already ran it (the pull learns all pages at once).
+        """
         self.check(raw_rel)
         page = Path(local_path).name
-        learned = classify(model, _pairs(base, human))
+        learned = learn(model, base, human) if learned is None else learned
         record = {"schema_version": VERSION, "page": page, "revision": revision, "base_blob": self.put(base),
                   "human_blob": self.put(human), "guidance": learned, "time": now()}
         return self._apply(raw_rel, page, base, human, record,
@@ -1861,8 +1825,10 @@ class HumanStore:
             audit_old.setdefault(doc["appendix"], "")
             audit_human[doc["appendix"]] = appendix
         try:
-            metadata = self._publication(raw_rel, doc, pages)
-            pages = _finalize_pages(model, audit_old, audit_human, new, pages, metadata=metadata)
+            pages = _finalize_pages(model, audit_old, audit_human, new, pages, metadata={
+                name: read_json(folder / "_planning" / name, default={})
+                for name in ("coverage.json", "metadata.json")
+            })
         except Exception:
             self._commit(raw_rel, previous_doc, before, pages, sweep=True)
             raise

@@ -39,6 +39,7 @@ tests/*
 !tests/test_mount_diff_pipeline.py
 !tests/test_update_tiers.py
 !tests/test_human_changes.py
+!tests/test_human_final_merge.py
 !tests/test_human_sync_rollout.py
 !tests/test_fast_repair.py
 !tests/test_failure_logs.py
@@ -58,9 +59,6 @@ data_big_backup2/
 data_big_backup3/
 data_backups/
 data_backup/
-docs/
-test_backup/
-cx/
 
 # Local secrets
 .env

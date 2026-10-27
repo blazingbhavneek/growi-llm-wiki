@@ -112,6 +112,12 @@ class Policy:
         del kwargs
         return False
 
+    async def judge_page_update(self, **kwargs: Any) -> list[str] | None:
+        """Judge one patched page: [] approves, a list is feedback, None means no verdict."""
+        from graph.wiki.pipeline import judge_page_update
+
+        return await judge_page_update(**kwargs)
+
     # -- linker (graph/linker) -------------------------------------------------------
 
     def neo_limits(self, caps: list[int], judge: bool) -> tuple[list[int], bool]:

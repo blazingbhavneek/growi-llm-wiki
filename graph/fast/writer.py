@@ -33,6 +33,7 @@ from .repair import (
     _image_errors,
     _judge,
     _judge_rank,
+    _split_page,
     _writer,
     _write_artifacts,
 )
@@ -189,6 +190,69 @@ def _clean_generation_images(
     return wiki._preserve_image_placeholders(body, session.page_units, lines)
 
 
+def _judge_body_only(verdict: RepairJudgeResult) -> None:
+    """The planned title is not the writer's to change: approve on the body alone."""
+
+    if (
+        verdict.coverage_score >= 80
+        and not verdict.body_defects
+        and not verdict.missing_important_information
+    ):
+        verdict.approved = True
+    verdict.title_defects = []
+
+
+async def judge_page_update(
+    *,
+    number: int,
+    filename: str,
+    before: str,
+    after: str,
+    owner_ranges: Sequence[tuple[int, int]],
+    owner_evidence: str,
+    reference_evidence: str,
+    model: Any,
+    output_dir: Path,
+    stem: str,
+    **_unused: Any,
+) -> list[str] | None:
+    """Judge a patched page with the repair judge; the page before the patch is the baseline."""
+
+    baseline, candidate = _split_page(before), _split_page(after)
+    page = _PageInput(
+        document="",
+        number=number,
+        filename=filename,
+        owner_ranges=list(owner_ranges),
+        reference_ranges=[],
+        original_text=before,
+        shell=baseline,
+        masked_body=baseline.body,
+        images=[],
+        owner_evidence=owner_evidence,
+        reference_evidence=reference_evidence or "（なし）",
+        allowed_source="",
+        context="",
+        page_path=output_dir,
+        state_path=output_dir,
+        state={},
+    )
+    artifacts: list[_Artifact] = []
+    verdict, _error = await _judge(
+        page,
+        candidate.title,
+        candidate.body,
+        model=judge_model(model),
+        stem=stem,
+        artifacts=artifacts,
+    )
+    _write_artifacts(output_dir, artifacts)
+    if verdict is None:
+        return None
+    _judge_body_only(verdict)
+    return [] if _approved(verdict) else _feedback(verdict)
+
+
 async def _generate_page(
     session: _GenerationSession,
     *,
@@ -225,9 +289,11 @@ async def _generate_page(
     best_verdict: RepairJudgeResult | None = None
     best_rank = (-1, -10**9, -1)
     errors: list[str] = []
-    max_attempts = min(
+    # Local model calls are cheap and the only alternative to an approved page is
+    # the verbatim source, so the setting can add attempts but never remove them.
+    max_attempts = max(
         MAX_REWRITE_ATTEMPTS,
-        max(1, int(getattr(config, "write_attempts", MAX_REWRITE_ATTEMPTS))),
+        int(getattr(config, "write_attempts", MAX_REWRITE_ATTEMPTS)),
     )
 
     wiki._emit(
@@ -238,57 +304,59 @@ async def _generate_page(
         current=0,
         total=0,
     )
+    unjudged = False
     for attempt in range(1, max_attempts + 1):
         if stop_check and stop_check():
             raise asyncio.CancelledError("page writing cancelled")
-        try:
-            candidate_title, candidate_body = await _writer(
-                prompt_page,
-                current_title,
-                current_body,
-                feedback,
-                model=writer_model(model),
-                attempt=attempt,
-                earlier_feedback=[
-                    item for item in feedback_history if item not in feedback
-                ],
-                artifacts=session.artifacts,
-            )
-            candidate_title = page.title
-        except Exception as exc:
-            error = f"writer unavailable: {type(exc).__name__}: {exc}"[:1000]
-            errors.append(error)
-            feedback = [error]
-            feedback_history.extend(
-                item for item in feedback if item not in feedback_history
-            )
-            continue
+        if not unjudged:
+            try:
+                candidate_title, candidate_body = await _writer(
+                    prompt_page,
+                    current_title,
+                    current_body,
+                    feedback,
+                    model=writer_model(model),
+                    attempt=attempt,
+                    earlier_feedback=[
+                        item for item in feedback_history if item not in feedback
+                    ],
+                    artifacts=session.artifacts,
+                )
+                candidate_title = page.title
+            except Exception as exc:
+                error = f"writer unavailable: {type(exc).__name__}: {exc}"[:1000]
+                errors.append(error)
+                feedback = [error]
+                feedback_history.extend(
+                    item for item in feedback if item not in feedback_history
+                )
+                continue
 
-        candidate_body = _clean_generation_images(
-            candidate_body, session, lines=lines
-        )
-        image_errors = _image_errors(
-            prompt_page, candidate_title, candidate_body
-        )
-        if image_errors:
-            errors.extend(image_errors)
-            feedback = image_errors
-            feedback_history.extend(
-                item for item in feedback if item not in feedback_history
+            candidate_body = _clean_generation_images(
+                candidate_body, session, lines=lines
             )
-            current_title, current_body = candidate_title, candidate_body
-            continue
+            image_errors = _image_errors(
+                prompt_page, candidate_title, candidate_body
+            )
+            if image_errors:
+                errors.extend(image_errors)
+                feedback = image_errors
+                feedback_history.extend(
+                    item for item in feedback if item not in feedback_history
+                )
+                current_title, current_body = candidate_title, candidate_body
+                continue
 
-        content_errors = check_section(
-            candidate_body,
-            lines=lines,
-            source_text=session.raw_source,
-            block_ranges=(),
-            placeholders=[],
-            facts=[],
-            check_identifiers=True,
-            tokens=policy.code_tokens,
-        ) + _value_errors(session.raw_source, candidate_body)
+            content_errors = check_section(
+                candidate_body,
+                lines=lines,
+                source_text=session.raw_source,
+                block_ranges=(),
+                placeholders=[],
+                facts=[],
+                check_identifiers=True,
+                tokens=policy.code_tokens,
+            ) + _value_errors(session.raw_source, candidate_body)
         verdict, judge_error = await _judge(
             prompt_page,
             candidate_title,
@@ -299,26 +367,17 @@ async def _generate_page(
             findings=content_errors,
         )
         current_title, current_body = candidate_title, candidate_body
-        if verdict is None:
-            error = "judge unavailable: " + (judge_error or "unknown error")
-            errors.append(error)
-            feedback = [error]
-            feedback_history.extend(
-                item for item in feedback if item not in feedback_history
-            )
+        unjudged = verdict is None
+        if unjudged:
+            # An unjudged candidate is not a rejected one: judge it again on the
+            # next attempt instead of rewriting it against feedback no writer can fix.
+            errors.append("judge unavailable: " + (judge_error or "unknown error"))
             continue
 
-        title_only = (
-            verdict.coverage_score >= 80
-            and not verdict.body_defects
-            and not verdict.missing_important_information
-        )
-        verdict.title_defects = []
-        if title_only:
-            verdict.approved = True
-
+        _judge_body_only(verdict)
         rank = _judge_rank(verdict, attempt=attempt)
-        if rank > best_rank:
+        # The approved draft ends the loop and is the page, whatever an earlier draft scored.
+        if rank > best_rank or _approved(verdict):
             best_title = candidate_title
             best_body = candidate_body
             best_verdict = verdict
@@ -339,6 +398,10 @@ async def _generate_page(
             item for item in feedback if item not in feedback_history
         )
 
+    if best_verdict is not None and policy.strict_judge and not _approved(best_verdict):
+        # Never publish a rejected draft: the source text is exact, the draft may not be.
+        errors.append("no candidate was approved: " + "; ".join(_feedback(best_verdict)))
+        best_verdict = None
     if best_verdict is None:
         wiki._emit(
             on_progress,

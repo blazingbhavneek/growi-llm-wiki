@@ -487,11 +487,6 @@ class SyncProgress:
             phase.completed += 1
             phase.current = max(phase.current, phase.completed)
             label = step.removeprefix("page_")
-            if step == "page_review" and int(event.get("selected_attempt") or 0) > 0:
-                label += (
-                    f" (ベストトライ {int(event['selected_attempt'])}, "
-                    f"スコア {int(event.get('selected_score') or 0)})"
-                )
             self._update_bar(phase, step=f"{label}: {page}")
             if phase.total is not None and phase.completed >= phase.total:
                 self._finish(key, event)

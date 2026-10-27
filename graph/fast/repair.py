@@ -30,7 +30,6 @@ from graph.wiki.storage import normalize_source, split_source_lines
 from .model import FAST_WRITER_MAX_OUTPUT_TOKENS
 from .passes import bounded_as_completed
 from .wiki import (
-    append_low_coverage_source,
     generation_prompt_rules,
     mask_math,
     recent_writer_context,
@@ -156,13 +155,8 @@ class _RepairSession:
     body: str = ""
     feedback: list[str] = field(default_factory=list)
     feedback_history: list[str] = field(default_factory=list)
-    best_title: str = ""
-    best_body: str = ""
-    best_final: str = ""
     best_verdict: RepairJudgeResult | None = None
     best_feedback: list[str] = field(default_factory=list)
-    best_attempt: int = 0
-    best_rank: tuple[int, int, int] = (-1, -10**9, -1)
     attempts: int = 0
     pending_title: str | None = None
     pending_body: str | None = None
@@ -173,9 +167,6 @@ def _new_repair_session(page: _PageInput) -> _RepairSession:
         page=page,
         title=page.shell.title,
         body=page.masked_body,
-        best_title=page.shell.title,
-        best_body=page.masked_body,
-        best_final=page.original_text,
     )
 
 
@@ -748,10 +739,11 @@ def _page_exception_outcome(
 
 
 def _review_session(session: _RepairSession, *, on_progress: Any) -> _PageOutcome:
-    """Return the best safe draft after the session exhausts its writer budget."""
+    """Keep the original page when no rewrite was approved; the review lists its findings."""
 
+    # A rejected rewrite is never published, however it scored: the original was
+    # at least judged as what the source pipeline produced.
     verdict = session.best_verdict or RepairJudgeResult()
-    selected_rewrite = session.best_attempt > 0
     final_feedback = (
         session.best_feedback
         or session.feedback
@@ -764,20 +756,16 @@ def _review_session(session: _RepairSession, *, on_progress: Any) -> _PageOutcom
         document=session.page.document,
         page=session.page.filename,
         attempts=session.attempts,
-        selected_attempt=session.best_attempt,
-        selected_score=verdict.coverage_score,
     )
     return _PageOutcome(
         session.page,
-        selected_rewrite,
+        False,
         "review",
-        session.best_title,
-        session.best_body,
-        session.best_final,
+        session.page.shell.title,
+        session.page.masked_body,
+        session.page.original_text,
         session.attempts,
         verdict.coverage_score,
-        selected_attempt=session.best_attempt,
-        selection="best-judged" if selected_rewrite else "original",
         defects=final_feedback,
         missing=list(verdict.missing_important_information),
         artifacts=session.artifacts,
@@ -834,11 +822,9 @@ async def _round_initial_judge(
 
     session.feedback = _feedback(verdict)
     session.feedback_history = list(session.feedback)
+    # What the review reports if no rewrite is approved and the original stays.
     session.best_feedback = list(session.feedback)
     session.best_verdict = verdict
-    # The original remains the transport/model-failure fallback, but it must
-    # not beat every readable rewrite merely because it retained OCR noise.
-    session.best_rank = (-1, -10**9, -1)
     return None
 
 
@@ -940,9 +926,7 @@ async def _round_candidate_judge(
         raise RuntimeError("writer phase completed without a candidate")
     session.pending_title = None
     session.pending_body = None
-    # If judging this candidate is unavailable, the next writer still needs
-    # to see the latest candidate and its new feedback, matching the old
-    # page-local retry behavior.
+    # A rejected candidate is what the next writer revises.
     session.title, session.body = candidate_title, candidate_body
     latest, judge_error = await _judge(
         page,
@@ -968,29 +952,11 @@ async def _round_candidate_judge(
             reason="judge-unavailable",
             checks=1,
         )
-        return (
-            ("done", _review_session(session, on_progress=on_progress))
-            if session.attempts >= MAX_REWRITE_ATTEMPTS
-            else ("retry", None)
-        )
+        # A rewrite cannot answer "judge unavailable": keep the original, like the
+        # initial judge; the next repair run retries it.
+        return "done", _review_session(session, on_progress=on_progress)
 
     candidate_feedback = _feedback(latest)
-    candidate_rank = _judge_rank(latest, attempt=session.attempts)
-    published_body = append_low_coverage_source(
-        candidate_body, page.allowed_source, latest.coverage_score
-    )
-    candidate_final = _restore_page_images(
-        _assemble_page(candidate_title, published_body, page.shell.footer),
-        page.images,
-    )
-    if candidate_rank > session.best_rank:
-        session.best_title = candidate_title
-        session.best_body = candidate_body
-        session.best_final = candidate_final
-        session.best_verdict = latest
-        session.best_feedback = list(candidate_feedback)
-        session.best_attempt = session.attempts
-        session.best_rank = candidate_rank
     _emit(
         on_progress,
         "candidate_judged",
@@ -1002,6 +968,10 @@ async def _round_candidate_judge(
         issues=len(_issues(latest)),
     )
     if _approved(latest):
+        candidate_final = _restore_page_images(
+            _assemble_page(candidate_title, candidate_body, page.shell.footer),
+            page.images,
+        )
         _emit(
             on_progress,
             "page_repaired",
@@ -1079,16 +1049,12 @@ def _write_session_checkpoint(
             "body": session.body,
             "feedback": list(session.feedback),
             "feedback_history": list(session.feedback_history),
-            "best_title": session.best_title,
-            "best_body": session.best_body,
             "best_verdict": (
                 session.best_verdict.model_dump(mode="json")
                 if session.best_verdict is not None
                 else None
             ),
             "best_feedback": list(session.best_feedback),
-            "best_attempt": session.best_attempt,
-            "best_rank": list(session.best_rank),
             "attempts": session.attempts,
             "pending_title": session.pending_title,
             "pending_body": session.pending_body,
@@ -1149,8 +1115,6 @@ def _resume_session_checkpoint(
     session.feedback_history = [
         str(item) for item in checkpoint.get("feedback_history") or []
     ]
-    session.best_title = str(checkpoint.get("best_title") or page.shell.title)
-    session.best_body = str(checkpoint.get("best_body") or page.masked_body)
     raw_verdict = checkpoint.get("best_verdict")
     session.best_verdict = (
         RepairJudgeResult.model_validate(raw_verdict) if raw_verdict else None
@@ -1158,27 +1122,11 @@ def _resume_session_checkpoint(
     session.best_feedback = [
         str(item) for item in checkpoint.get("best_feedback") or []
     ]
-    session.best_attempt = max(0, int(checkpoint.get("best_attempt") or 0))
-    raw_rank = checkpoint.get("best_rank") or []
-    if isinstance(raw_rank, list) and len(raw_rank) == 3:
-        session.best_rank = tuple(int(item) for item in raw_rank)
     session.attempts = max(0, int(checkpoint.get("attempts") or 0))
     pending_title = checkpoint.get("pending_title")
     pending_body = checkpoint.get("pending_body")
     session.pending_title = str(pending_title) if pending_title is not None else None
     session.pending_body = str(pending_body) if pending_body is not None else None
-    if session.best_attempt > 0:
-        restored_body = append_low_coverage_source(
-            session.best_body,
-            page.allowed_source,
-            session.best_verdict.coverage_score if session.best_verdict else None,
-        )
-        session.best_final = _restore_page_images(
-            _assemble_page(
-                session.best_title, restored_body, page.shell.footer
-            ),
-            page.images,
-        )
     if expected_stage == "judge" and (
         session.pending_title is None or session.pending_body is None
     ):

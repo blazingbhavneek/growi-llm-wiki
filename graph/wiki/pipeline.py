@@ -1503,6 +1503,52 @@ async def _write_section(
     )
 
 
+async def judge_page_update(
+    *,
+    title: str,
+    owner_ranges: Sequence[tuple[int, int]],
+    owner_evidence: str,
+    reference_evidence: str,
+    after: str,
+    model: ModelPort,
+    output_dir: Path,
+    stem: str,
+    output_language: str,
+    stop_check: StopCheck,
+    **_unused: Any,
+) -> list[str] | None:
+    """Judge a patched page with the section judge; it passes only as a section would."""
+
+    from graph.linker.chunks import _without_nav
+
+    judge = judge_model(model)
+    config = getattr(judge, "config", None)
+    numbered = owner_evidence
+    if reference_evidence:
+        numbered += "\n\n--- 他ページから引用してよい原文（反映は任意） ---\n" + reference_evidence
+    judgment, _attempts, _error = await _structured_with_artifacts(
+        schema=PageJudgeResult,
+        prompt=page_judge_prompt(
+            page_title=title,
+            owner_ranges=", ".join(f"{start}-{end}" for start, end in owner_ranges),
+            numbered_original=numbered,
+            candidate=_without_nav(after),
+            output_language=output_language,
+        ),
+        model=judge,
+        output_dir=output_dir,
+        stem=stem,
+        attempts=int(getattr(config, "judge_attempts", 2)),
+        max_output_tokens=int(getattr(config, "judge_max_output_tokens", 4000)),
+        stop_check=stop_check,
+        retry_temperature=getattr(config, "retry_temperature", 0.7),
+    )
+    if judgment is None:
+        return None
+    defects = [item.strip() for item in judgment.defects if item and item.strip()]
+    return _judge_feedback(judgment) + [f"品質: {item}" for item in defects]
+
+
 async def _write_intro(
     page: SeedPage,
     body: str,

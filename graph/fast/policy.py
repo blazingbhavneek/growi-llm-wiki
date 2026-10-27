@@ -90,6 +90,11 @@ class FastPolicy(Policy):
         await rewrite_pending_pages(**kwargs)
         return True
 
+    async def judge_page_update(self, **kwargs: Any) -> list[str] | None:
+        from .writer import judge_page_update
+
+        return await judge_page_update(**kwargs)
+
     def mask_for_linking(self, text: str) -> tuple[str, Callable[[str], str]]:
         from .wiki import mask_math
 

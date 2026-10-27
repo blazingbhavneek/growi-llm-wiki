@@ -13,9 +13,10 @@ import posixpath
 import re
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urljoin
 
 import httpx
@@ -56,6 +57,22 @@ class GrowiActivity(BaseModel):
     old_path: str = ""
     updated_by: str = ""
     sequence: int | None = None
+
+
+class _Staged(NamedTuple):
+    """One remote page that passed the pull checks: base -> human is the human delta, ``operation`` is "" without one."""
+
+    document: str
+    raw_rel: str
+    local_path: str
+    row: dict[str, Any]
+    page: GrowiPage
+    markdown: str
+    canonical: str
+    base: str
+    human: str
+    operation: str
+    accounted: dict[str, Any]
 
 
 _CHUNK_MARKER_RE = re.compile(
@@ -1158,7 +1175,7 @@ class GrowiPublisher:
         on_progress: Any = None,
     ) -> tuple[list[str], list[str], set[str]]:
         """Accept human revisions: each changed page is re-based onto the document's current pages."""
-        from publisher.human_changes import HumanStore, editable, merge, rebase
+        from publisher.human_changes import HumanStore, editable, learn, merge, rebase
 
         store = HumanStore(project)
         store.audit()
@@ -1186,6 +1203,50 @@ class GrowiPublisher:
         pulled, conflicts, blocked = [], [], set()
         decisions = {"unchanged": 0, "observed": 0, "captured": 0, "blocked": 0, "recovered": 0}
         wiki_root = Path(project.wiki).resolve()
+        staged: list[_Staged] = []
+
+        def fail(document: str, local_path: str, row: dict[str, Any], page: GrowiPage | None, exc: Exception) -> None:
+            log.exception("GROWIのプルに失敗: %s", local_path)
+            reason = str(exc)
+            store.block_page(local_path, row, reason, page)
+            blocked.add(document)
+            conflicts.append(f"{local_path}: {reason}")
+            decisions["blocked"] += 1
+
+        def capture(item: _Staged, learned: list[str]) -> None:
+            raw_rel, local_path, row, page = item.raw_rel, item.local_path, item.row, item.page
+            if item.base != item.human:
+                rewritten = sorted(store.accept(
+                    raw_rel, local_path, row["marker_id"], page.revision_id, item.base, item.human,
+                    model=model, learned=learned,
+                ))
+                pulled.extend(rewritten)
+                decisions["captured"] += 1
+                operation_ja = {"add": "追加", "delete": "削除", "replace": "更新"}[item.operation]
+                log.info(
+                    "GROWIユーザー編集を取り込みました: ドキュメント=%s ページ=%s 操作=%s",
+                    raw_rel, local_path, operation_ja,
+                )
+                log.debug(
+                    "human_sync event=captured document=%s page=%s revision=%s operation=%s rewritten=%s",
+                    raw_rel, local_path, page.revision_id, item.operation, rewritten,
+                )
+            else:
+                log.info(
+                    "GROWIページ更新を確認しました（ユーザー編集なし）: ドキュメント=%s ページ=%s",
+                    raw_rel, local_path,
+                )
+                log.debug(
+                    "human_sync event=accepted_without_user_edit document=%s page=%s revision=%s",
+                    raw_rel, local_path, page.revision_id,
+                )
+            row["revision_id"] = page.revision_id
+            row["marker_seed"] = self.page_marker_seed(project, local_path)
+            store.remember_page(local_path, row, item.markdown, item.canonical, published=False)
+            if item.accounted and item.accounted.get("attempt_id"):
+                settled = store.page(row["marker_id"])
+                if settled.get("prepared_attempt_id") == item.accounted["attempt_id"]:
+                    store.settle_prepared(settled, status="captured_late_human")
 
         for index, (local_path, page) in enumerate(remote.items(), 1):
             row = published_pages[local_path]
@@ -1280,7 +1341,17 @@ class GrowiPublisher:
                     )
                     continue
                 if baseline["accepted_revision"] != row.get("revision_id"):
-                    raise ValueError("published revision and human baseline disagree")
+                    if baseline["accepted_revision"] != page.revision_id:
+                        raise ValueError("published revision and human baseline disagree")
+                    # An interrupted pull already accepted this revision (baselines are written per page, the
+                    # ledger once at the end): the capture is complete and only the ledger row is behind.
+                    row["observed_revision_id"] = row["revision_id"] = page.revision_id
+                    row["marker_seed"] = self.page_marker_seed(project, local_path)
+                    log.info(
+                        "中断されたGROWIプルの取り込み済みリビジョンを台帳に反映しました: ドキュメント=%s ページ=%s",
+                        raw_rel, local_path,
+                    )
+                    continue
                 if page.revision_id == row.get("revision_id"):
                     log.debug(
                         "human_sync event=revision_unchanged document=%s page=%s revision=%s",
@@ -1369,44 +1440,10 @@ class GrowiPublisher:
                             f"remote difference requires human_sync_mode=apply (current mode: {mode})"
                         )
                 row["observed_revision_id"] = page.revision_id
-                if base != human:
-                    rewritten = sorted(store.accept(
-                        raw_rel, local_path, row["marker_id"], page.revision_id, base, human, model=model,
-                    ))
-                    pulled.extend(rewritten)
-                    decisions["captured"] += 1
-                    operation_ja = {"add": "追加", "delete": "削除", "replace": "更新"}[proposed_operation]
-                    log.info(
-                        "GROWIユーザー編集を取り込みました: ドキュメント=%s ページ=%s 操作=%s",
-                        raw_rel, local_path, operation_ja,
-                    )
-                    log.debug(
-                        "human_sync event=captured document=%s page=%s revision=%s operation=%s rewritten=%s",
-                        raw_rel, local_path, page.revision_id, proposed_operation, rewritten,
-                    )
-                else:
-                    log.info(
-                        "GROWIページ更新を確認しました（ユーザー編集なし）: ドキュメント=%s ページ=%s",
-                        raw_rel, local_path,
-                    )
-                    log.debug(
-                        "human_sync event=accepted_without_user_edit document=%s page=%s revision=%s",
-                        raw_rel, local_path, page.revision_id,
-                    )
-                row["revision_id"] = page.revision_id
-                row["marker_seed"] = self.page_marker_seed(project, local_path)
-                store.remember_page(local_path, row, markdown, canonical, published=False)
-                if accounted and accounted.get("attempt_id"):
-                    settled = store.page(row["marker_id"])
-                    if settled.get("prepared_attempt_id") == accounted["attempt_id"]:
-                        store.settle_prepared(settled, status="captured_late_human")
+                staged.append(_Staged(document, raw_rel, local_path, row, page, markdown, canonical, base, human,
+                                      proposed_operation if base != human else "", accounted))
             except (OSError, KeyError, TypeError, ValueError) as exc:
-                log.exception("GROWIのプルに失敗: %s", local_path)
-                reason = str(exc)
-                store.block_page(local_path, row, reason, page)
-                blocked.add(document)
-                conflicts.append(f"{local_path}: {reason}")
-                decisions["blocked"] += 1
+                fail(document, local_path, row, page, exc)
             finally:
                 if on_progress is not None:
                     on_progress({
@@ -1416,6 +1453,15 @@ class GrowiPublisher:
                         "total": len(remote),
                         "page": local_path,
                     })
+        # Every page is classified at once (the one model call here, same concurrency as the merge);
+        # the captures then apply one page at a time, in page order, because they share the document state.
+        with ThreadPoolExecutor(max_workers=max(1, getattr(model, "concurrency", 1))) as pool:
+            learning = [pool.submit(learn, model, item.base, item.human) for item in staged]
+            for item, learned in zip(staged, learning):
+                try:
+                    capture(item, learned.result())
+                except (OSError, KeyError, TypeError, ValueError) as exc:
+                    fail(item.document, item.local_path, item.row, item.page, exc)
         if on_progress is not None:
             on_progress({
                 "stage": "growi-preflight",

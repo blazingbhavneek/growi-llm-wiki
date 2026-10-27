@@ -128,14 +128,14 @@ def _apply_incremental_edits(
     else:
         config = wiki_config(settings, run_dir=state_root)
         model = policy_of(config).model_port(config) if llm is None else ChatModelPort(config, llm=llm)
+    policy = policy_of(settings)
+    language = str(getattr(settings, "wiki_output_language", "Japanese (日本語)"))
     attempts = max(5, int(getattr(settings, "wiki_write_attempts", 5)))
     semaphore = asyncio.Semaphore(
         max(1, int(getattr(settings, "wiki_rewrite_concurrency", getattr(settings, "concurrency", app_concurrency()))))
     )
 
     async def edit_page(filename: str, indexes: set[int]) -> str:
-        if stop_check and stop_check():
-            raise _EditCancelled("incremental wiki edit cancelled")
         page = pages.get(filename)
         path = state_root / "wiki" / filename
         if page is None or not path.exists():
@@ -164,97 +164,154 @@ def _apply_incremental_edits(
             for first, last in ranges
             for number in range(first, last + 1)
         )
+        # The judge may justify a quoted fact only by the lines the page quotes,
+        # including the new text of the quoted lines this update changed.
+        quoted = {
+            number
+            for first, last in page.get("reference_ranges", [])
+            for number in range(int(first), int(last) + 1)
+        } | {
+            number
+            for index in indexes - owned
+            for _old_start, _old_len, new_start, new_len in [hunks[index]]
+            for number in range(new_start, new_start + new_len)
+        }
+        reference_source = "\n".join(
+            f"{number}: {new_prompt_lines[number - 1]}"
+            for number in sorted(quoted)
+            if not any(first <= number <= last for first, last in ranges)
+        )
+        title = str(page.get("title") or Path(filename).stem)
+        judge_dir = state_root / "work" / "patch" / f"page-{int(page['number']):03d}"
+        shutil.rmtree(judge_dir, ignore_errors=True)
         image_units = {unit.placeholder: unit for unit in [*page_units, *new_units]}
         image_context = "\n".join(f"- {placeholder}: {unit.prompt_marker}" for placeholder, unit in image_units.items())
         edits = _edit_blocks(old_prompt_lines, new_prompt_lines, hunks, indexes)
-        feedback: list[str] = []
         retry_temperature = getattr(
             getattr(model, "config", None), "retry_temperature", 0.7
         )
-        for _attempt in range(attempts):
+
+        async def patch_page(feedback: list[str]) -> tuple[str, str]:
+            """One model patch that passed the mechanical checks: (page, placeholder text)."""
+
             prompt = incremental_page_edit_prompt(
-                page_title=str(page.get("title") or Path(filename).stem),
+                page_title=title,
                 current_page=scrub_base64(prompt_page),
                 current_source=scrub_base64(current_source),
                 edits=scrub_base64(edits),
                 image_context=image_context,
-                output_language=str(getattr(settings, "wiki_output_language", "Japanese (日本語)")),
+                output_language=language,
                 feedback=feedback,
                 reference_only=not owned,
                 guidance=(guidance or {}).get(filename, ()),
             )
-            try:
-                async with semaphore:
-                    try:
-                        kwargs = {
-                            "max_output_tokens": 8000,
-                            "temperature": (
-                                retry_temperature
-                                if feedback
-                                else getattr(getattr(model, "config", None), "temperature", 0.7)
-                            ),
-                        }
-                        result = await model.structured(
-                            IncrementalPageEditResult, prompt.messages(), **kwargs
-                        )
-                    except TypeError:
-                        result = await model.structured(IncrementalPageEditResult, prompt.messages())
-                result = result if isinstance(result, IncrementalPageEditResult) else IncrementalPageEditResult.model_validate(result)
-                updated = _apply_model_patches(prompt_page, result, {index + 1 for index in indexes})
-                unknown = [token for token in placeholders_in(updated) if f"[[NEO-IMAGE:{token}]]" not in image_units]
-                if unknown:
-                    raise ValueError(f"unknown image placeholders: {', '.join(unknown)}")
-                final, unresolved = restore_images(updated, list(image_units.values()))
-                if unresolved:
-                    raise ValueError(f"unresolved image placeholders: {', '.join(unresolved)}")
-                errors: list[str] = []
-                touched_hashes = {unit.unit_sha256 for unit in old_touched_units}
-                required = Counter(
-                    unit.unit_sha256
-                    for unit in page_units
-                    if unit.unit_sha256 not in touched_hashes
+            async with semaphore:
+                try:
+                    kwargs = {
+                        "max_output_tokens": 8000,
+                        "temperature": (
+                            retry_temperature
+                            if feedback
+                            else getattr(getattr(model, "config", None), "temperature", 0.7)
+                        ),
+                    }
+                    result = await model.structured(
+                        IncrementalPageEditResult, prompt.messages(), **kwargs
+                    )
+                except TypeError:
+                    result = await model.structured(IncrementalPageEditResult, prompt.messages())
+            result = result if isinstance(result, IncrementalPageEditResult) else IncrementalPageEditResult.model_validate(result)
+            updated = _apply_model_patches(prompt_page, result, {index + 1 for index in indexes})
+            unknown = [token for token in placeholders_in(updated) if f"[[NEO-IMAGE:{token}]]" not in image_units]
+            if unknown:
+                raise ValueError(f"unknown image placeholders: {', '.join(unknown)}")
+            final, unresolved = restore_images(updated, list(image_units.values()))
+            if unresolved:
+                raise ValueError(f"unresolved image placeholders: {', '.join(unresolved)}")
+            errors: list[str] = []
+            touched_hashes = {unit.unit_sha256 for unit in old_touched_units}
+            required = Counter(
+                unit.unit_sha256
+                for unit in page_units
+                if unit.unit_sha256 not in touched_hashes
+            )
+            if owned:
+                current = Counter(unit.unit_sha256 for unit in current_units)
+                for identity, count in current.items():
+                    required[identity] = max(required[identity], count)
+            final_counts = image_identity_counts(final)
+            labels = {
+                unit.unit_sha256: unit.image_id
+                for unit in [*page_units, *current_units, *old_touched_units]
+            }
+            checked = set(required) | {
+                unit.unit_sha256 for unit in old_touched_units
+            }
+            for identity in checked:
+                expected = required[identity]
+                actual = final_counts.get(identity, 0)
+                if actual != expected:
+                    errors.append(
+                        f"image {labels.get(identity, identity[:12])} count must be "
+                        f"{expected}, got {actual}"
+                    )
+            if owned:
+                for first, last in ranges:
+                    errors.extend(check_section(
+                        final, lines=new_lines, source_text="",
+                        block_ranges=verbatim_blocks(new_lines, first, last),
+                        placeholders=[], facts=[], check_identifiers=False,
+                    ))
+            changed_source = "\n".join(
+                line
+                for index in owned
+                for _old_start, _old_len, new_start, new_len in [hunks[index]]
+                for line in new_prompt_lines[new_start - 1 : new_start - 1 + new_len]
+            )
+            missing = sorted(code_tokens(changed_source) - code_tokens(final))
+            if missing:
+                errors.append("missing identifiers from edited source: " + ", ".join(missing[:40]))
+            if errors:
+                raise ValueError("; ".join(errors))
+            return final, updated
+
+        # Every patch, including "nothing to change", is published only after the
+        # judge approves it against the new source; exhaustion escalates the page.
+        feedback: list[str] = []
+        pending: tuple[str, str] | None = None
+        for attempt in range(1, attempts + 1):
+            if stop_check and stop_check():
+                raise _EditCancelled("incremental wiki edit cancelled")
+            if pending is None:
+                try:
+                    pending = await patch_page(feedback)
+                except (ValueError, TypeError) as exc:
+                    feedback = [str(exc)]
+                    continue
+            final, updated = pending
+            async with semaphore:
+                verdict = await policy.judge_page_update(
+                    number=int(page["number"]),
+                    filename=filename,
+                    title=title,
+                    before=scrub_base64(prompt_page),
+                    after=scrub_base64(updated),
+                    owner_ranges=ranges,
+                    owner_evidence=scrub_base64(current_source),
+                    reference_evidence=scrub_base64(reference_source),
+                    model=model,
+                    output_dir=judge_dir,
+                    stem=f"judge-{attempt:02d}",
+                    output_language=language,
+                    stop_check=stop_check,
                 )
-                if owned:
-                    current = Counter(unit.unit_sha256 for unit in current_units)
-                    for identity, count in current.items():
-                        required[identity] = max(required[identity], count)
-                final_counts = image_identity_counts(final)
-                labels = {
-                    unit.unit_sha256: unit.image_id
-                    for unit in [*page_units, *current_units, *old_touched_units]
-                }
-                checked = set(required) | {
-                    unit.unit_sha256 for unit in old_touched_units
-                }
-                for identity in checked:
-                    expected = required[identity]
-                    actual = final_counts.get(identity, 0)
-                    if actual != expected:
-                        errors.append(
-                            f"image {labels.get(identity, identity[:12])} count must be "
-                            f"{expected}, got {actual}"
-                        )
-                if owned:
-                    for first, last in ranges:
-                        errors.extend(check_section(
-                            final, lines=new_lines, source_text="",
-                            block_ranges=verbatim_blocks(new_lines, first, last),
-                            placeholders=[], facts=[], check_identifiers=False,
-                        ))
-                changed_source = "\n".join(
-                    line
-                    for index in owned
-                    for _old_start, _old_len, new_start, new_len in [hunks[index]]
-                    for line in new_prompt_lines[new_start - 1 : new_start - 1 + new_len]
-                )
-                missing = sorted(code_tokens(changed_source) - code_tokens(final))
-                if missing:
-                    errors.append("missing identifiers from edited source: " + ", ".join(missing[:40]))
-                if errors:
-                    raise ValueError("; ".join(errors))
+            if verdict is None:
+                # No verdict is not a rejection: judge the same patch again, do not re-patch.
+                feedback = ["judge unavailable"]
+                continue
+            if not verdict:
                 return final if final == original else final.rstrip() + "\n"
-            except (ValueError, TypeError) as exc:
-                feedback = [str(exc)]
+            feedback, pending = verdict, None
         raise RuntimeError(f"model could not apply incremental edits to {filename}: {feedback[-1]}")
 
     async def edit_all() -> dict[str, Any]:
