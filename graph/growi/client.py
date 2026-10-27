@@ -136,8 +136,8 @@ class GrowiClient:
             raise
         if response.is_error:
             detail = response.text[:500]
-            hint = " - check the API token" if response.status_code == 401 else (
-                " - page changed by another editor" if response.status_code == 409 else ""
+            hint = "（APIトークンを確認してください）" if response.status_code == 401 else (
+                "（他の利用者がページを変更しています）" if response.status_code == 409 else ""
             )
             if response.status_code not in expected_statuses:
                 log.error(
@@ -269,7 +269,10 @@ class GrowiClient:
         """Read one newest-first audit-log page using GROWI's offset contract."""
 
         response = await self._request(
-            "POST", "/activity/list", json_body={"offset": offset, "limit": min(100, max(1, limit))}
+            "POST", "/activity/list", json_body={"offset": offset, "limit": min(100, max(1, limit))},
+            # The activity detector explains the unavailable feature and requests
+            # a full inventory. Avoid a second error for this recoverable status.
+            expected_statuses=(405,),
         )
         payload = response.json()
         if not isinstance(payload, dict):

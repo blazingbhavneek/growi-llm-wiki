@@ -20,11 +20,8 @@ except ImportError:  # pragma: no cover - tqdm is an optional terminal aid
 log = logging.getLogger("progress")
 
 
-NAME_KEEP = 5
-NAME_THRESHOLD = 25
-NAME_JOIN = "....."
-# 5 + 5 + 5 characters are at most 25 columns when CJK counts as two.
-DOC_WIDTH = 25
+NAME_THRESHOLD = 48
+DOC_WIDTH = 40
 
 
 def _cells(value: str) -> int:
@@ -33,10 +30,32 @@ def _cells(value: str) -> int:
 
 
 def shorten_name(value: str, threshold: int = NAME_THRESHOLD) -> str:
-    """Keep the first and last NAME_KEEP characters of a name wider than threshold."""
+    """Shorten terminal labels by display width, preserving most of the name's start."""
     if _cells(value) <= threshold:
         return value
-    return f"{value[:NAME_KEEP]}{NAME_JOIN}{value[-NAME_KEEP:]}"
+    available = max(0, threshold - 1)  # one column for the ellipsis
+    tail_budget = available // 3
+    head_budget = available - tail_budget
+    head, tail = "", ""
+    for char in value:
+        if _cells(head + char) > head_budget:
+            break
+        head += char
+    for char in reversed(value):
+        if _cells(char + tail) > tail_budget:
+            break
+        tail = char + tail
+    return f"{head}…{tail}"
+
+
+def _elapsed_text(seconds: int) -> str:
+    minutes, seconds = divmod(max(0, seconds), 60)
+    if not minutes:
+        return f"{seconds}秒"
+    hours, minutes = divmod(minutes, 60)
+    if not hours:
+        return f"{minutes}分{seconds:02d}秒"
+    return f"{hours}時間{minutes:02d}分{seconds:02d}秒"
 
 
 class LiveLogFormatter(logging.Formatter):
@@ -56,8 +75,12 @@ class LiveLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         text = record.getMessage()
         exception = record.exc_info[1] if record.exc_info and record.exc_info[1] is not None else None
-        if exception is not None:
-            text = f"{text} エラー={type(exception).__name__}: {exception}"
+        # A caller may supply a complete Japanese explanation while retaining the
+        # original exception for debug.log. Otherwise add the reason only once.
+        if exception is not None and getattr(record, "live_exception", True):
+            reason = f"{type(exception).__name__}: {exception}"
+            if reason not in text:
+                text = f"{text} エラー={reason}"
         text = self._ANSI.sub("", text)
         if self.redact is not None:
             text = self.redact(text)
@@ -74,6 +97,7 @@ class LiveLogFormatter(logging.Formatter):
 @dataclass
 class _Phase:
     label: str
+    unit: str = "件"
     started: float | None = None
     total: int | None = None
     current: int = 0
@@ -89,19 +113,20 @@ class SyncProgress:
     """
 
     _LABELS = {
-        "capture": "キャプチャー",
-        "parse": "パーサー",
-        "planner": "プランナー",
-        "research": "ウィキリサーチ",
-        "writer": "ウィキ生成・チェック",
-        "fast-repair": "ウィキリペア・チェック",
-        "linker-entities": "リンクエンティティ",
-        "linker-edges": "メインリンク",
-        "growi-preflight": "パブリッシュ事前チェック",
-        "growi-publish": "パブリッシュ",
+        "capture": "GROWIの編集内容の取得",
+        "parse": "文書の変換",
+        "planner": "ページ構成の作成",
+        "research": "関連情報の収集",
+        "writer": "Wikiの生成・確認",
+        "writer-save": "Wikiの保存",
+        "fast-repair": "Wikiの修正・確認",
+        "linker-entities": "リンク対象の抽出",
+        "linker-edges": "ページ間リンクの作成",
+        "growi-preflight": "公開前の確認",
+        "growi-publish": "GROWIへの公開",
         "reset": "リモートページのリセット",
         "reset-index": "インデックスのリセット",
-        "index": "インデックス",
+        "index": "検索インデックスの更新",
     }
 
     def __init__(self, *, stream: Any = None) -> None:
@@ -118,11 +143,12 @@ class SyncProgress:
         if tqdm is not None:
             self._doc_bar = tqdm(
                 total=0,
-                desc="ドキュメント",
+                desc="文書",
                 unit="件",
                 position=0,
                 leave=True,
                 dynamic_ncols=True,
+                bar_format="{desc}を確認中 [{elapsed}]{postfix}",
                 disable=not self._bars_enabled,
                 file=self._progress_stream,
             )
@@ -137,6 +163,8 @@ class SyncProgress:
             self._documents.add(value)
         if self._doc_bar is not None:
             self._doc_bar.total = len(self._documents)
+            if self._documents:
+                self._doc_bar.bar_format = "{desc}: {n_fmt}/{total_fmt}件 |{bar}| [{elapsed}]{postfix}"
             self._doc_bar.refresh()
 
     @property
@@ -183,10 +211,14 @@ class SyncProgress:
         }:
             return "<batch>"
         value = event.get("document") or event.get("file") or "<batch>"
-        value = str(value)
-        if value.startswith("/"):
-            value = Path(value).name
-        return shorten_name(value)
+        return str(value)
+
+    @staticmethod
+    def _document_label(document: str, *, terminal: bool = False) -> str:
+        if document == "<batch>":
+            return "全体"
+        # Full paths identify log records and phase state. Only terminal labels shrink.
+        return shorten_name(Path(document).name) if terminal else document
 
     def _write(self, message: str) -> None:
         """Progress milestones are log records, so live.log gets them without a tee."""
@@ -206,31 +238,42 @@ class SyncProgress:
     ) -> _Phase:
         phase = self._phases.get(key)
         if phase is None or phase.reported:
-            phase = _Phase(self._LABELS[key[1]])
+            phase = _Phase(self._LABELS[key[1]],
+                           unit="ページ" if key[1] in {"writer", "writer-save", "fast-repair", "research", "planner"} else "件")
             self._phases[key] = phase
         if phase.started is None:
             phase.started = time.monotonic()
-            log.info("[%s] %s: 開始", key[0].replace('<batch>', '<バッチ>'), phase.label)
+            log.info("[%s] %sを開始します", self._document_label(key[0]), phase.label)
         if total is not None and total > 0:
             phase.total = total
         if self._active_key != key:
             self._close_visible()
             self._active_key = key
+            if self._doc_bar is not None:
+                self._doc_bar.set_postfix_str(self._document_label(key[0], terminal=True))
             if tqdm is not None:
                 self._stage_bar = tqdm(
                     total=phase.total,
-                    desc=f"{key[0].replace('<batch>', '<バッチ>')} | {phase.label}",
-                    unit="件",
+                    desc=phase.label,
+                    unit=phase.unit,
                     position=1,
                     leave=False,
                     dynamic_ncols=True,
+                    bar_format=self._stage_format(phase),
                     disable=not self._bars_enabled,
                     file=self._progress_stream,
                 )
         elif self._stage_bar is not None and phase.total != self._stage_bar.total:
             self._stage_bar.total = phase.total
+            self._stage_bar.bar_format = self._stage_format(phase)
             self._stage_bar.refresh()
         return phase
+
+    @staticmethod
+    def _stage_format(phase: _Phase) -> str:
+        if phase.total is None:
+            return "{desc} [{elapsed}]{postfix}"
+        return "{desc}: {n_fmt}/{total_fmt}{unit} |{bar}| [{elapsed}]{postfix}"
 
     def _update_bar(self, phase: _Phase, *, step: str = "") -> None:
         if self._stage_bar is None:
@@ -239,11 +282,18 @@ class SyncProgress:
         if desired > self._stage_bar.n:
             self._stage_bar.update(desired - self._stage_bar.n)
         if step:
-            label = {"start": "スタート", "page_start": "ページ開始", "page_done": "ページ完了",
+            label = {"start": "開始", "page_start": "処理中", "page_done": "ページ完了",
+                     "page_judged": "内容を確認済み", "resumed": "保存済みの結果を再利用",
+                     "page_started": "ページを確認中", "rewrite_started": "修正中",
+                     "page_checkpointed": "結果を保存済み", "page_resumed": "保存済みの結果を再利用",
+                     "judge_pass_started": "内容を確認中", "writer_pass_started": "修正中",
+                     "chunks": "本文を分割中", "entities": "リンク対象を抽出中",
+                     "edge_target_done": "リンク作成済み", "incremental_scope": "更新対象を確認中",
+                     "page_curated": "リンク対象を選択済み",
                      "document_done": "ドキュメント完了", "progress": "処理中", "document": "ドキュメント",
                      "folder": "フォルダー", "done": "完了", "complete": "完了", "batch_done": "バッチ完了",
                      "failed": "エラー", "page_failed": "ページエラー", "clean": "チェック済み",
-                     "repaired": "リペア済み", "review": "レビュー", "written": "保存済み",
+                     "repaired": "修正済み", "review": "要確認", "written": "保存済み",
                      "unchanged": "変更なし", "indexed": "インデックス更新済み", "deleted": "削除済み"}
             heading, separator, detail = step.partition(": ")
             first, space, rest = heading.partition(" ")
@@ -264,13 +314,28 @@ class SyncProgress:
         if self._active_key == key:
             self._update_bar(phase, step=status)
             self._close_visible()
-        label = {"done": "完了", "failed": "エラー", "review": "レビュー", "pending": "保留", "cancelled": "キャンセル"}.get(status, status)
-        self._write(f"[{key[0].replace('<batch>', '<バッチ>')}] {phase.label}: {elapsed:.1f}秒 ({label})")
+        label = {"done": "完了", "failed": "エラー", "review": "要確認", "pending": "保留", "cancelled": "キャンセル"}.get(status, status)
+        count = f"、{phase.current}/{phase.total}{phase.unit}" if phase.total is not None else ""
+        self._write(f"[{self._document_label(key[0])}] {phase.label}: {label}（{elapsed:.1f}秒{count}）")
 
     def on_event(self, event: dict[str, Any]) -> None:
         event = dict(event)
         if str(event.get("stage") or "") == "queue-claim":
             self.add_documents(event.get("paths", []))
+            return
+        if event.get("step") == "waiting":
+            document = self._document(event)
+            # Wiki heartbeats cover its planner/writer subphases; do not create a
+            # new phase or revive a completed one just to show elapsed time.
+            active = self._active_key
+            if active and active[0] == document:
+                phase = self._phases[active]
+                elapsed = int(time.monotonic() - phase.started) if phase.started is not None else 0
+                elapsed_text = _elapsed_text(elapsed)
+                self._update_bar(phase, step=f"処理中（{elapsed_text}経過）")
+                count = f"、{phase.current}/{phase.total}{phase.unit}完了" if phase.total is not None else ""
+                log.info("[%s] %sを継続中（%s経過%s）",
+                         self._document_label(document), phase.label, elapsed_text, count)
             return
         phase_name = self._phase_name(event)
         if phase_name is None:
@@ -291,7 +356,10 @@ class SyncProgress:
             phase = self._ensure_phase(key, total=total)
             if step == "page_start" and phase.total is not None:
                 phase.total = max(phase.total, total or phase.total)
-            self._update_bar(phase, step=step)
+            detail = step
+            if event.get("page"):
+                detail += f": {shorten_name(str(event['page']), DOC_WIDTH)}"
+            self._update_bar(phase, step=detail)
             return
 
         phase = self._ensure_phase(key, total=total)
@@ -306,6 +374,7 @@ class SyncProgress:
             if event.get("status"):
                 status = str(event["status"])
                 status = {"written": "保存済み", "unchanged": "変更なし", "indexed": "インデックス更新済み",
+                          "generated": "生成・確認済み", "verbatim": "原文を使用",
                           "deleted": "削除済み", "skipped": "スキップ", "failed": "エラー"}.get(status, status)
                 detail += f" ({status})"
             self._update_bar(phase, step=detail)
@@ -332,7 +401,7 @@ class SyncProgress:
             pages = event.get("pages")
             total = pages if isinstance(pages, int) and pages > 0 else None
             phase = self._ensure_phase(key, total=total)
-            self._update_bar(phase, step=f"{pages or 0}ページをスタート")
+            self._update_bar(phase, step=f"{pages or 0}ページの確認を開始")
             return
         if step == "document_done":
             status = str(event.get("status") or "done")
@@ -347,7 +416,7 @@ class SyncProgress:
             label = step.removeprefix("page_")
             if step == "page_review" and int(event.get("selected_attempt") or 0) > 0:
                 label += (
-                    f" (ベストトライ {int(event['selected_attempt'])}, "
+                    f" (採用した試行 {int(event['selected_attempt'])}, "
                     f"スコア {int(event.get('selected_score') or 0)})"
                 )
             self._update_bar(phase, step=f"{label}: {page}")
@@ -363,11 +432,11 @@ class SyncProgress:
                 f"、問題 {int(event.get('issues') or 0)}件"
             )
         elif step == "candidate_rejected":
-            detail = f"リジェクト ({str(event.get('reason') or '不明')})"
+            detail = f"候補を不採用 ({str(event.get('reason') or '不明')})"
         if page:
             detail += f": {page}"
         if isinstance(attempt, int):
-            detail += f" (トライ {attempt})"
+            detail += f" ({attempt}回目)"
         self._update_bar(phase, step=detail)
 
     def close(self) -> None:
@@ -376,5 +445,5 @@ class SyncProgress:
             self._doc_bar.close()
         if self._documents:
             self._write(
-                f"ドキュメント: {len(self._completed)}/{len(self._documents)}件を処理"
+                f"文書の処理結果: {len(self._completed)}/{len(self._documents)}件完了"
             )

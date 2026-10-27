@@ -179,6 +179,7 @@ async def _generate_page(
     config: Any,
     stop_check: Any,
     on_progress: Any,
+    total_pages: int,
 ) -> _GenerationOutcome:
     """Run writer -> judge retries and retain the best judged page candidate."""
 
@@ -187,6 +188,7 @@ async def _generate_page(
     page = session.page
     prompt_page = session.prompt_page
     fallback = _source_body(page, lines=lines, units=session.page_units)
+    wiki._emit(on_progress, "writer", "page_start", page=page.title, total=total_pages)
     if model is None:
         return _GenerationOutcome(
             session,
@@ -211,14 +213,6 @@ async def _generate_page(
         max(1, int(getattr(config, "write_attempts", MAX_REWRITE_ATTEMPTS))),
     )
 
-    wiki._emit(
-        on_progress,
-        "writer",
-        "page_start",
-        page=page.title,
-        current=0,
-        total=0,
-    )
     for attempt in range(1, max_attempts + 1):
         if stop_check and stop_check():
             raise asyncio.CancelledError("page writing cancelled")
@@ -382,16 +376,19 @@ async def rewrite_pending_pages(
         )
         for page in pending
     ]
+    generated_count = len(results)  # Saved pages resumed by _rewrite_all are already complete.
 
     async def generate(session: _GenerationSession) -> _GenerationOutcome:
+        nonlocal generated_count
         try:
-            return await _generate_page(
+            outcome = await _generate_page(
                 session,
                 lines=lines,
                 model=model,
                 config=config,
                 stop_check=stop_check,
                 on_progress=on_progress,
+                total_pages=len(pages),
             )
         except asyncio.CancelledError:
             raise
@@ -408,7 +405,7 @@ async def rewrite_pending_pages(
                 exc_info=True,
             )
             session.artifacts.append(_Artifact("generation-error.txt", error + "\n"))
-            return _GenerationOutcome(
+            outcome = _GenerationOutcome(
                 session,
                 session.page.title,
                 fallback,
@@ -416,6 +413,16 @@ async def rewrite_pending_pages(
                 errors=[error],
                 verbatim=True,
             )
+        generated_count += 1
+        status = "verbatim" if outcome.verbatim else "generated"
+        wiki._emit(
+            on_progress, "writer", "page_done", page=outcome.title,
+            current=generated_count, total=len(pages), status=status,
+        )
+        log.info("Wikiページの処理が終わりました: %s / %s（%d/%dページ、%s）",
+                 source_path.name, outcome.title, generated_count, len(pages),
+                 "原文を使用" if outcome.verbatim else "生成・確認済み")
+        return outcome
 
     outcomes = await bounded_map(
         sessions,
@@ -431,7 +438,9 @@ async def rewrite_pending_pages(
         if page.path and page.path[-1] == previous_title:
             page.path[-1] = outcome.title
 
-    for outcome in outcomes:
+    if outcomes:
+        wiki._emit(on_progress, "writer-save", "start", total=len(outcomes))
+    for saved_count, outcome in enumerate(outcomes, start=1):
         session = outcome.session
         page = session.page
         try:
@@ -517,10 +526,12 @@ async def rewrite_pending_pages(
             raise
         wiki._emit(
             on_progress,
-            "writer",
+            "writer-save",
             "page_done",
             page=page.title,
-            total=len(pages),
+            current=saved_count,
+            total=len(outcomes),
+            status="written",
         )
         wiki._emit(
             on_progress,
@@ -533,7 +544,9 @@ async def rewrite_pending_pages(
             score=result.judge_score,
             verbatim_sections=len(result.verbatim_sections),
         )
-        log.info(
+        log.info("Wikiページを保存しました: %s / %s（%d/%dページ）",
+                 source_path.name, page.title, len(results), len(pages))
+        log.debug(
             "ページを作成しました: 文書=%s、ページ=%s、完了数=%d、総数=%d、試行回数=%d、評価点=%s、原文使用=%d",
             source_path,
             page.filename,

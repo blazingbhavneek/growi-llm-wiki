@@ -229,7 +229,7 @@ class PlannerAhead:
                     model=model,
                     stop_check=self._stop.is_set,
                 )
-                log.info("先行の構成作成が完了しました: 文書=%s、経過時間=%.1f秒", job.rel, time.monotonic() - started)
+                log.info("ページ構成を事前に作成しました: %s（%.1f秒）", job.rel, time.monotonic() - started)
             except Exception as exc:  # noqa: BLE001 - the serial builder plans it itself
                 log.warning("先行の構成作成に失敗しました。本処理で再試行します: 文書=%s、エラー=%s: %s",
                             job.rel, type(exc).__name__, exc)

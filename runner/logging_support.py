@@ -14,6 +14,30 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 
+# Third-party HTTP stacks log every socket event at DEBUG; debug.log is for our own steps.
+# httpcore2 is the transport openai/httpx2 pull in, and is NOT a child of "httpcore".
+MUTED_LOGGERS = (
+    "asyncio",
+    "anyio",
+    "h11",
+    "httpcore",
+    "httpcore2",
+    "httpx",
+    "httpx2",
+    "urllib3",
+    "openai",
+    "langchain",
+    "langchain_openai",
+    "langchain-openai",
+    "anthropic",
+)
+
+
+def mute_third_party_logs() -> None:
+    for name in MUTED_LOGGERS:
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
 @contextmanager
 def startup_logs():
     """Buffer settings diagnostics until file handlers exist, without stderr fallbacks."""
@@ -24,6 +48,7 @@ def startup_logs():
     previous, level = root.handlers[:], root.level
     root.handlers = [handler]
     root.setLevel(logging.DEBUG)
+    mute_third_party_logs()
     try:
         yield records
     finally:
@@ -52,6 +77,7 @@ def file_logging(handlers: list[logging.Handler]):
     previous, level, hook = root.handlers[:], root.level, threading.excepthook
     root.handlers = handlers or [logging.NullHandler()]
     root.setLevel(logging.DEBUG)
+    mute_third_party_logs()
     try:
         yield root
     finally:

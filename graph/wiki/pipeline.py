@@ -2080,13 +2080,14 @@ async def run_pipeline(
         raise
     normalized = normalize_source(source_text)
     lines = split_source_lines(normalized)
+    log.info("文書を読み込みました: %s（%s行）", source_path.name, f"{len(lines):,}")
     # The whole source is held in memory (audit 4.5); record the size up front.
-    log.info(
-        "元文書を読み込みました: 文書=%s、パス=%s、バイト数=%d、行数=%d",
-        source_path.name,
-        source_path,
-        len(source_bytes),
-        len(lines),
+    log.debug(
+        "元文書の読み込み情報",
+        extra={"debug_fields": {
+            "document": source_path.name, "path": str(source_path),
+            "bytes": len(source_bytes), "lines": len(lines),
+        }},
     )
     config = config or WikiConfig()
     single_page_rewrite = config.skip_excel_and_small and is_small_document(source_text)

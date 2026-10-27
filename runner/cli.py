@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import copy
 import fcntl
 import json
 import logging
@@ -147,17 +146,14 @@ def _file_handlers(log_dir: Path, *, run_id: str, settings: Settings) -> list[lo
 
     from publisher.failure_logs import redact_log_text
     from publisher.progress import LiveLogFormatter
-
-    class RedactedDebugFormatter(logging.Formatter):
-        def format(self, record: logging.LogRecord) -> str:
-            # Redact the final text too: exception messages and chained traces can contain keys.
-            return redact_log_text(super().format(copy.copy(record)), settings)
+    from runner.debug_logging import DebugLogFormatter
 
     live = _open_log_handler(log_dir / "live.log", level=logging.INFO, max_bytes=1_000_000,
                              formatter=LiveLogFormatter(run_id=run_id,
                                                         redact=lambda text: redact_log_text(text, settings)))
     debug = _open_log_handler(log_dir / "debug.log", level=logging.DEBUG, max_bytes=10_000_000,
-                              formatter=RedactedDebugFormatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+                              formatter=DebugLogFormatter(run_id=run_id,
+                                                          redact=lambda text: redact_log_text(text, settings)))
     return [handler for handler in (live, debug) if handler is not None]
 
 
@@ -275,17 +271,10 @@ def _settings(args: argparse.Namespace) -> Settings:
 
 
 def _progress(event: dict[str, Any]) -> None:
+    from runner.debug_logging import progress_event_name
+
     event = dict(event)
-    stage = str(event.pop("stage", "work"))
-    step = str(event.pop("step", ""))
-    current, total = event.get("current"), event.get("total")
-    progress = ""
-    if isinstance(current, int) and isinstance(total, int) and total > 0:
-        progress = f" {current}/{total} ({current * 100 // total}%)"
-        event.pop("current", None)
-        event.pop("total", None)
-    details = json.dumps(event, ensure_ascii=False, default=str)
-    log.debug(f"処理の進捗: 工程={stage}、段階={step}{progress}、詳細={details}".rstrip())
+    log.debug("%s", progress_event_name(event), extra={"progress_event": event})
 
 
 def _report(result: dict[str, Any], settings: Settings | None = None) -> int:
@@ -1250,7 +1239,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python main.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--project", required=False, help="config name from configs/ or absolute INI path")
     parser.add_argument("--data-root", help="override the selected INI data_root")
-    parser.add_argument("-v", "--verbose", action="store_true", help="print pipeline progress events")
+    parser.add_argument("-v", "--verbose", action="store_true", help="compatibility flag; progress is shown automatically and diagnostics go to debug.log")
     sub = parser.add_subparsers(dest="command", required=True)
     def project_flags(p: argparse.ArgumentParser) -> None:
         p.add_argument("--project", default=argparse.SUPPRESS, help="config name from configs/ or absolute INI path")
@@ -1395,21 +1384,7 @@ def main() -> int:
         # file_logging supplies a NullHandler when neither file can be opened.
         reset_failure_summaries(settings)
         log.info("実行を開始します: プロジェクト=%s、実行ID=%s、コマンド=%s", settings.target_name, run_id, args.command)
-        # -v means "show our debug in debug.log", not third-party HTTP/client chatter.
-        for noisy in (
-            "asyncio",
-            "httpx",
-            "httpx2",
-            "httpcore",
-            "h11",
-            "urllib3",
-            "openai",
-            "langchain",
-            "langchain_openai",
-            "langchain-openai",
-            "anthropic",
-        ):
-            logging.getLogger(noisy).setLevel(logging.ERROR)
+        # Third-party HTTP chatter is muted by file_logging/startup_logs for every entry point.
         threading.excepthook = _thread_excepthook
         outcome = "failed"
         try:

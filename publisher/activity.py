@@ -122,10 +122,18 @@ class ActivityDetector:
             )
         except Exception as exc:
             status = getattr(exc, "status_code", None)
-            log.error("変更一覧の取得に失敗しました。変更を見落とす場合があります: パス=%s、理由=%s、応答コード=%s、対象範囲=%s、エラー=%s: %s",
-                      self.path,
-                      "activity_permission_gap" if status in {401, 403} else "activity_api_unavailable",
-                      status, self.boundary, type(exc).__name__, exc, exc_info=True)
+            if status == 405:
+                reason = "GROWIの監査ログが無効です" if "AuditLog is not enabled" in str(exc) else "GROWIの変更履歴APIを利用できません"
+                log.warning(
+                    "%s。変更履歴の代わりに全ページを確認します（HTTP 405、対象=%s）",
+                    reason, self.boundary, exc_info=True, extra={"live_exception": False},
+                )
+            else:
+                log.error(
+                    "GROWIの変更履歴を取得できません。全ページを確認します（HTTP %s、対象=%s）",
+                    status if status is not None else "応答なし", self.boundary,
+                    exc_info=True, extra={"live_exception": False},
+                )
             return DetectionBatch(
                 fallback_reason="activity_permission_gap" if status in {401, 403} else "activity_api_unavailable",
                 metrics={"cursor_resets": 1 if status in {401, 403} else 0, "reason": type(exc).__name__},

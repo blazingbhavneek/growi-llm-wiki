@@ -18,12 +18,13 @@ import textwrap
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from publisher import failure_logs  # noqa: E402
-from publisher.progress import LiveLogFormatter  # noqa: E402
+from publisher.progress import LiveLogFormatter, SyncProgress, _cells, shorten_name  # noqa: E402
 from runner import cli  # noqa: E402
 
 TRACE_HEAD = "Traceback (most recent call last)"
@@ -111,7 +112,7 @@ class TracebackSeparationTests(TempLogCase):
             self.assertRegex(live.strip(), LIVE_LINE.pattern)
             self.assertNotIn(TRACE_HEAD, live)
             self.assertIn("team/a.docx", live)
-            self.assertIn("エラー=ValueError: broken source", live)
+            self.assertEqual(live.count("ValueError: broken source"), 1)
             self.assertIn(TRACE_HEAD, debug)
             self.assertIn("ValueError: broken source", debug)
 
@@ -129,6 +130,7 @@ class TracebackSeparationTests(TempLogCase):
         self.assertIs(entry.exc_text, cached)
         self.assertIsNotNone(entry.exc_info)
         self.assertNotIn(TRACE_HEAD, live_text)
+        self.assertIn("エラー=KeyError: 'missing'", live_text)
         self.close(live, debug)
 
     def test_chaining_stack_info_and_multiline_stay_one_live_line(self):
@@ -585,6 +587,262 @@ class GrowiStatusTests(unittest.TestCase):
                 with self.assertRaises(GrowiAPIError):
                     asyncio.run(client.get_page(path="/existing-page"))
             error.assert_called_once()
+
+
+class ProgressReadabilityTests(unittest.TestCase):
+    def test_japanese_names_keep_identifying_text_within_terminal_width(self):
+        name = "(社外秘)制御機能仕様書【3章】_docx.md"
+        self.assertEqual(shorten_name(name), name)
+        for name in (name * 3, "long-source-document-name_" * 4, "長い日本語とASCII_" * 8):
+            for width in (10, 25, 48):
+                shortened = shorten_name(name, width)
+                self.assertLessEqual(_cells(shortened), width)
+                self.assertIn("…", shortened)
+
+    def test_similar_document_names_and_paths_keep_independent_progress(self):
+        documents = [
+            "(社外秘)制御機能仕様書【3章】_docx.md",
+            "(社外秘)融通計算機能仕様書_docx.md",
+            "/team-a/shared.docx", "/team-b/shared.docx",
+        ]
+        progress = SyncProgress(stream=io.StringIO())
+        try:
+            with self.assertLogs("progress", level="INFO") as captured:
+                for document in documents:
+                    progress.on_event({"stage": "writer", "step": "page_start",
+                                       "document": document, "total": 1})
+                for document in documents:
+                    progress.on_event({"stage": "writer", "step": "page_done",
+                                       "document": document, "total": 1})
+            self.assertEqual(len(progress._phases), 4)
+            self.assertTrue(all(phase.reported for phase in progress._phases.values()))
+            for document in documents:
+                self.assertIn(f"[{document}] Wikiの生成・確認: 完了", "\n".join(captured.output))
+        finally:
+            progress.close()
+
+    def test_fast_writer_supplies_total_before_the_first_page_finishes(self):
+        from graph.fast.writer import _generate_page
+
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        terminal = Terminal()
+        progress = SyncProgress(stream=terminal)
+        session = SimpleNamespace(page=SimpleNamespace(title="操作条件"), prompt_page=None, page_units=[])
+
+        def on_event(event):
+            progress.on_event({**event, "document": "制御機能仕様書_docx.md"})
+
+        try:
+            with patch("graph.fast.writer._source_body", return_value="原文"):
+                asyncio.run(_generate_page(session, lines=[], model=None, config=None,
+                                           stop_check=None, on_progress=on_event, total_pages=28))
+            self.assertEqual(progress._stage_bar.total, 28)
+            self.assertIn("0/28ページ", terminal.getvalue())
+            self.assertNotIn("?件/s", terminal.getvalue())
+        finally:
+            progress.close()
+
+    def test_unknown_total_does_not_show_a_misleading_zero_count(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        terminal = Terminal()
+        progress = SyncProgress(stream=terminal)
+        try:
+            progress.on_event({"stage": "parse", "step": "start", "document": "仕様書.docx"})
+            self.assertIn("文書の変換", terminal.getvalue())
+            self.assertNotIn("0件", terminal.getvalue())
+            self.assertNotIn("?件/s", terminal.getvalue())
+        finally:
+            progress.close()
+
+    def test_eighty_column_terminal_keeps_names_counts_and_labels_readable(self):
+        from tqdm import tqdm
+
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        def bar(*args, **kwargs):
+            return tqdm(*args, **{**kwargs, "dynamic_ncols": False, "ncols": 80})
+
+        document = "(社外秘)制御機能仕様書【3章】_docx.md"
+        with patch("publisher.progress.tqdm", side_effect=bar):
+            progress = SyncProgress(stream=Terminal())
+            try:
+                progress.add_documents([document, "別の仕様書.docx"])
+                progress.on_event({"stage": "writer", "step": "page_start", "document": document,
+                                   "page": "機器制御可・不可条件", "total": 28})
+                self.assertIn(document, str(progress._doc_bar))
+                self.assertIn("0/2件", str(progress._doc_bar))
+                self.assertIn("0/28ページ", str(progress._stage_bar))
+                self.assertIn("機器制御可・不可条件", str(progress._stage_bar))
+                progress.on_event({"stage": "writer", "step": "page_judged", "document": document})
+                self.assertIn("内容を確認済み", str(progress._stage_bar))
+                self.assertNotIn("page_judged", str(progress._stage_bar))
+                self.assertLessEqual(_cells(str(progress._stage_bar)), 80)
+            finally:
+                progress.close()
+
+    def test_wiki_heartbeat_reports_the_active_phase_and_page_count(self):
+        progress = SyncProgress(stream=io.StringIO())
+        try:
+            progress.on_event({"stage": "writer", "step": "page_start",
+                               "document": "仕様書.docx", "total": 28})
+            phase = progress._phases[("仕様書.docx", "writer")]
+            with patch("publisher.progress.time.monotonic", return_value=phase.started + 60):
+                with self.assertLogs("progress", level="INFO") as captured:
+                    progress.on_event({"stage": "wiki", "step": "waiting", "document": "仕様書.docx"})
+            self.assertIn("Wikiの生成・確認を継続中（1分00秒経過、0/28ページ完了）", captured.output[0])
+            self.assertEqual(len(progress._phases), 1)
+            progress.on_event({"stage": "writer", "step": "done", "document": "仕様書.docx"})
+            with patch("publisher.progress.log.info") as info:
+                progress.on_event({"stage": "wiki", "step": "waiting", "document": "仕様書.docx"})
+            info.assert_not_called()
+        finally:
+            progress.close()
+
+    def test_long_running_heartbeat_uses_minutes_and_completed_page_count(self):
+        progress = SyncProgress(stream=io.StringIO())
+        try:
+            progress.on_event({"stage": "writer", "step": "page_start",
+                               "document": "仕様書.docx", "total": 28})
+            for _ in range(7):
+                progress.on_event({"stage": "writer", "step": "page_done",
+                                   "document": "仕様書.docx", "total": 28})
+            phase = progress._phases[("仕様書.docx", "writer")]
+            with patch("publisher.progress.time.monotonic", return_value=phase.started + 1079):
+                with self.assertLogs("progress", level="INFO") as captured:
+                    progress.on_event({"stage": "wiki", "step": "waiting", "document": "仕様書.docx"})
+            self.assertIn("17分59秒経過、7/28ページ完了", captured.output[0])
+        finally:
+            progress.close()
+
+
+class FastWriterProgressTests(unittest.TestCase):
+    def test_progress_advances_while_another_page_is_generating_then_tracks_saves(self):
+        from graph.fast.repair import RepairJudgeResult
+        from graph.fast.writer import rewrite_pending_pages
+        from graph.wiki.config import WikiConfig
+        from graph.wiki.pipeline import RewriteResult, SeedPage
+
+        # Exercise real generation, retries, title finalization and local writes;
+        # only the two model-call boundaries are simulated.
+        for resumed, fallback in ((0, False), (1, False), (0, True)):
+            with self.subTest(resumed=resumed, fallback=fallback), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                pages = [SeedPage(number=n, title=f"元の見出し{n}", chapter="", summary="",
+                                  owner_ranges=[(n, n)], filename=f"{n:03d}.md", page_id=str(n))
+                         for n in range(1, resumed + 3)]
+                results = [RewriteResult(page=pages[0], markdown="既存のページ", attempts=1)] if resumed else []
+                progress = SyncProgress(stream=io.StringIO())
+                events = []
+
+                async def scenario():
+                    release = asyncio.Event()
+                    first_finished = asyncio.Event()
+                    last_started = asyncio.Event()
+
+                    def on_event(event):
+                        events.append(event)
+                        progress.on_event({**event, "document": "仕様書.docx"})
+                        if event["stage"] == "writer" and event["step"] == "page_done" and not event.get("resumed"):
+                            first_finished.set()
+
+                    async def writer(page, *_args, **_kwargs):
+                        if page.number == pages[-1].number:
+                            last_started.set()
+                            await release.wait()
+                        elif fallback:
+                            raise ValueError("simulated model failure")
+                        return f"確認後の見出し{page.number}", f"本文{page.number}"
+
+                    async def judge(page, *_args, stem, **_kwargs):
+                        if page.number == pages[resumed].number and stem == "rewrite-01-judge":
+                            return RepairJudgeResult(coverage_score=95, body_defects=["修正が必要"]), ""
+                        return RepairJudgeResult(approved=True, coverage_score=100), ""
+
+                    if resumed:
+                        on_event({"stage": "writer", "step": "page_start", "total": len(pages), "resumed": True})
+                        on_event({"stage": "writer", "step": "page_done", "total": len(pages), "resumed": True})
+
+                    with patch("graph.fast.writer._writer", side_effect=writer), \
+                            patch("graph.fast.writer._judge", side_effect=judge):
+                        task = asyncio.create_task(rewrite_pending_pages(
+                            pending=pages[resumed:], results=results, pages=pages,
+                            lines=[f"原文{page.number}" for page in pages], units=[], model=object(),
+                            config=WikiConfig(policy="fast", rewrite_concurrency=2),
+                            work_root=root / "work", wiki_root=root / "wiki", state_root=root / "state",
+                            source_path=root / "仕様書.md", source_snapshot_path=root / "source.md",
+                            source_sha256="a" * 64, source_line_count=len(pages), rewrite_version="test",
+                            stop_check=None, on_progress=on_event, parents=None,
+                        ))
+                        try:
+                            await asyncio.wait_for(first_finished.wait(), timeout=3)
+                            await asyncio.wait_for(last_started.wait(), timeout=3)
+                            phase = progress._phases[("仕様書.docx", "writer")]
+                            self.assertEqual(phase.current, resumed + 1)
+                            self.assertFalse(phase.reported)
+                            self.assertNotIn(("仕様書.docx", "writer-save"), progress._phases)
+                            self.assertFalse((root / "wiki" / pages[resumed].filename).exists())
+                            self.assertFalse(task.done())
+                        finally:
+                            release.set()
+                            await asyncio.wait_for(task, timeout=3)
+
+                try:
+                    with self.assertLogs("graph.fast.writer", level="INFO") as captured:
+                        asyncio.run(scenario())
+                    generated = [event for event in events if event["stage"] == "writer" and event["step"] == "page_done"]
+                    self.assertEqual(len(generated), len(pages))
+                    self.assertEqual(generated[resumed]["status"], "verbatim" if fallback else "generated")
+                    self.assertTrue(progress._phases[("仕様書.docx", "writer")].reported)
+                    saves = progress._phases[("仕様書.docx", "writer-save")]
+                    self.assertTrue(saves.reported)
+                    self.assertEqual((saves.current, saves.total), (2, 2))
+                    for page in pages[resumed:]:
+                        self.assertTrue((root / "wiki" / page.filename).exists())
+                        self.assertTrue((root / "state" / "pages" / f"{page.number:03d}.json").exists())
+                    first_body = (root / "wiki" / pages[resumed].filename).read_text()
+                    self.assertIn(f"確認後の見出し{pages[-1].number}", first_body)
+                    self.assertIn("原文を使用" if fallback else "生成・確認済み", "\n".join(captured.output))
+                finally:
+                    progress.close()
+
+
+class ActivityReadabilityTests(TempLogCase):
+    def test_unavailable_activity_api_has_one_actionable_warning_and_debug_trace(self):
+        import httpx
+        from graph.growi.client import GrowiClient
+        from publisher.activity import ActivityDetector
+        from runner.logging_support import file_logging
+
+        for message, expected in (("AuditLog is not enabled", "監査ログが無効"),
+                                  ("Method not allowed", "変更履歴APIを利用できません")):
+            with self.subTest(message=message):
+                self.tmp = Path(tempfile.mkdtemp())
+                client = GrowiClient("https://example.invalid", "", transport=httpx.MockTransport(
+                    lambda request: httpx.Response(405, json={"errors": [{"message": message}]})))
+                detector = ActivityDetector(SimpleNamespace(metadata=self.tmp),
+                                            endpoint=client.url, boundary="/test")
+                live, debug = self.handlers()
+                with file_logging([live, debug]):
+                    batch = detector.poll(client, {})
+                self.assertEqual(batch.fallback_reason, "activity_api_unavailable")
+                body = self.text("live.log")
+                self.assertEqual(len(body.splitlines()), 1, body)
+                self.assertIn("警告", body)
+                self.assertIn(expected, body)
+                self.assertIn("全ページを確認", body)
+                self.assertIn("対象=/test", body)
+                self.assertNotIn("GrowiAPIError", body)
+                self.assertNotIn(TRACE_HEAD, body)
+                self.assertIn(TRACE_HEAD, self.text("debug.log"))
+                self.assertIn(message, self.text("debug.log"))
 
 
 class _ListHandler(logging.Handler):

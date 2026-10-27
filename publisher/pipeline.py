@@ -50,7 +50,7 @@ def _progress_heartbeat(
     stage: str,
     file: str,
     document: str | None = None,
-    interval: float = 10.0,
+    interval: float = 60.0,
 ):
     if callback is None:
         yield
@@ -963,7 +963,7 @@ def sync_once(
                 previous_source.get("source_sha256") if not previous_source.get("last_error") else ""
             ) or "")
             try:
-                log.debug("文書の解析を開始します: 実行ID=%s、パス=%s", run_id, rel)
+                log.debug("文書の解析を開始します", extra={"debug_fields": {"run_id": run_id, "path": rel}})
                 if on_progress:
                     on_progress({
                         "stage": "parse",
@@ -1745,13 +1745,16 @@ def pull_growi_once(settings: Any, *, force_inventory: bool = False) -> dict[str
     human_sync = dict(getattr(publisher, "human_sync_summary", {}))
     if not failures:
         checked = int(detector.get("authoritative_pages_fetched", 0) or 0)
+        mode = human_sync.get("mode", getattr(settings, "human_sync_mode", "off"))
+        mode = getattr(mode, "value", mode)
+        mode_label = {"off": "無効", "observe": "確認のみ", "apply": "有効"}.get(str(mode), str(mode))
         log.info(
-            "GROWIでの編集確認が完了しました: 方式=%s、対象ページ数=%d、取り込み数=%d、停止数=%d、復旧数=%d",
-            human_sync.get("mode", getattr(settings, "human_sync_mode", "off")),
+            "GROWIの編集確認が完了しました: %dページ確認、%d件取り込み、%d件保留、%d件復旧（編集取り込み=%s）",
             checked,
             int(human_sync.get("captured", 0) or 0),
             int(human_sync.get("blocked", 0) or 0),
             int(human_sync.get("recovered", 0) or 0),
+            mode_label,
         )
         log.debug(
             "GROWIからの取り込みが完了しました: 実行ID=%s、確認数=%d、判定結果=%s、代替処理=%s",

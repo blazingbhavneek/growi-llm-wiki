@@ -219,16 +219,21 @@ def model_pair(config: WikiConfig) -> ModelPair:
     )
     concurrency = max(1, int(config.rewrite_concurrency))
     gate = _gate(writer_config, judge_config, concurrency)
-    # One line per run so a later 401 or timeout can be attributed to one of these endpoints.
-    # ``fallback`` means the judge/writer key was blank and the chat key is being reused.
-    log.info(
-        "高速処理のモデル設定: 本文生成の接続先=%s、生成モデル=%s、確認の接続先=%s、確認モデル=%s、生成用キー=%s、確認用キー=%s",
-        writer_config.chat_base_url,
-        writer_config.chat_model,
-        judge_config.chat_base_url,
-        judge_config.chat_model,
-        "set" if config.writer_api_key else "chat fallback",
-        "set" if config.judge_api_key else "chat fallback",
+    # Connection diagnostics belong in debug.log; this factory also runs for candidates.
+    log.debug(
+        "高速処理のモデル設定",
+        extra={"debug_fields": {
+            "writer": {
+                "base_url": writer_config.chat_base_url,
+                "model": writer_config.chat_model,
+                "credential_source": "専用キー" if config.writer_api_key else ("確認用キーを共用" if config.judge_api_key else "共通キーを使用"),
+            },
+            "judge": {
+                "base_url": judge_config.chat_base_url,
+                "model": judge_config.chat_model,
+                "credential_source": "専用キー" if config.judge_api_key else "共通キーを使用",
+            },
+        }},
     )
     return FastModelPair(
         FastModelPort(writer_config, gate=gate, role="writer"),

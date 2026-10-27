@@ -111,7 +111,9 @@ For any line showing `DOWN`, check that the service is running and that the URL 
 .venv/bin/python main.py -v sync --project test
 ```
 
-`-v` prints per-document progress. Repeated `waiting` lines every 10 seconds during a large-file conversion mean the conversion is in progress, not that it failed. A test-sized run finishes in a few minutes.
+The terminal shows document counts and progress for the current phase (`-v` remains as a compatibility flag). Read `logs/<name>/live.log` for normal progress and `debug.log` for endpoints, internal events, and exception details. During a long conversion or generation, the display and `live.log` report continued processing about every 60 seconds. A test-sized run finishes in a few minutes.
+
+In fast mode, the generation counter advances as each page finishes generation and checking. Saving the wiki and publishing to GROWI appear as separate, subsequent phases.
 
 `sync` is the main command of this tool and works in this order:
 
@@ -255,7 +257,7 @@ concurrency = 2
 
 ## 8. Operations Commands
 
-So far you only used `check` and `sync`. Regular operation uses these four commands; every one takes `--project <name>` (add `-v` for per-document progress).
+So far you only used `check` and `sync`. Regular operation uses these four commands; every one takes `--project <name>` (`sync` shows progress automatically).
 
 <table>
   <thead>
@@ -434,5 +436,15 @@ Set them in the root `.env`. The top block of `.env` holds the settings you chan
 - `<data_root>/<name>/wiki/`: generated pages
 - `<data_root>/<name>/metadata/`: publish state, watch queue
 - `logs/<name>/`: size-rotating `live.log` (INFO and above, 1 MB x 100 files, one Japanese line per record), `debug.log` (everything incl. tracebacks, 10 MB x 100 files), and the token/URL-redacted `failed_docs.md` summary
+
+`debug.log` uses blocks separated by blank lines: a header with the timestamp, level, run ID and logger, followed by indented fields. Progress headers also include an event code such as `parse.start`. Field names match the code, and complete filenames and diagnostic values are retained. Collections, model settings and full exception chains stay together in the same record.
+
+```text
+2026-10-27 16:55:34.582 DEBUG run=example runner.cli | parse.start
+  document: (社外秘)制御機能仕様書【3章】_docx.md
+  file: (社外秘)制御機能仕様書【3章】.docx
+  parser: docx
+  bytes: 548969
+```
 
 Deleting `<data_root>/<name>/` removes the local publish state while the GROWI pages stay (use `reset` to delete them). Logs and generated content contain internal documents; set access rights and retention to match your operational policy.
