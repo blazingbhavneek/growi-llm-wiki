@@ -713,6 +713,33 @@ class HumanSyncTests(unittest.TestCase):
         self.assertIn("Human annotation.", entries[0])
         self.assertIn("この部分は削除されました", entries[0])
 
+    def test_appendix_registration_reuses_navigation_without_inventing_source_coverage(self):
+        pages = {"028-Last.md": "# Last\n\nBody.\n\n---\n\n親: [Root](001-Root.md) ｜ 前のページ: [Before](027-Before.md)\n",
+                 "029-付録.md": "# 付録\n\nHuman memo.\n"}
+        doc = {"appendix": "029-付録.md"}
+        coverage_path = self.project.wiki_dir("") / "_planning" / "coverage.json"
+        source = {"filename": "付録.md", "source_start": 1, "source_end": 4}
+        hc.write_json_atomic(coverage_path, {"file_count": 1, "files": [source]})
+        metadata = self.store._publication("input.md", doc, pages)
+        self.assertIn("親: [Root](001-Root.md) ｜ 前のページ: [Before](027-Before.md) ｜ 次のページ: [付録](029-付録.md)", pages["028-Last.md"])
+        self.assertTrue(pages["029-付録.md"].endswith("前のページ: [Last](028-Last.md)\n"))
+        self.assertEqual(metadata["coverage.json"]["file_count"], 2)
+        self.assertEqual(metadata["coverage.json"]["files"][0], source)
+        self.assertEqual(metadata["coverage.json"]["files"][-1]["filename"], "付録.md")
+        self.assertNotIn("source_start", metadata["coverage.json"]["files"][-1])
+        self.assertEqual(metadata["manifest.json"]["files"][0]["source_ranges"], [])
+        self.assertEqual(hc.read_json(coverage_path)["files"], [source])
+        for filename, data in metadata.items():
+            if filename != "navigation":
+                hc.write_json_atomic(coverage_path.parent / filename, data)
+        before = dict(pages)
+        self.assertEqual(self.store._publication("input.md", doc, pages), metadata)
+        self.assertEqual(pages, before)
+        pages["029-付録.md"] += "\nAnother memo.\n"
+        self.store._publication("input.md", doc, pages)
+        self.assertIn("Human memo.", pages["029-付録.md"])
+        self.assertLess(pages["029-付録.md"].index("Another memo."), pages["029-付録.md"].index("前のページ:"))
+
     def test_multiple_conflicts_on_one_line_make_one_complete_note(self):
         old = "The limit is 110 seconds (11).\n"
         human = "The limit is 125 seconds (12-human).\n"
