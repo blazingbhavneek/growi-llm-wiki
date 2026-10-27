@@ -69,6 +69,8 @@ class WikiConfig(BaseModel):
     output_language: str = "Japanese (日本語)"
     # page file name -> what human editors want that page to look like (publisher/human_changes.py)
     human_guidance: dict[str, list[str]] = Field(default_factory=dict)
+    # Previous plan names used to preserve page identity across a full re-plan.
+    identity_hints: list[str] = Field(default_factory=list)
     prompt_version: str = PROMPT_VERSION
     resume: bool = True
     # Tier-2 updates must resume the stored plan; never silently re-plan.

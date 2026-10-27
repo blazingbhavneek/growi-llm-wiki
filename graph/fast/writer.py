@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
 from common.policy import policy_of
 from graph.wiki.model import judge_model, writer_model
-from graph.wiki.page import PLACEHOLDER_RE
+from graph.wiki.page import PLACEHOLDER_RE, check_section
 from graph.wiki.storage import slice_text, write_text_atomic
 
 from .passes import bounded_map
@@ -36,6 +37,11 @@ from .repair import (
     _write_artifacts,
 )
 from .wiki import append_low_coverage_source, recent_writer_context
+
+
+_VALUE_WITH_UNIT = re.compile(
+    r"[+-]?\d+(?:[.,]\d+)*\s*(?:時間|kPa|MPa|kg|mm|cm|Hz|ms|°C|秒|分|日|回|件|個|台|年|月|%|℃|g|m|V|A|W|s)"
+)
 
 
 @dataclass
@@ -78,6 +84,22 @@ def _source_body(
         ]
         chunks.append(wiki._verbatim_section(lines, start, end, range_units).rstrip())
     return "\n\n".join(chunks).rstrip() + "\n"
+
+
+def _value_errors(source: str, draft: str) -> list[str]:
+    """Flag possible value/row loss for semantic review."""
+    normal = lambda text: unicodedata.normalize("NFKC", text)
+    values = lambda text: {re.sub(r"\s+", "", match.group()) for match in _VALUE_WITH_UNIT.finditer(normal(text))}
+    missing = sorted(values(source) - values(draft))
+    errors = ["原文の単位付き数値が本文から消えている: " + ", ".join(missing[:40])] if missing else []
+    divider = re.compile(r"\|?\s*:?-{3,}:?(?:\s*\|\s*:?-{3,}:?)+\s*\|?")
+    rows = lambda text: len(re.findall(r"<tr\b", text, re.I)) + sum(
+        line.lstrip().startswith("|") and not divider.fullmatch(line.strip())
+        for line in text.splitlines()
+    )
+    if rows(draft) < rows(source):
+        errors.append("原文より表の行数が少ない。全ての表行とセルの意味を残すこと。")
+    return errors
 
 
 def _prepare_session(
@@ -182,6 +204,7 @@ async def _generate_page(
 
     page = session.page
     prompt_page = session.prompt_page
+    policy = policy_of(config)
     fallback = _source_body(page, lines=lines, units=session.page_units)
     if model is None:
         return _GenerationOutcome(
@@ -231,6 +254,7 @@ async def _generate_page(
                 ],
                 artifacts=session.artifacts,
             )
+            candidate_title = page.title
         except Exception as exc:
             error = f"writer unavailable: {type(exc).__name__}: {exc}"[:1000]
             errors.append(error)
@@ -255,6 +279,16 @@ async def _generate_page(
             current_title, current_body = candidate_title, candidate_body
             continue
 
+        content_errors = check_section(
+            candidate_body,
+            lines=lines,
+            source_text=session.raw_source,
+            block_ranges=(),
+            placeholders=[],
+            facts=[],
+            check_identifiers=True,
+            tokens=policy.code_tokens,
+        ) + _value_errors(session.raw_source, candidate_body)
         verdict, judge_error = await _judge(
             prompt_page,
             candidate_title,
@@ -262,6 +296,7 @@ async def _generate_page(
             model=judge_model(model),
             stem=f"rewrite-{attempt:02d}-judge",
             artifacts=session.artifacts,
+            findings=content_errors,
         )
         current_title, current_body = candidate_title, candidate_body
         if verdict is None:
@@ -272,6 +307,15 @@ async def _generate_page(
                 item for item in feedback if item not in feedback_history
             )
             continue
+
+        title_only = (
+            verdict.coverage_score >= 80
+            and not verdict.body_defects
+            and not verdict.missing_important_information
+        )
+        verdict.title_defects = []
+        if title_only:
+            verdict.approved = True
 
         rank = _judge_rank(verdict, attempt=attempt)
         if rank > best_rank:
@@ -398,14 +442,6 @@ async def rewrite_pending_pages(
         max(1, int(config.rewrite_concurrency)),
         generate,
     )
-
-    # Final titles must be known before cross-page links and navigation are made.
-    for outcome in outcomes:
-        page = outcome.session.page
-        previous_title = page.title
-        page.title = outcome.title
-        if page.path and page.path[-1] == previous_title:
-            page.path[-1] = outcome.title
 
     for outcome in outcomes:
         session = outcome.session

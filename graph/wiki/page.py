@@ -32,7 +32,7 @@ REFERENCE_MARKER_RE = re.compile(r"（参照元:\s*原文\s*(\d+)\s*(?:[-–—]
 READER_REFERENCE_RE = re.compile(
     r"（(?:参照元:\s*(?:\[[^\]\n]*\]\([^\n]*?\)\s*)?)?原文\s*\d+\s*(?:[-–—]\s*\d+\s*)?行）"
 )
-MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]\n]*\]\([^\n]*?\)")
+MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]\n]*\]\((?:[^()\n]|\([^()\n]*\))*\)")
 INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 PLACEHOLDER_RE = re.compile(r"\[\[NEO-IMAGE:[A-Za-z0-9_-]+\]\]")

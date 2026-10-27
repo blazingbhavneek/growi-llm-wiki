@@ -303,7 +303,7 @@ def _undo_edits(text: str, edits: list[dict[str, Any]]) -> tuple[str, str]:
             number = token_lines[0]
             lines[number] = lines[number].replace(token, anchor, 1)
             continue
-        if before in lines:
+        if before in lines or not token_lines:
             continue
         return text, f"could not locate generated link [{anchor}]({url})"
     cleaned = "\n".join(lines) + ("\n" if trailing else "")
@@ -869,7 +869,7 @@ async def _judge_candidates(
     return plans, failures, calls
 
 
-_MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]]+\]\([^)]+\)")
+_MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]]+\]\((?:[^()\n]|\([^()\n]*\))*\)")
 _INLINE_CODE = re.compile(r"`[^`]*`")
 
 
@@ -887,9 +887,11 @@ def _wrap_once(text: str, anchor: str, url: str) -> tuple[str, dict[str, Any] | 
         stripped = line.lstrip()
         if (
             flags[number]
-            or stripped.startswith(("#", "|", "<", "[[NEO-IMAGE", "!["))
+            or stripped.startswith(("#", ">", "|", "<", "[[NEO-IMAGE", "!["))
             or "前のページ:" in line
             or "次のページ:" in line
+            or "元ページ:" in line
+            or "元文書の更新" in line
         ):
             continue
         blocked = [match.span() for regex in (_MARKDOWN_LINK, _INLINE_CODE) for match in regex.finditer(line)]
@@ -908,7 +910,7 @@ def _wrap_once(text: str, anchor: str, url: str) -> tuple[str, dict[str, Any] | 
     return text, None
 
 
-def _apply_links(project: Any, pages: list[Page], plans: list[PlannedLink], settings: Any) -> dict[str, Any]:
+def _apply_links(project: Any, pages: list[Page], plans: list[PlannedLink], settings: Any, *, force: bool = False) -> dict[str, Any]:
     by_page: dict[str, list[PlannedLink]] = {}
     seen: set[tuple[str, str, str]] = set()
     for plan in sorted(plans, key=lambda item: (
@@ -929,7 +931,27 @@ def _apply_links(project: Any, pages: list[Page], plans: list[PlannedLink], sett
     for page in pages:
         text = page.text
         edits: list[dict[str, Any]] = []
-        for plan in by_page.get(page.rel, [])[:limit]:
+        previous = manifest_pages.get(page.rel)
+        lines = text.splitlines()
+        fenced = _fence_flags(lines)
+        unchanged = isinstance(previous, dict) and previous.get("base_sha256") == sha256_text(text)
+        for cached in (previous or {}).get("edits", []) if not force else []:
+            target = cached.get("target") or posixpath.normpath(posixpath.join(posixpath.dirname(page.rel), cached["url"]))
+            matches = [i for i, line in enumerate(lines) if line == cached["before"]]
+            index = int(cached.get("line", -1)) if unchanged else (matches[0] if len(matches) == 1 else -1)
+            replayed, eligible = _wrap_once(cached["before"], cached["anchor"], cached["url"])
+            if (len(edits) < limit and (Path(project.wiki) / target).is_file()
+                    and 0 <= index < len(lines) and not fenced[index] and lines[index] == cached["before"]
+                    and eligible and replayed == cached["after"]):
+                lines[index] = cached["after"]
+                edits.append({**cached, "line": index})
+                links += 1
+        text = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+        for plan in by_page.get(page.rel, []):
+            if len(edits) >= limit:
+                break
+            if any(edit.get("target") == plan.target_page.rel and edit["anchor"] == plan.anchor for edit in edits):
+                continue
             url = posixpath.relpath(plan.target_page.rel, posixpath.dirname(page.rel) or ".")
             text, edit = _wrap_once(text, plan.anchor, url)
             if edit is not None:
@@ -942,7 +964,6 @@ def _apply_links(project: Any, pages: list[Page], plans: list[PlannedLink], sett
         # it even when this run selected no replacement links, otherwise links from the
         # preceding run would remain visible after their manifest entry was dropped.
         current = page.path.read_text(encoding="utf-8")
-        previous = manifest_pages.get(page.rel)
         new_row = (
             {
                 "base_sha256": sha256_text(page.text),
@@ -1090,7 +1111,7 @@ async def _link_async(
     manifest["documents"] = completed
     write_json_atomic(_manifest_path(output), manifest)
     output_pages = [replace(page, path=Path(output.wiki) / page.rel) for page in pages if page.document in pending]
-    changed = _apply_links(output, output_pages, plans, settings)
+    changed = _apply_links(output, output_pages, plans, settings, force=force)
     accepted = _manifest(output)
     accepted["documents"] = {doc: row for doc, row in completed.items() if doc in documents}
     for doc in pending:

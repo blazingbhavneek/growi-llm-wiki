@@ -2062,10 +2062,20 @@ def reset_growi(
         raise RuntimeError("GROWI_URL is required for reset")
     ledger_path = project.metadata / "pipeline.json"
     with _lock(project):
-        deleted = publisher.reset(on_progress=on_progress)
+        ledger = load_ledger(ledger_path)
+        _pulled, failures, _blocked = _capture_remote(project, ledger, publisher, on_progress=on_progress)
+        save_ledger(ledger_path, ledger)
+        if (project.root / ".git").is_dir():
+            from .history import checkpoint_live
+
+            checkpoint_live(project, "capture GROWI before reset")
+        if failures:
+            return {"run_id": "reset-blocked", "done": [], "failures": failures}
+        deleted = publisher.reset(on_progress=on_progress, **(
+            {"known_pages": ledger.published_pages} if isinstance(publisher, GrowiPublisher) else {}
+        ))
         from publisher.index import delete_index_pages
         delete_index_pages(settings, on_progress=on_progress)  # index pages carry no chunk marker, reset() skips them
-        ledger = load_ledger(ledger_path)
         ledger.published_documents.clear()
         ledger.published_pages.clear()
         save_ledger(ledger_path, ledger)

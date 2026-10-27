@@ -58,6 +58,9 @@ data_big_backup2/
 data_big_backup3/
 data_backups/
 data_backup/
+docs/
+test_backup/
+cx/
 
 # Local secrets
 .env

@@ -54,6 +54,7 @@ class FastModelPort(ChatModelPort):
         writer_limit = (
             min(
                 FAST_WRITER_MAX_OUTPUT_TOKENS,
+                max(1, int(self.config.write_max_output_tokens)),
                 max(1, int(max_output_tokens or FAST_WRITER_MAX_OUTPUT_TOKENS)),
             )
             if self.role == "writer"
@@ -75,6 +76,9 @@ class FastModelPort(ChatModelPort):
         temperature: float | None = None,
     ) -> BaseModel:
         from graph.clients.chat import structured_ainvoke
+
+        if max_output_tokens is None:
+            return await super().structured(schema, messages, temperature=temperature)
 
         requested = int(max_output_tokens or JUDGE_MAX_OUTPUT_TOKENS)
         limit = min(JUDGE_MAX_OUTPUT_TOKENS, max(1, requested))

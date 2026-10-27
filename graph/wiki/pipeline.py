@@ -236,14 +236,18 @@ def _page_provenance(
     }
 
 
-def _plan_pages(plan: CompiledSeedPlan) -> list[SeedPage]:
+def _plan_pages(plan: CompiledSeedPlan, *, keep: Sequence[str] = ()) -> list[SeedPage]:
     """Give the already validated sequential ranges stable numbered filenames."""
 
     pages: list[SeedPage] = []
     used_names: set[str] = set()
+    previous: dict[str, list[str]] = {}
+    for name in keep:
+        previous.setdefault(re.sub(r"^\d+-", "", Path(name).stem), []).append(name)
     for number, entry in enumerate(plan.pages, start=1):
         stem = slugify(entry.title or f"document-section-{number}", fallback=f"page-{number}")
-        filename = f"{number:03d}-{stem}.md"
+        candidates = previous.get(stem, [])
+        filename = candidates.pop(0) if candidates else f"{number:03d}-{stem}.md"
         if filename.casefold() in used_names:
             suffix = 2
             while f"{number:03d}-{stem}-{suffix}.md".casefold() in used_names:
@@ -890,6 +894,7 @@ def _load_seed_plan(
     source_line_count: int,
     prompt_version: str,
     single_page_rewrite: bool = False,
+    accept_stale_version: bool = False,
 ) -> list[SeedPage] | None:
     """Load the completed seed plan so a stopped run resumes at rewriting."""
 
@@ -901,7 +906,7 @@ def _load_seed_plan(
             return None
         if int(raw.get("source_line_count", 0)) != source_line_count:
             return None
-        if raw.get("prompt_version") != prompt_version:
+        if raw.get("prompt_version") != prompt_version and not accept_stale_version:
             return None
         if bool(raw.get("single_page_rewrite", False)) != single_page_rewrite:
             return None
@@ -1186,6 +1191,7 @@ def _resume_rewritten_page(
     *,
     rewrite_version: str,
     source_line_count: int,
+    accept_stale_version: bool = False,
 ) -> RewriteResult | None:
     """Reuse a page whose sidecar state still matches the file on disk."""
 
@@ -1195,7 +1201,7 @@ def _resume_rewritten_page(
         markdown = output_path.read_text(encoding="utf-8")
         state = read_json(state_path)
         if (
-            state.get("rewrite_version") != rewrite_version
+            (state.get("rewrite_version") != rewrite_version and not accept_stale_version)
             or state.get("filename") != page.filename
             or state.get("content_sha256") != sha256_text(markdown)
         ):
@@ -1687,6 +1693,7 @@ async def _rewrite_all(
                 output_path, state_path, page,
                 rewrite_version=rewrite_version,
                 source_line_count=source_line_count,
+                accept_stale_version=config.require_resume,
             )
             if config.resume
             else None
@@ -1890,6 +1897,7 @@ async def run_pipeline(
         source_line_count=len(lines),
         prompt_version=policy.cache_key(SEED_PLAN_VERSION),
         single_page_rewrite=single_page_rewrite,
+        accept_stale_version=config.require_resume,
     ) if config.resume else None
     if pages is not None:
         block_index = build_block_index(lines)
@@ -1926,7 +1934,7 @@ async def run_pipeline(
             _store_plan_cache(plan_cache, source_text, lines, config, seed_plan)
             plan_kind = "single_page" if single_page_rewrite else "structural" if structural else "llm"
         _emit(on_progress, "seed", plan_kind, pages=len(seed_plan.pages))
-        pages = _plan_pages(seed_plan)
+        pages = _plan_pages(seed_plan, keep=config.identity_hints)
         _verify_ranges(pages, len(lines))
 
     for page in pages:

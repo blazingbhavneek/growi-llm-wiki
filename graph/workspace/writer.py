@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from graph.config import app_concurrency
 
@@ -298,7 +298,8 @@ class WriteResult:
     regenerated_pages: list[str] = field(default_factory=list)
     human_edits_overwritten: list[str] = field(default_factory=list)
 def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kind: str = "md", require_resume: bool = False,
-                human_guidance: dict[str, list[str]] | None = None):
+                human_guidance: dict[str, list[str]] | None = None,
+                identity_hints: list[str] | None = None):
     from graph.wiki.config import WikiConfig
     from common.policy import policy_of
 
@@ -340,6 +341,7 @@ def wiki_config(settings: Any, *, run_dir: Path, resume: bool = True, source_kin
         slide_title=getattr(settings, "slide_title", r"^### (.+?)\s*$"),
         pdf_use_headings=bool(getattr(settings, "pdf_use_headings", False)),
         human_guidance=dict(human_guidance or {}),
+        identity_hints=list(identity_hints or ()),
         tabular_slice_records=int(getattr(settings, "tabular_slice_records", 40)),
         tabular_preview_rows=int(getattr(settings, "tabular_preview_rows", 12)),
         tabular_preview_cols=int(getattr(settings, "tabular_preview_cols", 12)),
@@ -360,13 +362,15 @@ def run_wiki(
     source_kind: str = "md",
     require_resume: bool = False,
     human_guidance: dict[str, list[str]] | None = None,
+    identity_hints: list[str] | None = None,
 ) -> Path:
     from graph.common.async_tools import run_async_blocking
     from graph.wiki.pipeline import run_pipeline
     from graph.wiki.model import ChatModelPort
 
     config = wiki_config(settings, run_dir=run_dir, resume=resume, source_kind=source_kind,
-                         require_resume=require_resume, human_guidance=human_guidance)
+                         require_resume=require_resume, human_guidance=human_guidance,
+                         identity_hints=identity_hints)
     model = llm if hasattr(llm, "structured") and hasattr(llm, "text") else ChatModelPort(config, llm=llm) if llm is not None else None
     return run_async_blocking(
         run_pipeline(
@@ -395,6 +399,7 @@ def build_wiki_output(
     resume: bool = True,
     require_resume: bool = False,
     human_guidance: dict[str, list[str]] | None = None,
+    identity_hints: list[str] | None = None,
 ) -> SimpleNamespace:
     source_path = Path(source_path)
     out_dir = Path(out_dir)
@@ -447,6 +452,7 @@ def build_wiki_output(
             resume=resume,
             require_resume=require_resume,
             human_guidance=human_guidance,
+            identity_hints=identity_hints,
         )
         export_ingest_layout(run_root, out_dir, document_name=document_name)
         return SimpleNamespace(
@@ -507,10 +513,10 @@ def publish_output(staged: Path, target: Path) -> int:
     return count
 
 
-def _plan_filenames(state_root: Path) -> set[str]:
+def _plan_filenames(state_root: Path) -> list[str]:
     from graph.wiki.storage import read_json
 
-    return {str(page["filename"]) for page in read_json(Path(state_root) / "state" / "plan.json", default={}).get("pages", [])}
+    return [str(page["filename"]) for page in read_json(Path(state_root) / "state" / "plan.json", default={}).get("pages", [])]
 
 
 def _wiki_run_complete(state_root: Path) -> bool:
@@ -523,7 +529,8 @@ def _wiki_run_complete(state_root: Path) -> bool:
     )
 
 
-def _page_hashes(folder: Path, names: set[str]) -> dict[str, str]:
+def _page_hashes(folder: Path, names: Iterable[str]) -> dict[str, str]:
+    names = set(names)
     return {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted(Path(folder).glob("*.md"))
@@ -709,6 +716,7 @@ def write_wiki_pages(
                 mode=mode, settings=settings, llm=llm, embedder=embedder,
                 state_dir=state_root, on_progress=on_progress, stop_check=stop_check,
                 source_kind=kind, resume=resume_initial_build, human_guidance=guidance,
+                identity_hints=names,
             ).out_dir
         # A rebuilt workbook republishes and relinks as a whole (the linker's caches make
         # unchanged sheets cheap); only its 解説 regeneration is incremental.
