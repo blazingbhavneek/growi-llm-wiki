@@ -207,7 +207,11 @@ def read_lines(path: Path) -> list[str]:
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        log.error("artifact write failed path=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        raise
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -1013,8 +1017,15 @@ async def structured_ainvoke(
     request_timeout = getattr(llm, "request_timeout", None)
     try:
         hard_timeout = float(request_timeout) if request_timeout is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
         hard_timeout = None
+        log.error(
+            "invalid model timeout setting setting=model_timeout value=%r error=%s: %s; timeout disabled",
+            request_timeout,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
 
     async def invoke(runnable: Any, payload: list[Any]) -> Any:
         operation = runnable.ainvoke(payload)
@@ -1050,6 +1061,15 @@ async def structured_ainvoke(
         # A timed-out prompt will time out again; re-sending it twice more only
         # triples the loss. Let the caller's retry policy decide.
         if isinstance(structured_error, TimeoutError) or "Timeout" in type(structured_error).__name__:
+            log.error(
+                "model call timed out schema=%s model=%s timeout=%s error=%s: %s",
+                schema_cls.__name__,
+                getattr(llm, "model_name", ""),
+                hard_timeout,
+                type(structured_error).__name__,
+                structured_error,
+                exc_info=True,
+            )
             raise
         schema_json = json.dumps(schema_cls.model_json_schema(), indent=2)
         last_error: Exception = structured_error
@@ -1082,7 +1102,26 @@ async def structured_ainvoke(
                 return schema_cls.model_validate(data)
             except Exception as fallback_error:
                 last_error = fallback_error
+                log.debug(
+                    "structured fallback attempt failed schema=%s attempt=%s error=%s: %s",
+                    schema_cls.__name__,
+                    retry + 1,
+                    type(fallback_error).__name__,
+                    fallback_error,
+                    exc_info=True,
+                )
 
+        log.error(
+            "model structured call failed schema=%s model=%s attempts=%s error=%s: %s last_error=%s: %s",
+            schema_cls.__name__,
+            getattr(llm, "model_name", ""),
+            2,
+            type(structured_error).__name__,
+            structured_error,
+            type(last_error).__name__,
+            last_error,
+            exc_info=True,
+        )
         raise last_error from structured_error
 
 
@@ -1924,6 +1963,14 @@ async def split_window_until_valid(
 
     if CHUNK_FALLBACK_MECHANICAL:
         fallback_title = f"{label} 自動分割"
+        log.error(
+            "concept split failed label=%s lines=%s-%s attempts=%s error=%s; mechanical fallback used",
+            label,
+            source_start,
+            source_end,
+            PARTITION_RETRY_ATTEMPTS,
+            repr(last_error)[:200],
+        )
         log.debug(
             f"[Planning] {label}: using mechanical fallback after "
             f"{PARTITION_RETRY_ATTEMPTS} attempts. Last error: {last_error}"
@@ -2102,7 +2149,11 @@ def write_concept_plan_document(
 
     lines.append("")
 
-    path.write_text("\n".join(lines), encoding="utf-8")
+    try:
+        path.write_text("\n".join(lines), encoding="utf-8")
+    except Exception as exc:
+        log.error("artifact write failed path=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        raise
 
 
 # ---------------------------------------------------------------------
@@ -2442,7 +2493,13 @@ async def enrich_concept_plan(
         )
         global_name = GlobalName.model_validate(global_name_raw).inferred_file_name
     except Exception as e:
-        log.debug(f"[Enrichment] Failed to infer global name: {e}. Using fallback.")
+        log.error(
+            "enrichment failed stage=global-name document=%s error=%s: %s",
+            original_filename,
+            type(e).__name__,
+            e,
+            exc_info=True,
+        )
         global_name = "ドキュメント.md"
 
     if not global_name.endswith(".md"):
@@ -2464,7 +2521,14 @@ async def enrich_concept_plan(
         )
         first_header = ChunkHeader.model_validate(first_raw).header
     except Exception as e:
-        log.debug(f"[Enrichment] Failed to infer header for chunk 1: {e}. Using fallback.")
+        log.error(
+            "enrichment failed stage=chunk-header document=%s chunk=1/%s error=%s: %s",
+            original_filename,
+            len(files),
+            type(e).__name__,
+            e,
+            exc_info=True,
+        )
         first_header = "一般"
     inferred_headers.append(first_header)
 
@@ -2483,9 +2547,14 @@ async def enrich_concept_plan(
             raw = await structured_ainvoke(llm, ChunkHeader, prompt, max_output_tokens=100)
             header = ChunkHeader.model_validate(raw).header
         except Exception as e:
-            log.debug(
-                f"[Enrichment] Failed to infer header for chunk {i+1}: {e}. "
-                "Using fallback."
+            log.error(
+                "enrichment failed stage=chunk-header document=%s chunk=%s/%s error=%s: %s",
+                original_filename,
+                i + 1,
+                len(files),
+                type(e).__name__,
+                e,
+                exc_info=True,
             )
             header = "一般"
         inferred_headers.append(header)
@@ -2677,7 +2746,17 @@ async def arun_chunk_pipeline(
     planning_dir = out_dir / "_planning"
 
     if CLEAN_OUTPUT and out_dir.exists():
-        shutil.rmtree(out_dir)
+        try:
+            shutil.rmtree(out_dir)
+        except OSError as exc:
+            log.error(
+                "clean output failed path=%s error=%s: %s; old output may mix with new",
+                out_dir,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
 
     out_dir.mkdir(parents=True, exist_ok=True)
     docs_dir.mkdir(parents=True, exist_ok=True)
@@ -2718,32 +2797,85 @@ async def arun_chunk_pipeline(
         )
 
     else:
-        concept_files = await plan_concept_files_streaming(
-            llm=llm,
-            source_lines=source_lines,
-            target_lines=100,
-            max_extra=MAX_CHUNK_EXTRA,
-            concurrency=concurrency,
-            stop_check=stop_check,
-        )
+        try:
+            concept_files = await plan_concept_files_streaming(
+                llm=llm,
+                source_lines=source_lines,
+                target_lines=100,
+                max_extra=MAX_CHUNK_EXTRA,
+                concurrency=concurrency,
+                stop_check=stop_check,
+            )
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            log.error(
+                "wiki concept planning failed document=%s lines=%s error=%s: %s",
+                document_name,
+                source_line_count,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
 
-        assert_concept_coverage(
-            files=concept_files,
-            source_line_count=source_line_count,
-        )
+        try:
+            assert_concept_coverage(
+                files=concept_files,
+                source_line_count=source_line_count,
+            )
+        except Exception as exc:
+            log.error(
+                "wiki coverage gate failed document=%s lines=%s error=%s: %s",
+                document_name,
+                source_line_count,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
 
-        coverage = render_concept_files(
-            docs_dir=docs_dir,
-            source_lines=source_lines,
-            files=concept_files,
-            manifest=manifest,
-            output_root=out_dir,
-        )
+        try:
+            coverage = render_concept_files(
+                docs_dir=docs_dir,
+                source_lines=source_lines,
+                files=concept_files,
+                manifest=manifest,
+                output_root=out_dir,
+            )
+        except Exception as exc:
+            log.error(
+                "wiki page render failed document=%s pages=%s error=%s: %s",
+                document_name,
+                len(concept_files),
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
 
-        assert_rendered_docs_match_source(
-            source_lines=source_lines,
-            coverage=coverage,
-            output_root=out_dir,
+        try:
+            assert_rendered_docs_match_source(
+                source_lines=source_lines,
+                coverage=coverage,
+                output_root=out_dir,
+            )
+        except Exception as exc:
+            log.error(
+                "wiki render integrity gate failed document=%s pages=%s error=%s: %s",
+                document_name,
+                len(coverage),
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
+
+        log.info(
+            "wiki plan complete document=%s pages=%s source_lines=%s",
+            document_name,
+            len(concept_files),
+            source_line_count,
         )
 
         if on_progress:
@@ -2828,6 +2960,13 @@ async def arun_chunk_pipeline(
     )
 
     write_json(manifest_json_path, manifest)
+
+    log.info(
+        "wiki build complete document=%s pages=%s out_dir=%s",
+        document_name,
+        len(ordered_concept_files),
+        out_dir,
+    )
 
     if on_progress:
         on_progress(

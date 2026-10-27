@@ -1,6 +1,9 @@
 import argparse
 import json
+import logging
 import statistics
+
+log = logging.getLogger(__name__)
 
 
 def compare(reference_results, engine_results, max_abs=0.002):
@@ -34,18 +37,33 @@ def main():
     spec = importlib.util.spec_from_file_location("jev_reference", path / "jev_style_decision.py")
     module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
     runtime = module.JevStyleDecision(str(path), device=None if config.device == "auto" else config.device, dtype="float32")
-    rows = [json.loads(line) for line in open(args.fixture, encoding="utf-8") if line.strip()]
+    try:
+        rows = [json.loads(line) for line in open(args.fixture, encoding="utf-8") if line.strip()]
+    except Exception as exc:
+        # json's own message carries the line and column; it never names the file.
+        log.error("Jev parity fixture could not be read file=%s error=%s: %s", args.fixture, type(exc).__name__, exc, exc_info=True)
+        raise
     if args.limit: rows = rows[:args.limit]
     reference, actual = [], []
-    for row in rows:
-        q = row["question"]
-        ref = runtime.decide(row["state"], q["text"], options=q.get("options"), qtype=q.get("kind", "noul"))
-        from .types import JevResult
-        reference.append(JevResult("", ref["answer"], ref["probabilities"], ref["top_probability"], ref["entropy_concentration"], ref.get("input_tokens", 0)))
-        actual.append(engine.decide(row["state"], JevQuestion(q["text"], q.get("kind", "noul"), q.get("options"))))
+    for row_number, row in enumerate(rows, start=1):
+        try:
+            q = row["question"]
+            ref = runtime.decide(row["state"], q["text"], options=q.get("options"), qtype=q.get("kind", "noul"))
+            from .types import JevResult
+            reference.append(JevResult("", ref["answer"], ref["probabilities"], ref["top_probability"], ref["entropy_concentration"], ref.get("input_tokens", 0)))
+            actual.append(engine.decide(row["state"], JevQuestion(q["text"], q.get("kind", "noul"), q.get("options"))))
+        except Exception as exc:
+            # A KeyError names the missing fixture key; blank lines are filtered out, so the
+            # identity here is the fixture row number, not the raw file line.
+            log.error("Jev parity fixture row failed file=%s row=%d error=%s: %s", args.fixture, row_number, type(exc).__name__, exc, exc_info=True)
+            raise
     summary = compare(reference, actual, args.max_abs)
     print(json.dumps(summary, indent=2)); engine.close()
+    if not summary["passed"]:
+        log.error("Jev parity FAILED, the engine regressed against the reference fixture=%s items=%d max_abs=%s answer_flips=%d hard_flips=%d threshold=%s (the only other signal is exit code 1)", args.fixture, summary["items"], summary["max_abs"], summary["answer_flips"], summary["hard_flips"], args.max_abs)
     raise SystemExit(0 if summary["passed"] else 1)
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    from runner.logging_support import run_standalone
+    raise SystemExit(run_standalone(main))

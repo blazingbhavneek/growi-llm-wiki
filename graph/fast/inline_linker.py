@@ -342,6 +342,19 @@ def _undo_manifest_row(text: str, row: dict[str, Any]) -> tuple[str, str]:
     return text, error
 
 
+def _page_text(path: Path) -> str:
+    """Read a wiki page; a raw ``read_text`` traceback never names the file."""
+
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        log.error(
+            "wiki page could not be read path=%s error=%s: %s",
+            path, type(exc).__name__, exc, exc_info=True,
+        )
+        raise
+
+
 def _purge_extractions(project: Any) -> int:
     """Drop the extracted entity/behaviour facts so the next run re-runs the model pass."""
 
@@ -361,9 +374,17 @@ def _clean_existing(project: Any) -> tuple[dict[str, str], list[str]]:
     for rel, row in sorted(dict(manifest.get("pages", {})).items()):
         path = Path(project.wiki) / rel
         if not path.exists():
+            log.error(
+                "fast link manifest lists a page that is not in the wiki tree; its recorded links "
+                "cannot be undone page=%s path=%s", rel, path,
+            )
             continue
-        text, error = _undo_manifest_row(path.read_text(encoding="utf-8"), row)
+        text, error = _undo_manifest_row(_page_text(path), row)
         if error:
+            log.error(
+                "fast link undo failed; generated links remain on the published page page=%s error=%s",
+                rel, error,
+            )
             failures.append(f"{rel}: {error}")
         else:
             cleaned[rel] = text
@@ -373,16 +394,28 @@ def _clean_existing(project: Any) -> tuple[dict[str, str], list[str]]:
 def _inventory(project: Any, cleaned: dict[str, str]) -> list[Page]:
     pages: list[Page] = []
     wiki = Path(project.wiki)
-    for originals in sorted(wiki.rglob("_planning/pages")):
+    try:
+        planning_dirs = sorted(wiki.rglob("_planning/pages"))
+    except OSError as exc:
+        log.error(
+            "wiki page scan failed path=%s error=%s: %s (permission, unreadable mount, or too many open files?)",
+            wiki, type(exc).__name__, exc, exc_info=True,
+        )
+        raise
+    for originals in planning_dirs:
         document_dir = originals.parent.parent
         document = document_dir.relative_to(wiki).as_posix()
         folder = PurePosixPath(document).parent.as_posix()
         for original in sorted(originals.glob("*.md")):
             live = document_dir / original.name
             if not live.exists():
+                log.error(
+                    "planned page has no published page beside it; the page is skipped for linking page=%s",
+                    original.name,
+                )
                 continue
             rel = live.relative_to(wiki).as_posix()
-            text = cleaned.get(rel, live.read_text(encoding="utf-8"))
+            text = cleaned.get(rel, _page_text(live))
             pages.append(Page(rel, document, folder, _title(text, live.stem), live, text, _segments(text)))
     return pages
 
@@ -488,8 +521,14 @@ async def _extract(
                     cached = read_json(path)
                     facts_by_job[key] = _validated_facts(cached.get("facts", {}), page, group)
                     continue
-                except (FileNotFoundError, TypeError, ValueError):
-                    pass
+                except FileNotFoundError:
+                    pass  # a cold cache entry is the normal path, not a failure
+                except (TypeError, ValueError) as exc:
+                    log.error(
+                        "fast link page cache entry is unusable; the page facts are extracted "
+                        "again with new model calls page=%s file=%s error=%s: %s",
+                        page.rel, path, type(exc).__name__, exc,
+                    )
             jobs.append((page, group, key, path))
 
     semaphore = asyncio.Semaphore(max(1, int(getattr(settings, "wiki_linker_concurrency", 0)
@@ -523,7 +562,10 @@ async def _extract(
             except Exception as exc:  # noqa: BLE001 - bounded retry with model feedback
                 error = f"{type(exc).__name__}: {exc}"
                 if attempt == EXTRACTION_ATTEMPTS:
-                    log.exception("ファストリンクのメタデータ生成に失敗: %s", page.rel)
+                    log.error(
+                        "fast link metadata extraction failed page=%s attempts=%d error=%s: %s",
+                        page.rel, attempt, type(exc).__name__, exc, exc_info=True,
+                    )
                 if attempt < EXTRACTION_ATTEMPTS and on_progress:
                     on_progress({
                         "stage": "fast-link", "step": "page_retry", "page": page.rel,
@@ -552,7 +594,7 @@ async def _extract(
         calls += attempts
         if error:
             failures.append(error)
-            log.warning("%s", error)
+            log.error("fast link page failed; the whole link run will abort: %s", error)
             continue
         facts_by_job[key] = facts
         write_json_atomic(path, {"version": VERSION, "facts": facts})
@@ -695,6 +737,14 @@ async def _check_roles(
             if len(probabilities) != len(results) or not probabilities:
                 item.usable = False
                 failures += 1
+                failed = next((result for result in results if isinstance(result, BaseException)), None)
+                reason = (f"{type(failed).__name__}: {failed}" if failed is not None
+                          else f"no Jev score in {len(results)} results")
+                log.error(
+                    "fast link Jev role check failed; the entity is dropped page=%s entity=%s "
+                    "section=%s error=%s",
+                    item.page.rel, item.name, item.segment.key, reason, exc_info=failed,
+                )
                 continue
             probability = max(probabilities)
             item.role = "defines" if probability >= threshold else "uses"
@@ -826,6 +876,15 @@ async def _judge_candidates(
                             if not isinstance(result, BaseException)]
             if len(scored_parts) != len(results) or not scored_parts:
                 failures += 1
+                failed = next((result for result in results if isinstance(result, BaseException)), None)
+                reason = (f"{type(failed).__name__}: {failed}" if failed is not None
+                          else f"no Jev score in {len(results)} results")
+                log.error(
+                    "fast link Jev candidate check failed; the candidate is dropped "
+                    "page=%s target=%s anchor=%s kind=%s error=%s",
+                    candidate.source_page.rel, candidate.target_page.rel, candidate.anchor,
+                    candidate.kind, reason, exc_info=failed,
+                )
                 continue
             probability = max(scored_parts)
             probabilities[key] = probability
@@ -925,7 +984,7 @@ def _apply_links(project: Any, pages: list[Page], plans: list[PlannedLink], sett
         # ``page.text`` has the previous fast-link manifest removed in memory.  Write
         # it even when this run selected no replacement links, otherwise links from the
         # preceding run would remain visible after their manifest entry was dropped.
-        current = page.path.read_text(encoding="utf-8")
+        current = _page_text(page.path)
         previous = manifest_pages.get(page.rel)
         new_row = (
             {
@@ -1023,7 +1082,7 @@ async def _link_async(
             rows = {rel: row for rel, row in manifest["pages"].items() if str(Path(rel).parent.as_posix()) == doc}
             if (ledger.published_documents.get(doc, {}).get("content_sha256") == fingerprints[doc]
                     and all((Path(project.wiki) / rel).is_file()
-                            and sha256_text((Path(project.wiki) / rel).read_text(encoding="utf-8")) == row.get("linked_sha256")
+                            and sha256_text(_page_text(Path(project.wiki) / rel)) == row.get("linked_sha256")
                             for rel, row in rows.items())):
                 completed[doc] = {"version": VERSION, "status": "complete", "content_sha256": fingerprints[doc]}
     pending = {doc for doc in scope if force or completed.get(doc, {}).get("version") != VERSION
@@ -1113,9 +1172,17 @@ def link_project(
     project = open_project(settings)
     from publisher.pipeline import _content_hash
 
-    documents = {path.parent.parent.relative_to(project.wiki).as_posix()
-                 for path in project.wiki.rglob("_planning/pages")
-                 if any(path.parent.parent.glob("*.md"))}
+    try:
+        planning_dirs = list(project.wiki.rglob("_planning/pages"))
+        documents = {path.parent.parent.relative_to(project.wiki).as_posix()
+                     for path in planning_dirs
+                     if any(path.parent.parent.glob("*.md"))}
+    except OSError as exc:
+        log.error(
+            "wiki page scan failed path=%s error=%s: %s (permission, unreadable mount, or too many open files?)",
+            project.wiki, type(exc).__name__, exc, exc_info=True,
+        )
+        raise
     if only is not None:
         documents &= {project.wiki_dir(rel).relative_to(project.wiki).as_posix() for rel in only}
     completed = _manifest(project).get("documents", {})
@@ -1131,7 +1198,10 @@ def link_project(
     try:
         engine = get_engine_for(settings)
     except Exception as exc:
-        log.exception("ファストリンクのJevチェックに失敗")
+        log.error(
+            "fast link Jev engine unavailable; no links were added backend=%s error=%s: %s",
+            getattr(settings, "wiki_jev_backend", ""), type(exc).__name__, exc, exc_info=True,
+        )
         return {"done": [], "failures": [f"fast link: Jev unavailable: {type(exc).__name__}: {exc}"]}
     return run_async_blocking(
         _link_async(
@@ -1164,8 +1234,12 @@ def reset_project(settings: Any) -> dict[str, Any]:
         path = Path(project.wiki) / rel
         if not path.exists():
             continue
-        text, error = _undo_manifest_row(path.read_text(encoding="utf-8"), row)
+        text, error = _undo_manifest_row(_page_text(path), row)
         if error:
+            log.error(
+                "fast link reset could not undo the generated links; they stay on the published "
+                "page page=%s error=%s", rel, error,
+            )
             failures.append(f"{rel}: {error}")
             unresolved[rel] = row
             continue

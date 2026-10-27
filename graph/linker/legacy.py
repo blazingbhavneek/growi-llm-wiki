@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from .catalog import Catalog
 from .prompts import EDGE_VERSION_LEGACY, legacy_edge_messages
 from .wire import EdgeSuggestions
+
+log = logging.getLogger(__name__)
 
 LEGACY_K = 50
 MAX_FUSED_CANDIDATES = 16
@@ -85,7 +88,11 @@ async def filter_candidates(catalog: Catalog, model: Any, chunk: Any, selected: 
         group = selected[offset : offset + EDGE_GROUP_SIZE]
         payload_rows = [catalog.chunk(c.chunk_id) for c in group]
         payload_rows = [row for row in payload_rows if row is not None]
-        target = _view(catalog.chunk(chunk.chunk_id))
+        target_row = catalog.chunk(chunk.chunk_id)
+        if target_row is None:
+            # The missing row still raises below; this is the line that names which chunk is gone.
+            log.error("target chunk missing from catalog mode=%s chunk=%s document=%s page=%s", mode, chunk.chunk_id, chunk.document, chunk.page_rel)
+        target = _view(target_row)
         messages = legacy_edge_messages(target, [_view(row) for row in payload_rows])
         try:
             try:
@@ -93,7 +100,9 @@ async def filter_candidates(catalog: Catalog, model: Any, chunk: Any, selected: 
             except TypeError:
                 result = await model.structured(EdgeSuggestions, messages)
             result = result if isinstance(result, EdgeSuggestions) else EdgeSuggestions.model_validate(result)
-        except Exception:
+        except Exception as exc:
+            log.error("edge model call failed, candidate group dropped mode=%s chunk=%s document=%s candidates=%s error=%s: %s",
+                      mode, chunk.chunk_id, chunk.document, [item.chunk_id for item in group], type(exc).__name__, exc, exc_info=True)
             continue
         allowed = {c.chunk_id for c in group}
         for suggestion in result.edges:

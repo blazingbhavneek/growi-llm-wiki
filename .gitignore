@@ -24,6 +24,8 @@ growi-search/frontend/dist/
 tests/
 !tests/
 tests/*
+!tests/__init__.py
+!tests/test_logging.py
 !tests/test_sync_fallback.py
 !tests/test_fast_link_sync.py
 !tests/test_md_txt_formats.py

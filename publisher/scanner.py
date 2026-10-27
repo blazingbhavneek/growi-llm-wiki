@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import stat as stat_module
 import traceback
@@ -10,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from common.paths import SUPPORTED_SOURCE_SUFFIXES as SUPPORTED
+
+log = logging.getLogger(__name__)
 
 IGNORED_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 IGNORED_DIRS = {".git", ".hg", ".svn", ".venv", "venv", "node_modules",
@@ -38,6 +41,9 @@ def _inside(path: Path, root: Path) -> bool:
     try:
         path.resolve(strict=False).relative_to(root.resolve(strict=False))
     except ValueError:
+        # Correct to drop, but until now invisible: an unreadable resolve or a symlink out of the
+        # mount is the difference between "the mount is empty" and "the mount is elsewhere".
+        log.debug("scan entry dropped, path escapes the mount root=%s path=%s", root, path)
         return False
     return True
 
@@ -55,6 +61,9 @@ def discover_mount(root: Path, errors: dict[str, str]) -> dict[str, os.stat_resu
             rel = path.relative_to(root).as_posix()
         except ValueError:
             rel = "."
+        # Callers may ignore the errors dict, so the unreadable entry is reported here.
+        log.error("scan entry unreadable path=%s reason=%s error=%s: %s",
+                  path, exc.strerror or "", type(exc).__name__, exc, exc_info=True)
         errors[rel] = "".join(traceback.format_exception(exc))
 
     for directory, dirs, names in os.walk(root, onerror=failed):
@@ -81,7 +90,9 @@ def scan_mount(root: Path, previous: dict[str, dict[str, object]] | None = None)
         path = root / rel
         try:
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
+        except OSError as exc:
+            log.error("scan file unreadable file=%s reason=%s error=%s: %s",
+                      path, exc.strerror or "", type(exc).__name__, exc, exc_info=True)
             errors[rel] = traceback.format_exc()
             continue
         suffix = path.suffix.lower()
@@ -90,6 +101,8 @@ def scan_mount(root: Path, previous: dict[str, dict[str, object]] | None = None)
     known = set(previous)
     added = sorted(current - known)
     changed = sorted(rel for rel in current & known if str(previous[rel].get("source_sha256", "")) != files[rel].source_sha256)
+    if errors:
+        log.warning("scan incomplete errors=%d; delete detection is disabled for this scan", len(errors))
     deleted = [] if errors else sorted(known - current)
     return Scan(files, added, changed, deleted, errors)
 

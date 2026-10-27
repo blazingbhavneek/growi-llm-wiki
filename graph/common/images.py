@@ -13,11 +13,31 @@ import base64
 import binascii
 import hashlib
 import html
+import logging
 import re
 from bisect import bisect_right
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from typing import Callable
+
+
+log = logging.getLogger(__name__)
+
+# One data URI larger than this is reported before it is decoded into RAM.
+# shortcut: the size is an operator-chosen OOM guard, not a format limit; raise it if the
+# parser legitimately starts emitting bigger inline images.
+MAX_INLINE_IMAGE_CHARACTERS = 20_000_000
+
+# shortcut: one live.log line per reported image per process; find_images/canonicalize_images
+# run several times over the same text, so an unguarded line repeats for every pass.
+_reported_images: set[str] = set()
+
+
+def _report_image_once(key: str, message: str, *args: object, exc_info: bool = False) -> None:
+    if key in _reported_images:
+        return
+    _reported_images.add(key)
+    log.error(message, *args, exc_info=exc_info)
 
 
 IMAGE_UNIT_RE = re.compile(
@@ -89,12 +109,31 @@ def image_source_identity(src: str) -> tuple[str, str, str]:
     data = DATA_IMAGE_RE.match(source)
     if data:
         compact = "".join(data.group("data").split())
+        mime = data.group("mime").lower()
+        if len(compact) > MAX_INLINE_IMAGE_CHARACTERS:
+            _report_image_once(
+                f"oversized:{mime}:{len(compact)}",
+                "inline image data uri is oversized before decoding mime=%s characters=%d decoded_bytes~%d (one embedded image can exhaust memory)",
+                mime,
+                len(compact),
+                len(compact) * 3 // 4,
+            )
         try:
             payload = base64.b64decode(compact, validate=True)
-        except (ValueError, binascii.Error):
+        except (ValueError, binascii.Error) as exc:
             # Invalid media must remain distinguishable, but should not crash a
             # diff or prompt sanitizer before the publishing integrity gate.
             digest = hashlib.sha256(compact.encode("ascii", "replace")).hexdigest()
+            _report_image_once(
+                f"invalid:{digest}",
+                "inline image payload is not valid base64 mime=%s characters=%d identity=invalid-sha256:%s error=%s: %s",
+                mime,
+                len(compact),
+                digest,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
             return f"invalid-sha256:{digest}", "", data.group("mime").lower()
         digest = hashlib.sha256(payload).hexdigest()
         return f"sha256:{digest}", digest, data.group("mime").lower()

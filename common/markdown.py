@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import re
+
+log = logging.getLogger(__name__)
 
 LINKS_FOOTER_START = "<!-- llm-wiki-links:start -->"
 LINKS_FOOTER_END = "<!-- llm-wiki-links:end -->"
@@ -35,7 +38,11 @@ def strip_big_tables(text: str, *, max_rows: int = 40) -> str:
     def replace(match: re.Match[str]) -> str:
         table = match.group(0)
         rows = re.findall(r"<tr\b[^>]*>.*?</tr>", table, re.I | re.S)
-        return table if len(rows) <= max_rows else "<table>[large table omitted]</table>"
+        if len(rows) <= max_rows:
+            return table
+        # the content loss is silent in the published text, so it has to be visible here
+        log.error("large html table omitted from text rows=%d max_rows=%d characters=%d", len(rows), max_rows, len(table))
+        return "<table>[large table omitted]</table>"
 
     return re.sub(r"<table\b[^>]*>.*?</table>", replace, text, flags=re.I | re.S)
 

@@ -183,10 +183,15 @@ def _emit(callback: Any, step: str, **details: Any) -> None:
     if callback:
         try:
             callback({"stage": "fast-repair", "step": step, **details})
-        except Exception:
+        except Exception as exc:
             # Progress reporting is advisory.  A broken logger/UI callback
             # must not turn a page-local repair into a pipeline failure.
-            log.exception("fast repair progress callback failed: %s", step)
+            log.exception(
+                "fast repair progress callback failed step=%s error=%s: %s",
+                step,
+                type(exc).__name__,
+                exc,
+            )
 
 
 def _valid_ranges(value: Any, line_count: int) -> list[tuple[int, int]]:
@@ -644,6 +649,7 @@ async def _judge(
     messages = _judge_messages(page, title, body)
     artifacts.append(_Artifact(f"{stem}-prompt.md", _render_messages(messages)))
     last_error = ""
+    last_exc: BaseException | None = None
     for call in range(1, JUDGE_CALL_ATTEMPTS + 1):
         try:
             try:
@@ -657,7 +663,26 @@ async def _judge(
             return result, ""
         except Exception as exc:  # bounded transport/schema retry
             last_error = f"{type(exc).__name__}: {exc}"[:1000]
+            last_exc = exc
+            log.debug(
+                "fast repair judge attempt failed document=%s page=%s stage=%s attempt=%d/%d error=%s",
+                page.document,
+                page.filename,
+                stem,
+                call,
+                JUDGE_CALL_ATTEMPTS,
+                last_error,
+            )
             artifacts.append(_Artifact(f"{stem}-call-{call:02d}-error.txt", last_error + "\n"))
+    log.error(
+        "fast repair judge call failed; the page has no verdict document=%s page=%s stage=%s attempts=%d error=%s",
+        page.document,
+        page.filename,
+        stem,
+        JUDGE_CALL_ATTEMPTS,
+        last_error or "no attempt ran",
+        exc_info=last_exc,
+    )
     return None, last_error
 
 
@@ -694,6 +719,14 @@ async def _writer(
             )
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"[:1000]
+        log.error(
+            "fast repair writer call failed document=%s page=%s attempt=%d error=%s",
+            page.document,
+            page.filename,
+            attempt,
+            error,
+            exc_info=True,
+        )
         artifacts.append(_Artifact(f"rewrite-{attempt:02d}-error.txt", error + "\n"))
         raise RuntimeError(error) from exc
     artifacts.append(_Artifact(f"rewrite-{attempt:02d}.md", str(raw)))
@@ -704,6 +737,14 @@ async def _writer(
         # into the same bounded retry path as a model/transport error instead
         # of aborting every other page in the document.
         error = f"{type(exc).__name__}: {exc}"[:1000]
+        log.error(
+            "fast repair writer answer is unusable document=%s page=%s attempt=%d error=%s",
+            page.document,
+            page.filename,
+            attempt,
+            error,
+            exc_info=True,
+        )
         artifacts.append(_Artifact(f"rewrite-{attempt:02d}-parse-error.txt", error + "\n"))
         raise RuntimeError(error) from exc
 
@@ -750,6 +791,14 @@ def _review_session(session: _RepairSession, *, on_progress: Any) -> _PageOutcom
         or session.feedback
         or _feedback(verdict)
         or [f"{MAX_REWRITE_ATTEMPTS}回の修復で承認されなかった。"]
+    )
+    log.error(
+        "fast repair rewrite budget exhausted; the page needs human review document=%s page=%s attempts=%d selected_attempt=%d score=%d",
+        session.page.document,
+        session.page.filename,
+        session.attempts,
+        session.best_attempt,
+        verdict.coverage_score,
     )
     _emit(
         on_progress,
@@ -1201,7 +1250,17 @@ def _replace_link_title(text: str, filename: str, title: str) -> str:
 
 def _update_review(state_root: Path, version: str) -> bool:
     path = state_root / "wiki" / "_review.md"
-    previous = path.read_text(encoding="utf-8") if path.exists() else ""
+    try:
+        previous = path.read_text(encoding="utf-8") if path.exists() else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        log.error(
+            "review list could not be read after all model work; the pages that need human review are not recorded path=%s error=%s: %s",
+            path,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
     base = re.sub(
         re.escape(REVIEW_START) + r".*?" + re.escape(REVIEW_END) + r"\n?",
         "", previous, flags=re.S,
@@ -1298,9 +1357,16 @@ class FastRepair:
                     )
                     pages = plan.get("pages", []) if isinstance(plan, dict) else []
                     return len(pages) if isinstance(pages, list) else 10**9
-                except (OSError, TypeError, ValueError):
+                except (OSError, TypeError, ValueError) as exc:
                     # Keep malformed documents eligible; repair_document will
                     # report the actual state error when this target is reached.
+                    log.error(
+                        "fast repair page count is unavailable; the document is queued in the fallback order document=%s error=%s: %s",
+                        raw_rel,
+                        type(exc).__name__,
+                        exc,
+                        exc_info=True,
+                    )
                     return 10**9
 
             return sorted(set(raw_rels), key=lambda raw_rel: (page_count(raw_rel), raw_rel))
@@ -1345,15 +1411,31 @@ class FastRepair:
         snapshot = state_root / "source" / "original.md"
         raw_path = Path(self.project.raw_file(raw_rel))
         if not snapshot.is_file() or not raw_path.is_file():
+            log.error(
+                "fast repair cannot start; the source snapshot or source file is missing document=%s path=%s file=%s",
+                raw_rel,
+                snapshot,
+                raw_path,
+            )
             raise FileNotFoundError(f"repair state/source is unavailable for {raw_rel}")
         source_text = snapshot.read_text(encoding="utf-8")
         current_raw = raw_path.read_text(encoding="utf-8")
         if not source_text.strip():
+            log.error(
+                "fast repair cannot start; the source snapshot is empty; check conversion/extraction first document=%s path=%s",
+                raw_rel,
+                snapshot,
+            )
             raise RuntimeError(
                 f"{raw_rel}: source is empty; check conversion/extraction before repairing the wiki"
             )
         source_hash = sha256_text(source_text)
         if sha256_text(current_raw) != source_hash:
+            log.error(
+                "fast repair cannot start; the source changed since the wiki was generated; run a normal sync first document=%s file=%s",
+                raw_rel,
+                raw_path,
+            )
             raise RuntimeError(f"{raw_rel}: source changed; run a normal sync before repair")
         plan = read_json(state_root / "state" / "plan.json")
         manifest = read_json(state_root / "state" / "manifest.json", default={})
@@ -1362,6 +1444,11 @@ class FastRepair:
             ("manifest", manifest.get("source_sha256")),
         ):
             if value and value != source_hash:
+                log.error(
+                    "fast repair cannot start; a state file source hash is stale; run a normal sync first document=%s file=%s",
+                    raw_rel,
+                    state_root / "state" / f"{label}.json",
+                )
                 raise RuntimeError(f"{raw_rel}: {label} source hash is stale; run a normal sync")
 
         normalized = normalize_source(source_text)
@@ -1384,24 +1471,57 @@ class FastRepair:
                 state_rel = ""
             resume_checkpoint = state_rel in self.resume_page_states
             if not state or not page_path.is_file():
+                log.error(
+                    "fast repair cannot start; the planned page has no state or no published page file document=%s page=%s path=%s",
+                    raw_rel,
+                    filename,
+                    page_path,
+                )
                 raise RuntimeError(f"{raw_rel}: incomplete generated page state for {filename}")
             if state.get("human_edited"):
+                log.error(
+                    "fast repair cannot start; the page still carries legacy human state; a normal sync is required document=%s page=%s",
+                    raw_rel,
+                    filename,
+                )
                 raise RuntimeError(f"{raw_rel}: {filename} contains legacy human state; normal sync is required")
             if state.get("filename") not in (None, filename):
+                log.error(
+                    "fast repair cannot start; the page state names a different filename document=%s page=%s state_filename=%s",
+                    raw_rel,
+                    filename,
+                    state.get("filename"),
+                )
                 raise RuntimeError(f"{raw_rel}: page filename state mismatch for {filename}")
             provenance_hash = (
                 (state.get("provenance") or {}).get("source_document") or {}
             ).get("sha256")
             if provenance_hash and provenance_hash != source_hash:
+                log.error(
+                    "fast repair cannot start; the page provenance is stale for the current source; run a normal sync first document=%s page=%s",
+                    raw_rel,
+                    filename,
+                )
                 raise RuntimeError(f"{raw_rel}: stale provenance for {filename}; run a normal sync")
             text = page_path.read_text(encoding="utf-8")
             content_hash = sha256_text(text)
             if state.get("content_sha256") and state.get("content_sha256") != content_hash:
+                log.error(
+                    "fast repair cannot start; the published page no longer matches its recorded hash document=%s page=%s path=%s",
+                    raw_rel,
+                    filename,
+                    page_path,
+                )
                 raise RuntimeError(f"{raw_rel}: generated page hash mismatch for {filename}")
             shell = _split_page(text)
             if state.get("repair_version") == self.version or resume_checkpoint:
                 state_title = str(state.get("title") or shell.title)
                 if state_title != shell.title:
+                    log.error(
+                        "fast repair cannot start; the repaired page title no longer matches its state document=%s page=%s",
+                        raw_rel,
+                        filename,
+                    )
                     raise RuntimeError(f"{raw_rel}: repaired title state mismatch for {filename}")
                 previous_title = str(
                     state.get("repair_previous_title") or item.get("title") or shell.title
@@ -1419,6 +1539,11 @@ class FastRepair:
             owner = _valid_ranges(state.get("source_ranges") or item.get("owner_ranges"), len(source_lines))
             planned_owner = _valid_ranges(item.get("owner_ranges"), len(source_lines))
             if owner != planned_owner:
+                log.error(
+                    "fast repair cannot start; the page source ranges no longer match the plan document=%s page=%s",
+                    raw_rel,
+                    filename,
+                )
                 raise RuntimeError(f"{raw_rel}: source ownership mismatch for {filename}")
             references = _valid_ranges(
                 state.get("reference_ranges") or item.get("reference_ranges", []), len(source_lines)
@@ -1700,9 +1825,11 @@ class FastRepair:
                         error=error,
                     )
                     log.exception(
-                        "fast repair checkpoint failed for %s page %s",
+                        "fast repair page commit failed document=%s page=%s error=%s: %s",
                         raw_rel,
                         outcome.page.filename,
+                        type(exc).__name__,
+                        exc,
                     )
                     return
                 outcomes.append(outcome)
@@ -1736,8 +1863,11 @@ class FastRepair:
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"[:1000]
                     log.exception(
-                        "fast repair pending checkpoint failed for page %s",
+                        "fast repair pending checkpoint failed document=%s page=%s error=%s: %s",
+                        raw_rel,
                         session.page.filename,
+                        type(exc).__name__,
+                        exc,
                     )
                     commit(
                         _page_exception_outcome(
@@ -1758,7 +1888,13 @@ class FastRepair:
                     return session, outcome, ""
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"[:1000]
-                    log.exception("fast repair initial judge failed for page %s", page.filename)
+                    log.exception(
+                        "fast repair initial judge failed document=%s page=%s error=%s: %s",
+                        raw_rel,
+                        page.filename,
+                        type(exc).__name__,
+                        exc,
+                    )
                     return session, _page_exception_outcome(
                         page, exc, on_progress=self.on_progress
                     ), error
@@ -1774,8 +1910,11 @@ class FastRepair:
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"[:1000]
                     log.exception(
-                        "fast repair writer phase failed for page %s",
+                        "fast repair writer phase failed document=%s page=%s error=%s: %s",
+                        raw_rel,
                         session.page.filename,
+                        type(exc).__name__,
+                        exc,
                     )
                     return session, "done", _page_exception_outcome(
                         session.page, exc, on_progress=self.on_progress
@@ -1792,8 +1931,11 @@ class FastRepair:
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"[:1000]
                     log.exception(
-                        "fast repair candidate judge failed for page %s",
+                        "fast repair candidate judge failed document=%s page=%s error=%s: %s",
+                        raw_rel,
                         session.page.filename,
+                        type(exc).__name__,
+                        exc,
                     )
                     return session, "done", _page_exception_outcome(
                         session.page, exc, on_progress=self.on_progress
@@ -1807,6 +1949,12 @@ class FastRepair:
                     ).as_posix()
                 except ValueError:
                     state_rel = ""
+                    log.error(
+                        "fast repair page state is outside the project; resume is disabled for this page and its completed model work is repeated document=%s page=%s path=%s",
+                        raw_rel,
+                        page.filename,
+                        page.state_path,
+                    )
                 restored = (
                     _resume_session_checkpoint(state_root, self.version, page)
                     if state_rel in self.resume_page_states
@@ -1928,6 +2076,8 @@ class FastRepair:
 
         if pages:
             run_async_blocking(run())
+        for failure in page_failures:
+            log.error("fast repair page failed document=%s failure=%s", raw_rel, failure)
         changed_pages.update(self._apply_title_changes(state_root, plan, manifest, title_changes))
         write_json_atomic(state_root / "state" / "plan.json", plan)
         write_json_atomic(state_root / "state" / "manifest.json", manifest)

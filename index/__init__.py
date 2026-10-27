@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,8 @@ from common.context import Context
 from common.legacy import index as index_project
 from common.paths import DataLayout
 from common.settings import settings_for_root
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -49,7 +52,28 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
     if cfg.settings is not None:
         settings = settings_for_root(settings, layout.root)
     else:
-        layout.mount.mkdir(exist_ok=True)
+        # growi_url="" is only harmless for a metadata-only run; a publish run cannot reach GROWI.
+        if cfg.publish:
+            log.error(
+                "index settings fallback built growi_url=(empty) publish=True out=%s (GROWI publishing cannot work without GROWI_URL; pass --config)",
+                out,
+            )
+        else:
+            log.debug(
+                "index settings fallback built growi_url=(empty) publish=False out=%s (no project settings were passed)",
+                out,
+            )
+        try:
+            layout.mount.mkdir(exist_ok=True)
+        except OSError as exc:
+            log.error(
+                "mount folder could not be created path=%s error=%s: %s (disk full, read-only, or the volume is not mounted?)",
+                layout.mount,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
     with (ctx.stage("index", "<scope>") if ctx is not None else _null_context()):
         result = index_project(settings, only=list(inp.scope) or None, publish=cfg.publish)
     return Result(tuple(result.get("done", [])), tuple(result.get("failures", [])), inp.scope)

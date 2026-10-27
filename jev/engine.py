@@ -82,7 +82,10 @@ class JevEngine:
         self._oom_times = deque()
         self._last_stats_log = self._started = time.monotonic()
         self._thread = threading.Thread(target=self._work, name="jev-engine", daemon=True)
-        self._thread.start()
+        try: self._thread.start()
+        except RuntimeError as exc:
+            log.error("Jev engine worker thread did not start name=%s error=%s: %s (the process cannot create another thread, so no Jev request can be served)", self._thread.name, type(exc).__name__, exc, exc_info=True)
+            raise
 
     def _request(self, state, question, state_id=""):
         if not isinstance(question, JevQuestion):
@@ -95,9 +98,13 @@ class JevEngine:
             with self._record_lock:
                 if self._recorded < self.record_max:
                     from pathlib import Path
-                    Path(self.record_path).parent.mkdir(parents=True, exist_ok=True)
-                    with open(self.record_path, "a", encoding="utf-8") as out:
-                        out.write(json.dumps({"state": req.state, "question": {"text": req.question.text, "kind": req.question.kind, "options": req.question.options}}, ensure_ascii=False) + "\n")
+                    try:
+                        Path(self.record_path).parent.mkdir(parents=True, exist_ok=True)
+                        with open(self.record_path, "a", encoding="utf-8") as out:
+                            out.write(json.dumps({"state": req.state, "question": {"text": req.question.text, "kind": req.question.kind, "options": req.question.options}}, ensure_ascii=False) + "\n")
+                    except OSError as exc:
+                        log.error("Jev record file write failed file=%s error=%s: %s (a disk, path or permission problem, not a Jev scoring failure)", self.record_path, type(exc).__name__, exc, exc_info=True)
+                        raise
                     self._recorded += 1
 
     def _submit(self, req):
@@ -112,8 +119,9 @@ class JevEngine:
         self._record(req)
         self._stats["requests"] += 1
         try: return self.backend.prepare(req)
-        except Exception:
+        except Exception as exc:
             self._stats["errors"] += 1
+            log.error("Jev request could not be prepared backend=%s state=%s question=%s kind=%s error=%s: %s", getattr(self.backend, "name", "?"), req.state_id[:12], getattr(req.question, "key", ""), getattr(req.question, "kind", ""), type(exc).__name__, exc, exc_info=True)
             raise
 
     def _enqueue(self, prepared):
@@ -189,54 +197,67 @@ class JevEngine:
     def count_tokens(self, text): return self.backend.count_tokens(text)
 
     def _work(self):
-        pending = deque()
-        while True:
-            first = pending.popleft() if pending else self._queue.get()
-            if first is None: break
-            batch = [first]
-            deadline = time.monotonic() + self.batch_wait
-            while len(batch) < self.max_requests:
-                if pending:
-                    item = pending.popleft()
+        # Without this guard the daemon thread dies in silence, the queue stops draining and
+        # every later decide() blocks forever. shortcut: it reports the death only; pending
+        # futures are still never resolved (class B, see the audit report).
+        try:
+            pending = deque()
+            while True:
+                first = pending.popleft() if pending else self._queue.get()
+                if first is None: break
+                batch = [first]
+                deadline = time.monotonic() + self.batch_wait
+                while len(batch) < self.max_requests:
+                    if pending:
+                        item = pending.popleft()
+                        if item is None:
+                            pending.appendleft(None); break
+                        batch.append(item)
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0: break
+                    try: item = self._queue.get(timeout=remaining)
+                    except queue.Empty: break
                     if item is None:
-                        pending.appendleft(None); break
+                        pending.append(None); break
                     batch.append(item)
-                    continue
-                remaining = deadline - time.monotonic()
-                if remaining <= 0: break
-                try: item = self._queue.get(timeout=remaining)
-                except queue.Empty: break
-                if item is None:
-                    pending.append(None); break
-                batch.append(item)
-            planned = plan_batches([(i, item[0].cost) for i, item in enumerate(batch)], self.budget, self.max_requests)
-            selected_indexes = planned[0] if planned else []
-            selected = set(selected_indexes)
-            # Marks each future running; a caller that cancelled meanwhile is dropped, since
-            # resolving a cancelled future raises and would kill this worker thread.
-            picked = [batch[i] for i in selected_indexes if batch[i][1].set_running_or_notify_cancel()]
-            pending.extendleft(reversed([item for i, item in enumerate(batch) if i not in selected]))
-            self._run(picked)
-        try: self.backend.close()
-        except Exception: log.exception("closing Jev backend")
+                planned = plan_batches([(i, item[0].cost) for i, item in enumerate(batch)], self.budget, self.max_requests)
+                selected_indexes = planned[0] if planned else []
+                selected = set(selected_indexes)
+                # Marks each future running; a caller that cancelled meanwhile is dropped, since
+                # resolving a cancelled future raises and would kill this worker thread.
+                picked = [batch[i] for i in selected_indexes if batch[i][1].set_running_or_notify_cancel()]
+                pending.extendleft(reversed([item for i, item in enumerate(batch) if i not in selected]))
+                self._run(picked)
+            try: self.backend.close()
+            except Exception: log.exception("closing Jev backend")
+        except BaseException as exc:
+            log.critical("Jev engine worker thread stopped name=%s error=%s: %s (the queue is no longer drained and every later decide() blocks forever)", self._thread.name, type(exc).__name__, exc, exc_info=True)
+            raise
 
-    def _run(self, group):
+    def _run(self, group, retries=0):
         if not group: return
         start = time.monotonic()
         try:
             results = self.backend.run([i[0] for i in group])
-            if len(results) != len(group): raise JevUnavailable("backend returned misaligned results")
+            if len(results) != len(group):
+                log.error("Jev backend returned the wrong number of results backend=%s expected=%d got=%d states=%d", getattr(self.backend, "name", "?"), len(group), len(results), len({i[3] for i in group}))
+                raise JevUnavailable("backend returned misaligned results")
             for item, result in zip(group, results): item[1].set_result(result)
         except JevOutOfMemory as exc:
             now = time.monotonic()
             self._stats["out_of_memory_events"] += 1
             self._oom_times.append(now)
             while self._oom_times and now - self._oom_times[0] > 60: self._oom_times.popleft()
+            budget_before = self.budget
             if len(self._oom_times) >= 2:
                 # ponytail: the budget only shrinks; restart to reset it.
                 self.budget = max(8192, int(self.budget * .8))
                 self._stats["budget"] = self.budget
                 self._oom_times.clear()
+            # The GPU message from torch names the allocation it tried to get, e.g.
+            # "Tried to allocate 20.00 MiB"; requested_tokens is what this batch asked for.
+            log.error("Jev GPU out of memory backend=%s state=%s requests=%d requested_tokens=%d budget=%d->%d action=%s error=%s: %s", getattr(self.backend, "name", "?"), group[0][3][:12], len(group), sum(i[0].cost for i in group), budget_before, self.budget, "batch split in half" if len(group) > 1 else "request failed", type(exc).__name__, exc, exc_info=True)
             if len(group) > 1:
                 middle = len(group) // 2
                 self._run(group[:middle]); self._run(group[middle:])
@@ -247,9 +268,11 @@ class JevEngine:
             by_state = {}
             for item in group: by_state.setdefault(item[3], []).append(item)
             if len(by_state) > 1:
-                for same_state in by_state.values(): self._run(same_state)
+                log.debug("Jev batch retried per state states=%d requests=%d retries=%d error=%s: %s", len(by_state), len(group), retries, type(exc).__name__, exc)
+                for same_state in by_state.values(): self._run(same_state, retries + 1)
             else:
                 self._stats["errors"] += len(group)
+                log.error("Jev batch failed backend=%s state=%s requests=%d retries=%d error=%s: %s (every request in this state failed)", getattr(self.backend, "name", "?"), group[0][3][:12], len(group), retries, type(exc).__name__, exc, exc_info=True)
                 for item in group: item[1].set_exception(exc)
         elapsed = (time.monotonic() - start) * 1000
         self._stats["runs"] += 1; self._stats["batch_size_sum"] += len(group)

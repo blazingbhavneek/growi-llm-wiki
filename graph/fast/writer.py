@@ -9,6 +9,7 @@ document's serial order.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +37,9 @@ from .repair import (
     _write_artifacts,
 )
 from .wiki import append_low_coverage_source, recent_writer_context
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -296,6 +300,13 @@ async def _generate_page(
         )
 
     if best_verdict is None:
+        log.error(
+            "fast page has no acceptable candidate; it is published as a raw source dump document=%s page=%s attempts=%d last errors=%s",
+            prompt_page.document,
+            page.filename,
+            max_attempts,
+            "; ".join(errors)[-500:] or "no attempt ran",
+        )
         wiki._emit(
             on_progress,
             "write",
@@ -351,6 +362,12 @@ async def rewrite_pending_pages(
     from graph.wiki import pipeline as wiki
 
     policy = policy_of(config)
+    if model is None:
+        log.error(
+            "fast page writing has no model client (missing model config or API key); every page of this document becomes a verbatim source dump document=%s pages=%d",
+            source_path,
+            len(pending),
+        )
     sessions = [
         _prepare_session(
             page,
@@ -383,6 +400,13 @@ async def rewrite_pending_pages(
                 session.page, lines=lines, units=session.page_units
             )
             error = f"{type(exc).__name__}: {exc}"[:1000]
+            log.error(
+                "fast page generation failed; the page is published as verbatim source document=%s page=%s error=%s",
+                source_path,
+                session.page.filename,
+                error,
+                exc_info=True,
+            )
             session.artifacts.append(_Artifact("generation-error.txt", error + "\n"))
             return _GenerationOutcome(
                 session,
@@ -410,7 +434,18 @@ async def rewrite_pending_pages(
     for outcome in outcomes:
         session = outcome.session
         page = session.page
-        _write_artifacts(session.task_dir, session.artifacts)
+        try:
+            _write_artifacts(session.task_dir, session.artifacts)
+        except OSError as exc:
+            # common/storage + graph/wiki/storage log the file error (path + errno) on the line above.
+            log.error(
+                "fast page artifacts could not be written; the commit loop stops here and this document stays partly written document=%s page=%s path=%s",
+                source_path,
+                page.filename,
+                session.task_dir,
+                exc_info=True,
+            )
+            raise
         body = policy.section(outcome.body).rstrip()
         markdown = f"# {page.title}\n\n{body}\n"
         masked, unmask = policy.mask_for_linking(markdown)
@@ -427,6 +462,12 @@ async def rewrite_pending_pages(
         markdown += wiki._nav_footer(page, pages)
         restored, unresolved = wiki.restore_images(markdown, session.page_units)
         if unresolved:
+            log.error(
+                "fast page commit stopped; unresolved image placeholders abort the remaining commits document=%s page=%s placeholders=%s",
+                source_path,
+                page.filename,
+                unresolved,
+            )
             raise wiki.PipelineError(
                 f"page {page.number} has unresolved image placeholders: {unresolved}"
             )
@@ -454,16 +495,26 @@ async def rewrite_pending_pages(
             ),
         )
         results.append(result)
-        write_text_atomic(wiki_root / page.filename, result.markdown)
-        wiki._write_page_state(
-            wiki._page_state_path(state_root, page),
-            result,
-            rewrite_version=rewrite_version,
-            pages=pages,
-            source_path=source_path,
-            source_snapshot_path=source_snapshot_path,
-            source_sha256=source_sha256,
-        )
+        try:
+            write_text_atomic(wiki_root / page.filename, result.markdown)
+            wiki._write_page_state(
+                wiki._page_state_path(state_root, page),
+                result,
+                rewrite_version=rewrite_version,
+                pages=pages,
+                source_path=source_path,
+                source_snapshot_path=source_snapshot_path,
+                source_sha256=source_sha256,
+            )
+        except OSError as exc:
+            log.error(
+                "fast page could not be committed; the document is half-published and the remaining pages are not written document=%s page=%s path=%s",
+                source_path,
+                page.filename,
+                wiki_root / page.filename,
+                exc_info=True,
+            )
+            raise
         wiki._emit(
             on_progress,
             "writer",
@@ -481,6 +532,16 @@ async def rewrite_pending_pages(
             attempts=result.attempts,
             score=result.judge_score,
             verbatim_sections=len(result.verbatim_sections),
+        )
+        log.info(
+            "fast page written document=%s page=%s current=%d of=%d attempts=%d score=%s verbatim=%d",
+            source_path,
+            page.filename,
+            len(results),
+            len(pages),
+            result.attempts,
+            result.judge_score,
+            len(result.verbatim_sections),
         )
 
 

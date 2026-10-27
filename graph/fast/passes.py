@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from typing import TypeVar
 
+log = logging.getLogger(__name__)
 
 Input = TypeVar("Input")
 Output = TypeVar("Output")
@@ -59,7 +61,18 @@ async def bounded_as_completed(
         for task in pending:
             task.cancel()
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+            results = await asyncio.gather(*pending, return_exceptions=True)
+            # A task that had already failed before the teardown keeps its exception here
+            # and nowhere else; the cancelled ones are the expected CancelledError.
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                    log.error(
+                        "fast model pass cancelled with a failed in-flight item operation=%s error=%s: %s",
+                        getattr(operation, "__qualname__", repr(operation)),
+                        type(result).__name__,
+                        result,
+                        exc_info=result,
+                    )
 
 
 __all__ = ["bounded_as_completed", "bounded_map"]

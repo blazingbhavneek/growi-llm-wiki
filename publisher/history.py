@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import shutil
 import sqlite3
 import subprocess
@@ -14,6 +15,8 @@ from typing import Any, Iterator
 
 from graph.wiki.storage import read_json, write_json_atomic
 from graph.workspace.project import Project
+
+log = logging.getLogger(__name__)
 
 LAST_GOOD_REF = "refs/llm-wiki/last-good"
 GITIGNORE = """mount/
@@ -34,15 +37,36 @@ class Blob:
     suffix: str
 
 
+def _stderr(error: Any) -> str:
+    """The stderr a git subprocess captured, on one trimmed line."""
+    raw = error.stderr or b""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    return " ".join(raw.split())[-400:]
+
+
 def _git(project: Project, *args: str, input: bytes | None = None, text: bool = True) -> str | bytes:
     binary = input is not None or not text
-    result = subprocess.run(
-        ["git", "-C", str(project.root), *args],
-        input=input,
-        check=True,
-        capture_output=True,
-        text=not binary,
-    )
+    argv = ["git", "-C", str(project.root), *args]
+    command = " ".join(argv)[:300]  # a commit message can sit in the argv, so the line stays short
+    try:
+        result = subprocess.run(
+            argv,
+            input=input,
+            check=True,
+            capture_output=True,
+            text=not binary,
+        )
+    except FileNotFoundError as exc:
+        # No git at all is an install/PATH problem, not a repository problem.
+        log.error("git binary not found command=%s error=%s: %s (is git installed and on PATH?)",
+                  command, type(exc).__name__, exc, exc_info=True)
+        raise
+    except subprocess.CalledProcessError as exc:
+        # The reason lives in git's stderr: a corrupt repo, .git/index.lock, a full disk.
+        log.error("git failed code=%s command=%s stderr=%s error=%s: %s",
+                  exc.returncode, command, _stderr(exc), type(exc).__name__, exc, exc_info=True)
+        raise
     if binary:
         return result.stdout if not text else result.stdout.decode().strip()
     return result.stdout.strip()
@@ -69,6 +93,7 @@ def _validate_legacy_state(project: Project, ledger: Any) -> None:
         if expected_source and source.is_file():
             valid = valid and expected_source == hashlib.sha256(source.read_bytes()).hexdigest()
         if not valid:
+            log.error("Git baseline refused: incomplete generated state document=%s; run a normal repair sync", rel)
             raise RuntimeError(f"cannot create Git baseline: incomplete generated state for {rel}; run a normal repair sync")
         known_raw.add(raw_rel)
         known_wiki.add(wiki)
@@ -81,6 +106,7 @@ def _validate_legacy_state(project: Project, ledger: Any) -> None:
             if not known_state & {path.parent.parent, *path.parent.parent.parents}}
     )
     if orphaned:
+        log.error("Git baseline refused: generated data is not represented by pipeline.json count=%d; run a normal repair sync", len(orphaned))
         raise RuntimeError("cannot create Git baseline: generated data is not represented by pipeline.json; run a normal repair sync")
 
 
@@ -114,6 +140,7 @@ def _adopt_built_documents(project: Project) -> None:
 def _validate_empty_unledgered_state(project: Project) -> None:
     for root in (project.raw, project.wiki, project.metadata / "state"):
         if root.is_dir() and any(path.is_file() for path in root.rglob("*")):
+            log.error("Git baseline refused: generated files exist without pipeline.json path=%s; run a normal repair sync", root)
             raise RuntimeError(
                 "cannot create Git baseline from generated data without pipeline.json; "
                 "run a normal repair sync"
@@ -171,13 +198,24 @@ def ensure_repository(project: Project) -> str:
             _validate_legacy_state(project, load_ledger(ledger_path))
         else:
             _validate_empty_unledgered_state(project)
-        subprocess.run(["git", "init", "-q", str(project.root)], check=True, capture_output=True)
+        try:
+            subprocess.run(["git", "init", "-q", str(project.root)], check=True, capture_output=True)
+        except subprocess.CalledProcessError as exc:
+            log.error("git init failed root=%s code=%s stderr=%s error=%s: %s",
+                      project.root, exc.returncode, _stderr(exc), type(exc).__name__, exc, exc_info=True)
+            raise
+        log.info("git repository initialized root=%s", project.root)
         _git(project, "config", "user.name", "llm-wiki")
         _git(project, "config", "user.email", "llm-wiki@local")
         ignore = project.root / ".gitignore"
         existing = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
         missing = [line for line in GITIGNORE.splitlines() if line and line not in existing.splitlines()]
-        ignore.write_text(existing.rstrip() + ("\n" if existing.strip() else "") + "\n".join(missing) + "\n", encoding="utf-8")
+        try:
+            ignore.write_text(existing.rstrip() + ("\n" if existing.strip() else "") + "\n".join(missing) + "\n", encoding="utf-8")
+        except OSError as exc:
+            log.error("gitignore update failed path=%s error=%s: %s (the baseline would commit generated files)",
+                      ignore, type(exc).__name__, exc, exc_info=True)
+            raise
         _migrate_legacy_state(project)
         _stage_durable(project)
         _git(project, "commit", "-q", "--allow-empty", "-m", "baseline")
@@ -188,12 +226,18 @@ def ensure_repository(project: Project) -> str:
         try:
             return last_good(project)
         except subprocess.CalledProcessError:
+            log.error("last-good ref is missing root=%s; the repository is re-baselined from the current live tree", project.root)
             from .ledger import load_ledger
 
             ignore = project.root / ".gitignore"
             existing = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
             missing = [line for line in GITIGNORE.splitlines() if line and line not in existing.splitlines()]
-            ignore.write_text(existing.rstrip() + ("\n" if existing.strip() else "") + "\n".join(missing) + "\n", encoding="utf-8")
+            try:
+                ignore.write_text(existing.rstrip() + ("\n" if existing.strip() else "") + "\n".join(missing) + "\n", encoding="utf-8")
+            except OSError as exc:
+                log.error("gitignore update failed path=%s error=%s: %s (the baseline would commit generated files)",
+                          ignore, type(exc).__name__, exc, exc_info=True)
+                raise
             ledger_path = project.metadata / "pipeline.json"
             if ledger_path.exists():
                 _adopt_built_documents(project)
@@ -223,10 +267,16 @@ def is_ancestor(project: Project, commit: str, descendant: str) -> bool:
 def stage_blob(project: Project, source_path: Path) -> Blob:
     """Read one stable sample and store it in the project's Git object database."""
     ensure_repository(project)
-    before = source_path.stat()
-    payload = source_path.read_bytes()
-    after = source_path.stat()
+    try:
+        before = source_path.stat()
+        payload = source_path.read_bytes()
+        after = source_path.stat()
+    except OSError as exc:
+        log.error("source sample could not be read path=%s error=%s: %s (this document cannot be staged)",
+                  source_path, type(exc).__name__, exc, exc_info=True)
+        raise
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or len(payload) != after.st_size:
+        log.error("source changed while staging path=%s (another process is writing the mount file)", source_path)
         raise RuntimeError(f"source changed while staging: {source_path}")
     digest = hashlib.sha256(payload).hexdigest()
     oid = str(_git(project, "hash-object", "-w", "--stdin", input=payload))
@@ -285,24 +335,35 @@ def candidate(project: Project, operation_id: str, *, keep: bool = False) -> Ite
     try:
         if project.linker_database.exists():
             staged.linker_database.parent.mkdir(parents=True, exist_ok=True)
-            with closing(sqlite3.connect(project.linker_database)) as source, closing(
-                sqlite3.connect(staged.linker_database)
-            ) as target:
-                source.backup(target)
+            try:
+                with closing(sqlite3.connect(project.linker_database)) as source, closing(
+                    sqlite3.connect(staged.linker_database)
+                ) as target:
+                    source.backup(target)
+            except sqlite3.Error as exc:
+                log.error("linker database copy failed source=%s target=%s error=%s: %s (a corrupt or locked database stops this candidate)",
+                          project.linker_database, staged.linker_database, type(exc).__name__, exc, exc_info=True)
+                raise
         yield staged
     finally:
         if keep:
             try:
                 _git(project, "worktree", "prune")
             except subprocess.CalledProcessError:
-                pass
+                log.error("worktree prune failed operation=%s root=%s; stale worktree registrations are still listed", operation_id, root)
         else:
-            subprocess.run(
+            removed = subprocess.run(
                 ["git", "-C", str(project.root), "worktree", "remove", "--force", str(root)],
                 check=False,
                 capture_output=True,
             )
+            if removed.returncode != 0:
+                log.error("worktree remove failed code=%s root=%s stderr=%s (git still lists this worktree)",
+                          removed.returncode, root, _stderr(removed))
             shutil.rmtree(root.parent, ignore_errors=True)
+            # shortcut: exists() says something survived, not which entry failed; upgrade to onerror= if the reason is ever needed.
+            if root.parent.exists():
+                log.error("candidate worktree left behind operation=%s path=%s (leftover worktrees accumulate and fill the disk)", operation_id, root.parent)
             _git(project, "worktree", "prune")
 
 
@@ -310,23 +371,31 @@ def remove_candidate(project: Project, operation_id: str) -> None:
     """Remove one candidate worktree; a missing worktree is ignored."""
     staged = candidate_project(project, operation_id)
     root = staged.root
-    subprocess.run(
+    removed = subprocess.run(
         ["git", "-C", str(project.root), "worktree", "remove", "--force", str(root)],
         check=False,
         capture_output=True,
     )
+    if removed.returncode != 0:
+        log.error("worktree remove failed code=%s root=%s stderr=%s (git still lists this worktree)",
+                  removed.returncode, root, _stderr(removed))
     shutil.rmtree(root.parent, ignore_errors=True)
+    # shortcut: exists() says something survived, not which entry failed; upgrade to onerror= if the reason is ever needed.
+    if root.parent.exists():
+        log.error("candidate worktree left behind operation=%s path=%s (leftover worktrees accumulate and fill the disk)", operation_id, root.parent)
     try:
         _git(project, "worktree", "prune")
     except subprocess.CalledProcessError:
-        pass
+        log.error("worktree prune failed operation=%s root=%s; stale worktree registrations are still listed", operation_id, root)
 
 
 def list_candidate_ids(project: Project) -> list[str]:
     """Return operation ids that still have a candidate directory on disk."""
     try:
         base = _candidate_base(project).resolve()
-    except OSError:
+    except OSError as exc:
+        log.error("candidate directory could not be located root=%s error=%s: %s; the candidate list may be incomplete",
+                  project.root, type(exc).__name__, exc, exc_info=True)
         return []
     if not base.is_dir():
         return []
@@ -336,14 +405,18 @@ def list_candidate_ids(project: Project) -> list[str]:
         return []
     try:
         children = list(base.iterdir())
-    except OSError:
+    except OSError as exc:
+        log.error("candidate directory is unreadable path=%s error=%s: %s; reported as no candidates, the list may be incomplete",
+                  base, type(exc).__name__, exc, exc_info=True)
         return []
     ids: list[str] = []
     for child in children:
         try:
             if child.is_dir() and (child / expected).is_dir():
                 ids.append(child.name)
-        except OSError:
+        except OSError as exc:
+            log.error("candidate entry is unreadable path=%s error=%s: %s; the candidate list may be incomplete",
+                      child, type(exc).__name__, exc, exc_info=True)
             continue
     return sorted(ids)
 
@@ -360,17 +433,22 @@ def resumed_candidate(project: Project, operation_id: str, commit: str) -> Itera
     staged = reopen_candidate(project, operation_id, commit)
     if project.linker_database.exists() and not staged.linker_database.exists():
         staged.linker_database.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(project.linker_database)) as source, closing(
-            sqlite3.connect(staged.linker_database)
-        ) as target:
-            source.backup(target)
+        try:
+            with closing(sqlite3.connect(project.linker_database)) as source, closing(
+                sqlite3.connect(staged.linker_database)
+            ) as target:
+                source.backup(target)
+        except sqlite3.Error as exc:
+            log.error("linker database copy failed source=%s target=%s error=%s: %s (a corrupt or locked database stops this candidate)",
+                      project.linker_database, staged.linker_database, type(exc).__name__, exc, exc_info=True)
+            raise
     try:
         yield staged
     finally:
         try:
             _git(project, "worktree", "prune")
         except subprocess.CalledProcessError:
-            pass
+            log.error("worktree prune failed operation=%s root=%s; stale worktree registrations are still listed", operation_id, staged.root)
 
 
 def commit_candidate(candidate_project: Project, message: str, metadata: dict[str, Any]) -> str:
@@ -380,7 +458,9 @@ def commit_candidate(candidate_project: Project, message: str, metadata: dict[st
     if body:
         args.extend(["-m", body])
     _git(candidate_project, *args)
-    return str(_git(candidate_project, "rev-parse", "HEAD"))
+    commit = str(_git(candidate_project, "rev-parse", "HEAD"))
+    log.info("candidate committed commit=%s root=%s message=%s", commit, candidate_project.root, message)
+    return commit
 
 
 def amend_candidate(candidate_project: Project) -> str:
@@ -412,7 +492,9 @@ def candidate_is_clean(candidate_project: Project, commit: str, *, allow_initial
                 return False
             data = read_json(schema)
             return data == {"schema_version": VERSION} and type(data["schema_version"]) is int
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.error("human store schema could not be checked path=%s error=%s: %s (the worktree is reported dirty, so the command is refused for the wrong reason)",
+                      schema, type(exc).__name__, exc, exc_info=True)
             return False
     return False
 
@@ -433,6 +515,7 @@ def checkpoint_live(project: Project, message: str) -> str:
     _git(project, "commit", "-q", "-m", message)
     commit = str(_git(project, "rev-parse", "HEAD"))
     _git(project, "update-ref", LAST_GOOD_REF, commit, previous)
+    log.info("live checkpoint committed commit=%s previous_last_good=%s message=%s", commit, previous, message)
     return commit
 
 
@@ -483,10 +566,14 @@ def _prune_empty_generated_dirs(project: Project) -> None:
 def promote(project: Project, candidate_project: Project, commit: str) -> None:
     _git(project, "cat-file", "-e", f"{commit}^{{commit}}")
     previous = last_good(project)
+    log.info("promoting commit=%s previous_last_good=%s root=%s", commit, previous, project.root)
     _git(project, "update-ref", LAST_GOOD_REF, commit, previous)
     try:
         _git(project, "reset", "--hard", commit)
-    except BaseException:
+    except BaseException as exc:
+        # One of the biggest events of a run: the accepted work is not live and last-good goes back.
+        log.error("promote failed, rolling back to last-good commit=%s last_good=%s root=%s error=%s: %s",
+                  commit, previous, project.root, type(exc).__name__, exc, exc_info=True)
         _git(project, "update-ref", LAST_GOOD_REF, previous, commit)
         raise
     _prune_empty_generated_dirs(project)
@@ -494,8 +581,13 @@ def promote(project: Project, candidate_project: Project, commit: str) -> None:
     if source_db.exists():
         project.linker_database.parent.mkdir(parents=True, exist_ok=True)
         temp = project.linker_database.with_suffix(".sqlite.tmp")
-        shutil.copy2(source_db, temp)
-        temp.replace(project.linker_database)
+        try:
+            shutil.copy2(source_db, temp)
+            temp.replace(project.linker_database)
+        except OSError as exc:
+            log.error("linker database copy failed source=%s target=%s temp=%s error=%s: %s (the commit is live but the linker database was not replaced; the temp file may be left behind)",
+                      source_db, project.linker_database, temp, type(exc).__name__, exc, exc_info=True)
+            raise
     else:
         project.linker_database.unlink(missing_ok=True)
         project.linker_database.with_name(project.linker_database.name + "-wal").unlink(missing_ok=True)
@@ -513,6 +605,9 @@ def prune_candidates(project: Project) -> None:
     base = _candidate_base(project).resolve()
     if base.is_dir() and base != project.root.resolve() and project.root.resolve() not in base.parents:
         shutil.rmtree(base, ignore_errors=True)
+        # shortcut: exists() says something survived, not which entry failed; upgrade to onerror= if the reason is ever needed.
+        if base.exists():
+            log.error("candidate worktrees left behind path=%s (leftover worktrees accumulate and fill the disk)", base)
         _git(project, "worktree", "prune")
 
 

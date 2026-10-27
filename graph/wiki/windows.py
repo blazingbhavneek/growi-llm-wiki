@@ -7,6 +7,7 @@ only the later seed compiler is allowed to assign source-line ownership.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -26,6 +27,8 @@ from .storage import (
     write_text_atomic,
 )
 from .wire import ObservedRange, WindowInventory
+
+log = logging.getLogger(__name__)
 
 StopCheck = Callable[[], bool] | None
 
@@ -224,11 +227,22 @@ async def _observe_one(
             )
             if error is None and checked is not None:
                 return cached, True
-        except (OSError, TypeError, ValueError):
-            pass
+            log.error("stored window checkpoint is not a usable inventory, this window is observed again document=%s window=%d/%d lines=%d-%d file=%s reason=%.300s",
+                      document, ordinal, total, source_start, source_end, result_path, error)
+        except OSError as exc:
+            log.error("stored window checkpoint exists but could not be read, this window is observed again document=%s window=%d/%d lines=%d-%d file=%s error=%s: %s",
+                      document, ordinal, total, source_start, source_end, result_path, type(exc).__name__, exc, exc_info=True)
+        except (TypeError, ValueError) as exc:
+            log.error("stored window checkpoint is corrupt, not missing, this window is observed again document=%s window=%d/%d lines=%d-%d file=%s error=%s: %s",
+                      document, ordinal, total, source_start, source_end, result_path, type(exc).__name__, exc, exc_info=True)
 
     if task_root:
-        task_root.mkdir(parents=True, exist_ok=True)
+        try:
+            task_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.error("window checkpoint directory could not be created, this document cannot be observed document=%s window=%d/%d stage=observe dir=%s error=%s: %s",
+                      document, ordinal, total, task_root, type(exc).__name__, exc, exc_info=True)
+            raise
     last_error = ""
     inventory: WindowInventory | None = None
     for attempt in range(1, max(1, config.planner_attempts) + 1):
@@ -256,7 +270,14 @@ async def _observe_one(
                 else WindowInventory.model_validate(raw)
             )
             if task_root:
-                write_json_atomic(task_root / f"attempt-{attempt:02d}-response.json", candidate)
+                try:
+                    write_json_atomic(task_root / f"attempt-{attempt:02d}-response.json", candidate)
+                except OSError as write_exc:
+                    # The write is inside the retry try: this ENOSPC/EACCES reaches the
+                    # `except Exception` below and the attempt is retried as a bad answer.
+                    log.error("usable model answer could not be saved, the attempt is retried as if the model failed document=%s window=%d/%d lines=%d-%d attempt=%d/%d file=%s error=%s: %s",
+                              document, ordinal, total, source_start, source_end, attempt, max(1, config.planner_attempts), task_root / f"attempt-{attempt:02d}-response.json", type(write_exc).__name__, write_exc, exc_info=True)
+                    raise
             inventory, error = validate_inventory(
                 candidate,
                 source_start=source_start,
@@ -264,6 +285,8 @@ async def _observe_one(
             )
             if error is None:
                 break
+            log.warning("window inventory rejected by validation document=%s window=%d/%d lines=%d-%d attempt=%d/%d reason=%.300s",
+                        document, ordinal, total, source_start, source_end, attempt, max(1, config.planner_attempts), error)
             last_error = error
         except Exception as exc:  # noqa: BLE001 - bounded retry with feedback
             last_error = f"{type(exc).__name__}: {exc}"[:1000]
@@ -274,6 +297,8 @@ async def _observe_one(
 
     mechanical = inventory is None
     if inventory is None:
+        log.error("every window observation attempt failed, a mechanical placeholder window is published instead document=%s window=%d/%d lines=%d-%d attempts=%d last_error=%.300s",
+                  document, ordinal, total, source_start, source_end, max(1, config.planner_attempts), last_error)
         inventory = _mechanical_inventory(
             source_start, source_end, len(lines), last_error
         )
@@ -287,16 +312,21 @@ async def _observe_one(
         mechanical=mechanical,
         note=last_error if mechanical else "",
     )
-    if result_path:
-        write_json_atomic(result_path, report)
-    if live_root:
-        live_root.mkdir(parents=True, exist_ok=True)
-        stem = f"window-{ordinal:06d}-lines-{source_start:06d}-{source_end:06d}"
-        write_json_atomic(live_root / f"{stem}.json", report)
-        write_text_atomic(
-            live_root / f"{stem}.md",
-            _window_markdown(report, block.text, total),
-        )
+    try:
+        if result_path:
+            write_json_atomic(result_path, report)
+        if live_root:
+            live_root.mkdir(parents=True, exist_ok=True)
+            stem = f"window-{ordinal:06d}-lines-{source_start:06d}-{source_end:06d}"
+            write_json_atomic(live_root / f"{stem}.json", report)
+            write_text_atomic(
+                live_root / f"{stem}.md",
+                _window_markdown(report, block.text, total),
+            )
+    except OSError as exc:
+        log.error("observed window could not be written, the window is not checkpointed and the observation stage stops document=%s window=%d/%d lines=%d-%d path=%s error=%s: %s",
+                  document, ordinal, total, source_start, source_end, result_path or live_root, type(exc).__name__, exc, exc_info=True)
+        raise
     return report, False
 
 

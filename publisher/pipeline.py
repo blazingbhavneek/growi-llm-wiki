@@ -202,7 +202,9 @@ def _folders(project: Project, *, allow_unlinked: bool = False) -> dict[str, Pat
         try:
             if json.loads(marker.read_text(encoding="utf-8")).get("status") not in ready:
                 continue
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            log.error("linker marker unreadable, document is invisible to publishing path=%s error=%s: %s",
+                      marker, type(exc).__name__, exc, exc_info=True)
             continue
         result[marker.parent.parent.relative_to(project.wiki).as_posix()] = marker.parent.parent
     return result
@@ -217,7 +219,8 @@ def _write_raw(path: Path, text: str) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, path)
-    except BaseException:
+    except BaseException as exc:
+        log.error("raw write failed path=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
         Path(name).unlink(missing_ok=True)
         raise
 
@@ -301,6 +304,8 @@ def _lock(project: Project):
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
+            log.error("publisher lock held by another run path=%s error=%s: %s",
+                      path, type(exc).__name__, exc, exc_info=True)
             raise RuntimeError("publisher already running") from exc
         try:
             yield
@@ -382,7 +387,9 @@ def _wiki_raw_rels(project: Project) -> list[str]:
     for marker in sorted(project.wiki.rglob("_planning/source.json")):
         try:
             result.append(str(json.loads(marker.read_text(encoding="utf-8"))["raw"]))
-        except (OSError, KeyError, TypeError, ValueError):
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            log.error("source marker unreadable, document dropped from pending links path=%s error=%s: %s",
+                      marker, type(exc).__name__, exc, exc_info=True)
             continue
     return list(dict.fromkeys(result))
 
@@ -469,7 +476,9 @@ def _capture_detected(
     inventory = None
     try:
         cursor = detector.cursor()
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError) as exc:
+        log.error("activity cursor unreadable, full inventory forced path=%s error=%s: %s",
+                  detector.path, type(exc).__name__, exc, exc_info=True)
         cursor = {}
     last_inventory = str(cursor.get("last_inventory_at") or "")
     audit_seconds = int(getattr(settings, "human_sync_activity_audit_seconds", 3600))
@@ -480,7 +489,9 @@ def _capture_detected(
 
             age = (datetime.now(timezone.utc) - datetime.fromisoformat(last_inventory.replace("Z", "+00:00"))).total_seconds()
             audit_due = age >= audit_seconds
-        except ValueError:
+        except ValueError as exc:
+            log.error("activity cursor timestamp invalid, inventory audit forced path=%s value=%s error=%s: %s",
+                      detector.path, last_inventory, type(exc).__name__, exc, exc_info=True)
             audit_due = True
     discovery_failures: list[str] = []
     if force_inventory or batch.fallback_reason or batch.unknown_page_ids or audit_due:
@@ -640,7 +651,7 @@ def _publish_sweep(
                                                  if Path(path).parent.as_posix() in set(folders) - blocked})
         except Exception as exc:
             blocked = set(folders)
-            log.exception("run=%s stage=preflight failed", run_id)
+            log.exception("run=%s stage=preflight failed error=%s: %s", run_id, type(exc).__name__, exc)
             failures.append(f"pull: {type(exc).__name__}: {exc}")
     documents = [
         (document, folder, _document_raw_rel(document))
@@ -717,7 +728,7 @@ def _publish_sweep(
                 path: row for path, row in ledger.published_pages.items() if not path.startswith(prefix)
             }
         except Exception as exc:
-            log.exception("run=%s document=%s stage=delete failed", run_id, document)
+            log.exception("run=%s document=%s stage=delete failed error=%s: %s", run_id, document, type(exc).__name__, exc)
             failures.append(f"{document}: {type(exc).__name__}: {exc}")
     if publisher is not None and settings is not None and not failures:
         # Index pages are derived: they follow a batch that published cleanly, and a
@@ -759,6 +770,9 @@ def _remove_sources(project: Project, ledger: Ledger, sources: dict[str, str]) -
                 touched = []
             shutil.rmtree(project.wiki_dir(raw_rel), ignore_errors=True)
             shutil.rmtree(project.state_dir(raw_rel), ignore_errors=True)
+            for leftover in (project.wiki_dir(raw_rel), project.state_dir(raw_rel)):
+                if leftover.exists():
+                    log.error("ledger claims deleted but the generated tree is still on disk path=%s", leftover)
             project.raw_file(raw_rel).unlink(missing_ok=True)
             _prune_empty_parents(project.wiki_dir(raw_rel).parent, project.wiki)
             _prune_empty_parents(project.state_dir(raw_rel).parent, project.metadata / "state")
@@ -784,7 +798,7 @@ def _remove_sources(project: Project, ledger: Ledger, sources: dict[str, str]) -
                 "rebuild": "full",
             })
         except Exception as exc:
-            log.exception("ドキュメントの削除に失敗: %s", rel)
+            log.exception("ドキュメントの削除に失敗: %s error=%s: %s", rel, type(exc).__name__, exc)
             failures.append(f"{rel}: {type(exc).__name__}: {exc}")
     return done, touched_raw, failures
 
@@ -844,12 +858,14 @@ def sync_once(
             from .history import candidate_is_clean, last_good
 
             if not candidate_is_clean(project, last_good(project)):
+                log.error("sync refused, last-good working tree is dirty root=%s", project.root)
                 raise RuntimeError("cannot sync from a dirty last-good working tree")
         ledger = load_ledger(ledger_path)
         scan = scan_mount(project.mount, ledger.sources)
         assert_unique_generated_paths(scan.files)
         publisher = _publisher(settings)
         if publisher is None:
+            log.error("GROWI_URL is not configured, sync/watch refused setting=GROWI_URL root=%s", project.root)
             raise RuntimeError("GROWI_URL is required for sync/watch; use build for local-only output")
         if on_revision is not None and hasattr(publisher, "on_revision"):
             publisher.on_revision = on_revision
@@ -857,10 +873,12 @@ def sync_once(
         scan_failures = [f"scan {rel}: {error}" for rel, error in scan.errors.items()
                          if wanted is None or rel in wanted or rel == "."]
         if scan_failures:
+            log.error("scan reported %d unreadable paths, sync stopped", len(scan_failures))
             return {"run_id": run_id, "done": [], "failures": scan_failures, "cancelled": False}
         if wanted is not None:
             missing = wanted - set(scan.files) - set(ledger.sources)
             if missing:
+                log.error("requested paths are not under the mount root=%s missing=%s", project.mount, sorted(missing))
                 raise FileNotFoundError(f"not under mount/: {sorted(missing)}")
         scoped_raw = {
             str(ledger.sources.get(rel, {}).get("raw_rel") or (
@@ -883,6 +901,7 @@ def sync_once(
             })
         save_ledger(ledger_path, ledger)
         if capture_failures:
+            log.error("GROWI revision capture failed, sync stopped failures=%s", "; ".join(capture_failures))
             if history_enabled:
                 from .history import checkpoint_live
                 from .human_changes import HumanStore
@@ -1066,7 +1085,7 @@ def sync_once(
                     parser_skips.append(rel)
                     log.warning("ドキュメントをスキップ: %s: %s", rel, exc, exc_info=True)
                 else:
-                    log.exception("run=%s path=%s stage=generate failed", run_id, rel)
+                    log.exception("run=%s path=%s stage=generate failed error=%s: %s", run_id, rel, type(exc).__name__, exc)
                 error = f"{type(exc).__name__}: {exc}"[:500]
                 ledger.sources[rel] = _source_row(
                     item, raw_rel, error, details=details, previous=previous_source,
@@ -1118,7 +1137,7 @@ def sync_once(
                 if should_continue is not None and not should_continue():
                     cancelled = True
                 else:
-                    log.exception("run=%s stage=link failed", run_id)
+                    log.exception("run=%s stage=link failed error=%s: %s", run_id, type(exc).__name__, exc)
                     failures.append(f"link: {type(exc).__name__}: {exc}")
         if should_continue is not None and not should_continue():
             cancelled = True
@@ -1169,6 +1188,7 @@ def delete_sources(
     project = open_project(settings)
     publisher = _publisher(settings)
     if publisher is None:
+        log.error("GROWI_URL is not configured, queued deletion refused setting=GROWI_URL root=%s", project.root)
         raise RuntimeError("GROWI_URL is required for queued deletion")
     if on_revision is not None and hasattr(publisher, "on_revision"):
         publisher.on_revision = on_revision
@@ -1245,6 +1265,7 @@ def move_sources(
     project = open_project(settings)
     publisher = _publisher(settings)
     if publisher is None:
+        log.error("GROWI_URL is not configured, queued move refused setting=GROWI_URL root=%s", project.root)
         raise RuntimeError("GROWI_URL is required for queued move")
     if on_revision is not None and hasattr(publisher, "on_revision"):
         publisher.on_revision = on_revision
@@ -1419,7 +1440,7 @@ def move_sources(
                                 exc_info=True, extra={"failure_summary": f"index: {type(exc).__name__}: {exc}"})
             save_ledger(ledger_path, ledger)
         except Exception as exc:
-            log.exception("ドキュメントの移動に失敗: %s", [(job.from_rel, job.rel) for job in jobs])
+            log.exception("ドキュメントの移動に失敗: %s error=%s: %s", [(job.from_rel, job.rel) for job in jobs], type(exc).__name__, exc)
             failures.append(f"move: {type(exc).__name__}: {exc}")
     return {
         "run_id": run_id,
@@ -1677,6 +1698,7 @@ def pull_growi_once(settings: Any, *, force_inventory: bool = False) -> dict[str
         from .history import candidate_is_clean, last_good
 
         if not candidate_is_clean(project, last_good(project), allow_initial_human_schema=True):
+            log.error("pull refused, last-good working tree is dirty root=%s", project.root)
             raise RuntimeError("cannot pull GROWI changes into a dirty last-good working tree")
     publisher = _publisher(settings)
     if publisher is None:
@@ -1716,6 +1738,7 @@ def pull_growi_once(settings: Any, *, force_inventory: bool = False) -> dict[str
                             activity_detector.path.unlink(missing_ok=True)
                     raise
         except Exception as exc:
+            log.error("GROWI pull failed run=%s error=%s: %s", run_id, type(exc).__name__, exc, exc_info=True)
             pulled = []
             failures = [f"pull: {type(exc).__name__}: {exc}"]
             detector = {"fallback_reason": "pull_exception"}
@@ -1761,7 +1784,9 @@ def build_wiki_only(settings: Any, *, only: list[str] | None = None, force: bool
             for marker in sorted(project.wiki.rglob("_planning/source.json")):
                 try:
                     raw_rel = str(json.loads(marker.read_text(encoding="utf-8"))["raw"])
-                except (KeyError, TypeError, ValueError):
+                except (KeyError, TypeError, ValueError) as exc:
+                    log.error("source marker unreadable, stale document not cleaned up path=%s error=%s: %s",
+                              marker, type(exc).__name__, exc, exc_info=True)
                     continue
                 if raw_rel in available or raw_rel in mount_raw:
                     continue
@@ -1773,9 +1798,12 @@ def build_wiki_only(settings: Any, *, only: list[str] | None = None, force: bool
                     touched = remove_document(project, raw_rel)
                     shutil.rmtree(project.wiki_dir(raw_rel), ignore_errors=True)
                     shutil.rmtree(project.state_dir(raw_rel), ignore_errors=True)
+                    for leftover in (project.wiki_dir(raw_rel), project.state_dir(raw_rel)):
+                        if leftover.exists():
+                            log.error("delete reported deleted but the generated tree is still on disk path=%s", leftover)
                     done.append({"path": raw_rel, "status": "deleted", "touched": touched})
                 except Exception as exc:
-                    log.exception("ドキュメントの削除に失敗: %s", raw_rel)
+                    log.exception("ドキュメントの削除に失敗: %s error=%s: %s", raw_rel, type(exc).__name__, exc)
                     failures.append(f"{raw_rel}: {type(exc).__name__}: {exc}")
         model = _model(settings, project) if pending else None
         for rel in rels:
@@ -1786,7 +1814,7 @@ def build_wiki_only(settings: Any, *, only: list[str] | None = None, force: bool
                 result = write_wiki_pages(project, rel, mode=str(settings.ingest_mode), settings=settings, llm=model, embedder=None, on_progress=on_progress, resume=not force)
                 done.append({"path": rel, "status": "built", "touched": result.touched})
             except Exception as exc:
-                log.exception("ドキュメントのビルドに失敗: %s", rel)
+                log.exception("ドキュメントのビルドに失敗: %s error=%s: %s", rel, type(exc).__name__, exc)
                 failures.append(f"{rel}: {type(exc).__name__}: {exc}")
     return {"run_id": run_id, "done": done, "failures": failures}
 
@@ -1820,7 +1848,7 @@ def link_raw(settings: Any, *, only: list[str] | None = None, force: bool = Fals
             touched = run_linkers(project, pending, settings=settings, llm=model, embedder=embedder, on_progress=on_progress)
             done.append({"status": "linked", "documents": pending, "touched": touched})
         except Exception as exc:
-            log.exception("ドキュメントのリンク処理に失敗: %s", pending)
+            log.exception("ドキュメントのリンク処理に失敗: %s error=%s: %s", pending, type(exc).__name__, exc)
             failures.append(f"link: {type(exc).__name__}: {exc}")
     return {"run_id": run_id, "done": done, "failures": failures}
 
@@ -1995,6 +2023,7 @@ def publish_only(
     project = open_project(settings)
     publisher = _publisher(settings)
     if publisher is None:
+        log.error("GROWI_URL is not configured, publish refused setting=GROWI_URL root=%s", project.root)
         raise RuntimeError("GROWI_URL is required for publish")
     ledger_path = project.metadata / "pipeline.json"
     run_id = "pub-" + uuid.uuid4().hex[:16]
@@ -2059,6 +2088,7 @@ def reset_growi(
     project = open_project(settings)
     publisher = _publisher(settings)
     if publisher is None:
+        log.error("GROWI_URL is not configured, reset refused setting=GROWI_URL root=%s", project.root)
         raise RuntimeError("GROWI_URL is required for reset")
     ledger_path = project.metadata / "pipeline.json"
     with _lock(project):

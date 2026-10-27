@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Literal, TypedDict
+
+log = logging.getLogger(__name__)
 
 
 Stage = Literal["convert", "wiki", "linker", "index", "publisher", "runner"]
@@ -50,6 +53,8 @@ class Context:
         try:
             yield
         except BaseException as exc:
+            # logged before the callback: emit may be None, and a callback failure must not eat the record.
+            log.error("stage=%s document=%s failed error=%s: %s", stage, document, type(exc).__name__, exc, exc_info=True)
             self.event(stage, "error", document=document, error=f"{type(exc).__name__}: {exc}", elapsed_seconds=round(time.monotonic() - started, 3))
             raise
         else:

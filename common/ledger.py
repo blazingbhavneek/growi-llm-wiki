@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .storage import read_json, write_json_atomic
+from .storage import _missing_reason, read_json, write_json_atomic
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -31,9 +34,18 @@ class Ledger:
 def load_ledger(path: Path) -> Ledger:
     target = Path(path)
     if not target.exists():
+        reason = _missing_reason(target)
+        if reason != "not found":
+            # an empty ledger on a permission error means every document looks unpublished.
+            log.error("pipeline ledger could not be read file=%s reason=%s; continuing with an empty ledger, so published documents may be republished", target, reason)
         return Ledger({}, {})
     data = read_json(target)
-    if not isinstance(data, dict) or data.get("schema_version") not in (1, 2, 3, 4):
+    if not isinstance(data, dict):
+        log.error("pipeline ledger is not a json object file=%s found=%s", target, type(data).__name__)
+        raise ValueError(f"invalid pipeline ledger: {target}")
+    version = data.get("schema_version")
+    if version not in (1, 2, 3, 4):
+        log.error("unsupported pipeline ledger schema_version file=%s version=%s (supported 1-4)", target, version)
         raise ValueError(f"invalid pipeline ledger: {target}")
     return Ledger(
         dict(data.get("sources") or {}),

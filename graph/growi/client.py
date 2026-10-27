@@ -110,22 +110,40 @@ class GrowiClient:
         json_body: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
         files: dict[str, tuple[str, bytes, str]] | None = None,
+        expected_statuses: tuple[int, ...] = (),
     ) -> httpx.Response:
-        async with httpx.AsyncClient(
-            timeout=self.timeout,
-            headers=self._headers(),
-            transport=self.transport,
-        ) as client:
-            response = await client.request(
-                method,
-                urljoin(self.api_base, path.lstrip("/")),
-                params=params,
-                json=json_body,
-                data=data,
-                files=files,
+        # This is the single exit for every GROWI status code and transport failure; the
+        # callers only re-raise, so the reason has to be recorded here.
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout,
+                headers=self._headers(),
+                transport=self.transport,
+            ) as client:
+                response = await client.request(
+                    method,
+                    urljoin(self.api_base, path.lstrip("/")),
+                    params=params,
+                    json=json_body,
+                    data=data,
+                    files=files,
+                )
+        except httpx.RequestError as exc:
+            log.error(
+                "GROWI network request failed (%s %s): %s - check server URL and network url=%s error=%s",
+                method, path, type(exc).__name__, self.url, exc, exc_info=True,
             )
+            raise
         if response.is_error:
             detail = response.text[:500]
+            hint = " - check the API token" if response.status_code == 401 else (
+                " - page changed by another editor" if response.status_code == 409 else ""
+            )
+            if response.status_code not in expected_statuses:
+                log.error(
+                    "GROWI request failed (%s %s): HTTP %s%s url=%s detail=%.120s",
+                    method, path, response.status_code, hint, self.url, detail,
+                )
             raise GrowiAPIError(response.status_code, method, path, detail)
         return response
 
@@ -171,8 +189,15 @@ class GrowiClient:
     async def health(self) -> bool:
         try:
             response = await self._request("GET", "/healthcheck")
-        except (GrowiAPIError, httpx.HTTPError):
+        except (GrowiAPIError, httpx.HTTPError) as exc:
+            # The caller only receives a bare False, so this is the caller-visible reason.
+            log.error(
+                "GROWI health check reports unreachable url=%s error=%s: %s",
+                self.url, type(exc).__name__, exc, exc_info=True,
+            )
             return False
+        if not response.is_success:
+            log.error("GROWI health check reports unreachable url=%s status=%s", self.url, response.status_code)
         return response.is_success
 
     async def get_page(
@@ -184,7 +209,7 @@ class GrowiClient:
             raise ValueError("provide exactly one of path or page_id")
         params = {"path": path} if path else {"pageId": page_id}
         try:
-            response = await self._request("GET", "/page", params=params)
+            response = await self._request("GET", "/page", params=params, expected_statuses=(404,))
         except GrowiAPIError as exc:
             if exc.status_code == 404:
                 return None
@@ -315,7 +340,16 @@ class GrowiClient:
                 "origin": "view",
             },
         )
-        return self._page_from_payload(response.json())
+        try:
+            return self._page_from_payload(response.json())
+        except Exception as exc:
+            # The remote write already happened: an unreadable body leaves the ledger
+            # prepared-but-unconfirmed, so the page ID has to be on the record.
+            log.error(
+                "GROWI page update response could not be read after the write succeeded page=%s error=%s: %s",
+                page_id, type(exc).__name__, exc, exc_info=True,
+            )
+            raise
 
     async def rename_page(self, page_id: str, revision_id: str, path: str, *, recursively: bool = False) -> GrowiPage:
         response = await self._request(
@@ -466,6 +500,11 @@ async def _publish_images(client: GrowiClient, body: str, page_id: str) -> str:
         try:
             content = base64.b64decode("".join(data.group("data").split()), validate=True)
         except (ValueError, binascii.Error) as exc:
+            log.error(
+                "embedded image is invalid page=%s image=%s error=%s: %s",
+                page_id, hashlib.sha256(match.src.encode("utf-8")).hexdigest()[:12],
+                type(exc).__name__, exc, exc_info=True,
+            )
             raise ValueError("invalid embedded image data") from exc
         extension = mimetypes.guess_extension(mime) or ".bin"
         if extension == ".jpe":
@@ -748,6 +787,10 @@ async def publish_pages(
                 status="existing" if existing is not None else "new",
             )
         except Exception as exc:
+            log.error(
+                "GROWI preflight check failed, no page was published page=%s error=%s: %s",
+                item.get("local_path") or item.get("path") or "<page>", type(exc).__name__, exc, exc_info=True,
+            )
             await report_page(
                 "page_failed",
                 index,
@@ -812,9 +855,27 @@ async def publish_pages(
     except Exception as exc:
         failed_index = len(results)
         failed_item = pages[failed_index] if failed_index < len(pages) else pages[-1]
+        log.error(
+            "GROWI publish stopped, the remaining pages were not published page=%s published=%d of=%d error=%s: %s",
+            failed_item.get("local_path") or failed_item.get("path") or "<page>", len(results), len(pages),
+            type(exc).__name__, exc, exc_info=True,
+        )
         await report_page("page_failed", failed_index, failed_item, error=f"{type(exc).__name__}: {exc}")
         raise
     return results
+
+
+def _save_publish_ledger(store: Any, data: dict[str, Any], *, page: str, step: str) -> None:
+    """The publish ledger is the only record that a page write landed; a failed write here
+    leaves the page prepared-but-unconfirmed for the next run, so it names the page."""
+    try:
+        store.save_page(data)
+    except Exception as exc:
+        log.error(
+            "GROWI publish ledger write failed page=%s step=%s error=%s: %s",
+            page, step, type(exc).__name__, exc, exc_info=True,
+        )
+        raise
 
 
 class GrowiPublisher:
@@ -846,7 +907,17 @@ class GrowiPublisher:
     def page_marker_seed(self, project: Any, local_path: str) -> str:
         """The readable page identity behind a page's stamp ID (the local half of the map)."""
         document = Path(local_path).parent.as_posix()
-        marker = read_json(Path(project.wiki) / document / "_planning" / "source.json", default={})
+        seed_file = Path(project.wiki) / document / "_planning" / "source.json"
+        try:
+            marker = read_json(seed_file, default={})
+        except (OSError, ValueError) as exc:
+            # A corrupt or unreadable seed is not a missing one: without the file name the
+            # page only ever reports "source mapping is missing" or a changed stamp ID.
+            log.error(
+                "GROWI page marker seed could not be read document=%s file=%s error=%s: %s",
+                document, seed_file, type(exc).__name__, exc, exc_info=True,
+            )
+            raise
         id_seed = str(marker.get("id_seed") or document)
         return growi_path(self.connection.write_path, id_seed, Path(local_path).name)
 
@@ -860,7 +931,14 @@ class GrowiPublisher:
         pages: list[dict[str, str]] = []
         for md in sorted(folder.glob("*.md")):
             name = growi_segment(md.name)
-            body = strip_reader_references(md.read_text(encoding="utf-8"))
+            try:
+                body = strip_reader_references(md.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError) as exc:
+                log.error(
+                    "local wiki page could not be read for publish document=%s file=%s error=%s: %s",
+                    doc_path, md, type(exc).__name__, exc, exc_info=True,
+                )
+                raise
             page_path = f"{doc_path}/{name}"
             local_path = md.relative_to(project.wiki).as_posix()
             page_id = self.page_marker_id(project, local_path)
@@ -927,7 +1005,7 @@ class GrowiPublisher:
                 if attempt.get("attempt_id") == attempt_id:
                     attempt.update({"status": "rejected" if reason == "revision_race" else "failed",
                                     "error": reason, "observed_revision": observed.revision_id})
-            store.save_page(data)
+            _save_publish_ledger(store, data, page=item["local_path"], step="conflict")
 
         def record_prepared(item: dict, inspected: GrowiPage | None, body: str) -> None:
             store = HumanStore(project)
@@ -962,7 +1040,7 @@ class GrowiPublisher:
                          "publication_error": "", "publication_error_attempt_id": "",
                          "prepared_remote_blob": remote_blob,
                          "prepared_local_blob": local_blob})
-            store.save_page(data)
+            _save_publish_ledger(store, data, page=item["local_path"], step="prepared")
 
         def record_confirmed(item: dict, page: GrowiPage, body: str) -> None:
             """Persist per-page success before the next page can be mutated."""
@@ -984,7 +1062,7 @@ class GrowiPublisher:
             for attempt in data.get("attempt_history", []):
                 if attempt.get("attempt_id") == attempt_id:
                     attempt.update({"status": "confirmed", **confirmation})
-            store.save_page(data)
+            _save_publish_ledger(store, data, page=item["local_path"], step="confirmed")
 
         def reconcile_prepared(item: dict, observed: GrowiPage) -> bool:
             """True when an unledgered page already holds exactly the body we prepared."""
@@ -1041,7 +1119,7 @@ class GrowiPublisher:
         data.update({"schema_version": 1, "marker_id": marker, "deleted_page_id": page.page_id,
                      "deleted_revision": page.revision_id, "deleted_path": page.path,
                      "deleted_remote_blob": store.put(page.body), "deleted_at": now()})
-        store.save_page(data)
+        _save_publish_ledger(store, data, page=local_path, step="deleted")
 
     def discover_documents(self, project: Any, rels: list[str]) -> dict[str, GrowiPage]:
         pages = [page for rel in dict.fromkeys(rels) for page in self._document_pages(project, rel)]
@@ -1204,7 +1282,17 @@ class GrowiPublisher:
                 markdown = managed_page_markdown(page.body, row["marker_id"])
                 if markdown is None:
                     raise ValueError("GROWI ownership markers were removed")
-                stamp = read_json(target.parent / "_planning" / "source.json", default={})
+                stamp_file = target.parent / "_planning" / "source.json"
+                try:
+                    stamp = read_json(stamp_file, default={})
+                except (OSError, ValueError) as exc:
+                    # Without the file name this surfaces later as a misleading
+                    # "source mapping is missing" block reason.
+                    log.error(
+                        "GROWI page marker seed could not be read document=%s file=%s error=%s: %s",
+                        document, stamp_file, type(exc).__name__, exc, exc_info=True,
+                    )
+                    raise
                 raw_rel = str(stamp.get("raw") or "")
                 if not raw_rel:
                     raise ValueError("source mapping is missing")
@@ -1225,13 +1313,20 @@ class GrowiPublisher:
                     continue
                 try:
                     accounted = store.account_prepared(row, page, remote=markdown)
-                except ValueError:
+                except ValueError as exc:
                     # An unconfirmed write (for example an HTTP 500) under a later revision: the page
                     # history decides. Only if no revision holds its exact body did it never land.
                     prepared = store.prepared_pending(row["marker_id"], page)
                     bodies = asyncio.run(self.client.revision_bodies(page.page_id)) if hasattr(self.client, "revision_bodies") else None
                     if bodies is None or store.get(prepared["prepared_remote_blob"]) in bodies:
                         raise
+                    # The original failure is dropped here, so it has to be on the record:
+                    # our prepared body never landed on the page.
+                    log.error(
+                        "GROWI publish attempt did not land on the page document=%s page=%s attempt=%s error=%s: %s",
+                        document, local_path, str(prepared.get("prepared_attempt_id") or ""),
+                        type(exc).__name__, exc, exc_info=True,
+                    )
                     store.settle_prepared(prepared, status="not_landed")
                     accounted = {}
                 if accounted.get("exact"):
@@ -1246,7 +1341,17 @@ class GrowiPublisher:
                         document, local_path, page.revision_id,
                     )
                     continue
-                local = target.read_text(encoding="utf-8") if not baseline else store.get(baseline["local_blob"])
+                if not baseline:
+                    try:
+                        local = target.read_text(encoding="utf-8")
+                    except (OSError, UnicodeDecodeError) as exc:
+                        log.error(
+                            "local wiki page could not be read for pull document=%s file=%s error=%s: %s",
+                            raw_rel, target, type(exc).__name__, exc, exc_info=True,
+                        )
+                        raise
+                else:
+                    local = store.get(baseline["local_blob"])
                 if not baseline:
                     # Old ledgers have no exact remote snapshot. A clean revision
                     # can establish one; a changed one cannot be told apart from
@@ -1305,13 +1410,24 @@ class GrowiPublisher:
                         "GROWIユーザー編集の複雑な差分をマージしています: ドキュメント=%s ページ=%s",
                         raw_rel, local_path,
                     )
-                    merged, entries = rebase(
-                        {page_name: editable(previous_remote)},
-                        {page_name: editable(markdown)},
-                        {page_name: editable(previous_local)},
-                        model=model if policy.captures else None,
-                        concurrency=getattr(model, "concurrency", 1),
-                    )
+                    try:
+                        merged, entries = rebase(
+                            {page_name: editable(previous_remote)},
+                            {page_name: editable(markdown)},
+                            {page_name: editable(previous_local)},
+                            model=model if policy.captures else None,
+                            concurrency=getattr(model, "concurrency", 1),
+                        )
+                    except (OSError, KeyError, TypeError, ValueError):
+                        raise  # the pull handler below blocks this page and names the reason
+                    except Exception as exc:
+                        # A model outage is outside that tuple: it aborts the whole pull and
+                        # skips every remaining page, so name the page before it propagates.
+                        log.error(
+                            "GROWI human-edit merge model call failed document=%s page=%s error=%s: %s",
+                            raw_rel, local_path, type(exc).__name__, exc, exc_info=True,
+                        )
+                        raise
                     canonical = merged[page_name]
                     for entry in entries:
                         if entry.strip() and entry not in canonical:
@@ -1365,9 +1481,19 @@ class GrowiPublisher:
                         )
                 row["observed_revision_id"] = page.revision_id
                 if base != human:
-                    rewritten = sorted(store.accept(
-                        raw_rel, local_path, row["marker_id"], page.revision_id, base, human, model=model,
-                    ))
+                    try:
+                        rewritten = sorted(store.accept(
+                            raw_rel, local_path, row["marker_id"], page.revision_id, base, human, model=model,
+                        ))
+                    except (OSError, KeyError, TypeError, ValueError):
+                        raise  # the pull handler below blocks this page and names the reason
+                    except Exception as exc:
+                        # Outside the pull handler's tuple: the whole pull aborts here.
+                        log.error(
+                            "GROWI human-edit capture model call failed document=%s page=%s error=%s: %s",
+                            raw_rel, local_path, type(exc).__name__, exc, exc_info=True,
+                        )
+                        raise
                     pulled.extend(rewritten)
                     decisions["captured"] += 1
                     operation_ja = {"add": "追加", "delete": "削除", "replace": "更新"}[proposed_operation]
@@ -1396,8 +1522,14 @@ class GrowiPublisher:
                     if settled.get("prepared_attempt_id") == accounted["attempt_id"]:
                         store.settle_prepared(settled, status="captured_late_human")
             except (OSError, KeyError, TypeError, ValueError) as exc:
-                log.exception("GROWIのプルに失敗: %s", local_path)
                 reason = str(exc)
+                # A plain ValueError is one of this loop's expected block states (remote
+                # deleted or moved, ownership markers removed, no source mapping); anything
+                # else, including corrupt-JSON and encoding subclasses, is unexpected.
+                if type(exc) is ValueError:
+                    log.error("GROWIのプルをブロックしました: ページ=%s 理由=%s", local_path, reason)
+                else:
+                    log.exception("GROWIのプルに失敗: %s", local_path)
                 store.block_page(local_path, row, reason, page)
                 blocked.add(document)
                 conflicts.append(f"{local_path}: {reason}")

@@ -7,6 +7,7 @@ import json
 import logging
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -47,6 +48,23 @@ def _concurrency(settings: Any) -> int:
 
 class LinkerCancelled(RuntimeError):
     pass
+
+
+@contextmanager
+def _catalog_lock(catalog: Catalog, project: Any, *, stage: str):
+    """One reason line for a lock that cannot be taken; only acquisition is reported here."""
+
+    lock = catalog.lock(project)
+    try:
+        lock.__enter__()
+    except OSError as exc:
+        log.error("linker lock unavailable stage=%s project=%s error=%s: %s (another linker run holds it, or the lock folder is unwritable)",
+                  stage, project.metadata, type(exc).__name__, exc, exc_info=True)
+        raise
+    try:
+        yield
+    finally:
+        lock.__exit__(None, None, None)
 
 
 @dataclass
@@ -148,7 +166,12 @@ def _raw_rel(catalog: Catalog, document: str) -> str:
 
 def _big_document(project: Any, document: str) -> bool:
     originals = Path(project.wiki) / document / "_planning" / "pages"
-    return sum(len(page.read_text(encoding="utf-8").splitlines()) for page in originals.glob("*.md")) >= BIG_DOCUMENT_LINES
+    try:
+        return sum(len(page.read_text(encoding="utf-8").splitlines()) for page in originals.glob("*.md")) >= BIG_DOCUMENT_LINES
+    except (OSError, UnicodeDecodeError) as exc:
+        log.error("document pages could not be measured for the render limit document=%s path=%s error=%s: %s",
+                  document, originals, type(exc).__name__, exc, exc_info=True)
+        raise
 
 
 def _navigation_path(project: Any, document: str) -> Path:
@@ -255,8 +278,10 @@ async def _curate_page(
                 item["placement"] = "footer"
                 item["anchor"] = ""
         return _valid_choices(proposed, pool, inline_limit=inline_limit, footer_limit=footer_limit), candidate_ids
-    except Exception:
+    except Exception as exc:
         # A transient curator failure must not erase good links already visible to readers.
+        log.error("page reference curator failed page=%s kept_references=%d error=%s: %s (the page keeps its previous references, so new links stay invisible and stale ones stay visible)",
+                  page_rel, len(current), type(exc).__name__, exc, exc_info=True)
         return (current or [{"edge_id": edge.edge_id, "placement": "footer", "anchor": "", "summary": edge.summary or edge.peer_summary} for edge in pool[:3]]), candidate_ids
 
 
@@ -284,11 +309,19 @@ async def render_pages(
         doc, filename = page_rel.rsplit("/", 1)
         original_path = Path(project.wiki) / doc / "_planning" / "pages" / filename
         if not original_path.exists():
+            # a page removed from the document lands here on every incremental run
+            log.debug("page source missing, its references are not updated page=%s path=%s", page_rel, original_path)
             continue
         nav = navigation_by_doc.setdefault(doc, _navigation(project, doc))
         page_state = nav.setdefault("pages", {}).get(filename, {})
         edges = [_edge_from_row(row, page_rel) for row in catalog.edges_for_page(page_rel)]
-        jobs.append((page_rel, doc, original_path, strip_reader_references(original_path.read_text(encoding="utf-8")), edges, page_state, _big_document(project, doc)))
+        try:
+            original = strip_reader_references(original_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError) as exc:
+            log.error("page source could not be read page=%s path=%s error=%s: %s (the page is not re-rendered, its links stay as they are)",
+                      page_rel, original_path, type(exc).__name__, exc, exc_info=True)
+            raise
+        jobs.append((page_rel, doc, original_path, original, edges, page_state, _big_document(project, doc)))
 
     async def curate(job: tuple[str, str, Path, str, list[RenderEdge], dict[str, Any], bool]):
         nonlocal completed
@@ -312,11 +345,24 @@ async def render_pages(
         page_rel, doc, original_path, original, edges, _state, big = job
         navigation_by_doc[doc].setdefault("pages", {})[original_path.name] = {"version": reference_version, "candidate_ids": candidate_ids, "references": choices}
         rendered = render_page(original, page_rel=page_rel, edges=edges, mode=mode, big_document=big, choices=choices, settings=settings)
-        if write_if_changed(Path(project.wiki) / page_rel, rendered):
+        page_path = Path(project.wiki) / page_rel
+        try:
+            changed = write_if_changed(page_path, rendered)
+        except OSError as exc:
+            log.error("rendered page could not be written page=%s path=%s error=%s: %s (readers keep the previous links for this page)",
+                      page_rel, page_path, type(exc).__name__, exc, exc_info=True)
+            raise
+        if changed:
             touched.add(doc)
     for doc, navigation in navigation_by_doc.items():
         navigation["schema_version"] = 1
-        write_json_atomic(_navigation_path(project, doc), navigation)
+        navigation_path = _navigation_path(project, doc)
+        try:
+            write_json_atomic(navigation_path, navigation)
+        except OSError as exc:
+            log.error("page reference state could not be written document=%s path=%s error=%s: %s (the next run re-plans every page of this document)",
+                      doc, navigation_path, type(exc).__name__, exc, exc_info=True)
+            raise
     return touched
 
 
@@ -376,6 +422,8 @@ async def _filter_groups(catalog: Catalog, model: Any, target: Any, candidates_:
                 write_text_atomic(artifact_dir / f"{artifact_name}-error.txt", f"{type(exc).__name__}: {exc}")
             if strict:
                 raise
+            log.error("edge model call failed stage=edges document=%s target=%s group=%s mode=%s error=%s: %s (the candidate group is dropped, no links are judged from it)",
+                      target.document, target.chunk_id, artifact_name, mode, type(exc).__name__, exc, exc_info=True)
             continue
         allowed = {item.chunk_id for item, _row in pairs}
         for suggestion in result.edges:
@@ -408,7 +456,9 @@ async def _filter_target(catalog, model, target, candidates_, *, mode, version, 
             from .jev_judge import judge_edges
             return (await judge_edges(catalog, jev_engine, target, candidates_, settings, model=model)), len(candidates_), 0
         except Exception as exc:
-            log.warning("Jev edge judge failed for %s: %s", target.chunk_id, exc)
+            # graph/linker/jev_judge.py already logged the failure itself at ERROR with the
+            # document; this line is only the fallback notice.
+            log.warning("Jev edge judge unavailable for %s; using the LLM judge instead: %s", target.chunk_id, exc)
             accepted, calls = await _filter_groups(
                 catalog, model, target, candidates_, mode, version,
                 artifact_dir, stop_check, output_language, strict=strict, settings=settings,
@@ -451,14 +501,26 @@ async def link_document(
     if mode not in {"legacy", "neo"}:
         raise ValueError("wiki_linker_mode must be legacy or neo")
     planning = Path(project.wiki_dir(rel)) / "_planning"
-    planning.mkdir(parents=True, exist_ok=True)
+    try:
+        planning.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.error("planning folder could not be created document=%s path=%s error=%s: %s (disk full, read-only, or the volume is not mounted?)",
+                  document, planning, type(exc).__name__, exc, exc_info=True)
+        raise
     run_id = "lrun-" + uuid.uuid4().hex[:20]
     id_seed = _id_seed(planning, document)
     # A document without a complete marker (first run, failed run, rebuild) gets a
     # candidate pass for every chunk, even ones the catalog already knows from
     # bootstrapping; metadata is still reused through the chunks.json cache.
     previously_complete = _previously_complete(planning)
-    write_json_atomic(planning / "linker.json", policy.stamp({"schema_version": 2, "status": "pending", "mode": mode, "run_id": run_id}))
+    pending_marker = planning / "linker.json"
+    try:
+        write_json_atomic(pending_marker, policy.stamp({"schema_version": 2, "status": "pending", "mode": mode, "run_id": run_id}))
+    except OSError as exc:
+        log.error("linker start marker could not be written document=%s path=%s run=%s error=%s: %s (the run is not visible to publishing and cannot be resumed)",
+                  rel, pending_marker, run_id, type(exc).__name__, exc, exc_info=True)
+        raise
+    log.info("linker run started document=%s run=%s mode=%s judge=%s render=%s", rel, run_id, mode, judge, render)
     if on_progress:
         on_progress({"stage": "linker", "step": "pending", "document": rel})
     catalog: Catalog | None = None
@@ -477,7 +539,7 @@ async def link_document(
                 log.warning("Jev linker engine unavailable; using LLM: %s", exc)
                 jev_fallbacks += 1
         catalog = Catalog.open(project.linker_database, mode=mode, edge_version=edge_version)
-        with catalog.lock(project):
+        with _catalog_lock(catalog, project, stage="link-document"):
             catalog.sync_from_planning(project, skip_document=document)
             chunk_cache_path = planning / "chunks.json"
             incremental_scope = changed_page_rels is not None and previously_complete
@@ -490,6 +552,7 @@ async def link_document(
             original_hashes = chunks.snapshot_originals(project.wiki_dir(rel))
             if on_progress:
                 on_progress({"stage": "linker-entities", "step": "start", "document": rel})
+            log.info("chunk metadata stage started document=%s run=%s", rel, run_id)
             all_chunks = _page_chunks(planning, document, team, id_seed)
             old_rows = {row["chunk_id"]: row for row in catalog.chunks_for_document(document)}
             old_titles = {
@@ -552,6 +615,8 @@ async def link_document(
                     "current": reported_chunks, "total": reported_chunks,
                     "catalog_total": len(all_chunks),
                 })
+            log.info("chunk scope resolved document=%s run=%s chunks=%d to_describe=%d scope=%s",
+                     rel, run_id, len(all_chunks), reported_chunks, "incremental" if incremental_scope else "full")
             run_dir = Path(project.state_dir(rel)) / "work" / "linker" / run_id
             meta_calls, meta_fallbacks = (0, 0)
             revised_ids: set[str] = set()
@@ -582,7 +647,12 @@ async def link_document(
             chunk_data["raw_rel"] = rel
             for page in chunk_data["pages"]:
                 page["original_sha256"] = original_hashes.get(page["filename"], "")
-            write_json_atomic(planning / "chunks.json", chunk_data)
+            try:
+                write_json_atomic(planning / "chunks.json", chunk_data)
+            except OSError as exc:
+                log.error("chunk metadata cache could not be written document=%s path=%s run=%s error=%s: %s (the next run describes every chunk again)",
+                          rel, planning / "chunks.json", run_id, type(exc).__name__, exc, exc_info=True)
+                raise
             known_team_names = {name_norm for name_norm, _name in catalog.entity_names(team)}
             catalog.upsert_chunks(all_chunks)
             if judge == "jev" and jev_engine is not None:
@@ -612,6 +682,8 @@ async def link_document(
                     "current": metadata_total, "total": metadata_total,
                     "chunks": len(all_chunks), "meta_calls": meta_calls,
                 })
+            log.info("chunk metadata done document=%s run=%s chunks=%d meta_calls=%d meta_fallbacks=%d",
+                     rel, run_id, len(all_chunks), meta_calls, meta_fallbacks)
             changed_ids = stale_ids | revised_ids
             affected_ids = changed_ids | set(diff["removed"])
             relevant_edges = [
@@ -643,6 +715,7 @@ async def link_document(
 
             if on_progress:
                 on_progress({"stage": "linker-edges", "step": "start", "document": rel})
+            log.info("edge stage started document=%s run=%s", rel, run_id)
             edge_rows: list[dict[str, Any]] = []
             incremental_candidate_edges: dict[tuple[str, str], dict[str, Any]] = {}
             candidates_for: list[tuple[Any, list[Candidate]]] = []
@@ -744,6 +817,9 @@ async def link_document(
                     "existing_edges": len(relevant_edges),
                     "checked_edges": sum(len(found) for _item, found in candidates_for),
                 })
+            if incremental_scope:
+                log.info("incremental edge scope document=%s run=%s changed_chunks=%d existing_edges=%d checked_edges=%d",
+                         rel, run_id, len(changed_ids), len(relevant_edges), sum(len(found) for _item, found in candidates_for))
             unresolved: list[tuple[chunks.Chunk, list[Candidate]]] = []
             for item, found in candidates_for:
                 pending: list[Candidate] = []
@@ -773,6 +849,7 @@ async def link_document(
                     "stage": "linker-edges", "step": "targets", "document": rel,
                     "current": 0, "total": len(unresolved),
                 })
+            log.info("edge targets queued document=%s run=%s targets=%d", rel, run_id, len(unresolved))
             concurrency = _concurrency(settings)
             semaphore = asyncio.Semaphore(concurrency)
             completed = 0
@@ -877,6 +954,7 @@ async def link_document(
                     "current": len(unresolved), "total": len(unresolved),
                     "pages": len(pages), "edge_calls": edge_calls,
                 })
+            log.info("edge stage done document=%s run=%s pages=%d edge_calls=%d", rel, run_id, len(pages), edge_calls)
             all_docs = {
                 document,
                 *{page.rsplit("/", 1)[0] for page in pages},
@@ -890,12 +968,26 @@ async def link_document(
             }
             catalog.write_links_json(project, all_docs)
             complete = {"schema_version": 2, "status": "complete" if render else "render_pending", "mode": mode, "scope": "incremental" if incremental_scope else "full", "meta_version": meta_version, "edge_version": edge_version, "run_id": run_id, "chunks_total": len(all_chunks), "chunks_new": len(diff["new"]) + len(diff["changed"]), "meta_calls": meta_calls, "edge_calls": edge_calls, "meta_fallbacks": meta_fallbacks, "jev_fallbacks": jev_fallbacks, "edges_added": inserted_edges, "edges_removed": diff.get("edges_removed", 0), "touched_documents": sorted(touched_docs), "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-            write_json_atomic(planning / "linker.json", policy.stamp(complete))
+            try:
+                write_json_atomic(planning / "linker.json", policy.stamp(complete))
+            except OSError as exc:
+                log.error("linker completion marker could not be written document=%s path=%s run=%s error=%s: %s (the links are computed but the document stays marked incomplete and is linked again)",
+                          rel, planning / "linker.json", run_id, type(exc).__name__, exc, exc_info=True)
+                raise
             if on_progress:
                 on_progress({"stage": "linker", "step": "done", "document": rel, "edges": len(edge_rows)})
+            log.info("linker run finished document=%s run=%s scope=%s edges_added=%d edges_removed=%d pages=%d touched=%d",
+                     rel, run_id, complete["scope"], inserted_edges, int(diff.get("edges_removed", 0)), len(pages), len(touched_docs))
             return LinkResult(sorted(touched_docs), inserted_edges, int(diff.get("edges_removed", 0)), meta_calls, edge_calls, meta_fallbacks, sorted(pages), jev_fallbacks)
     except Exception as exc:
-        write_json_atomic(planning / "linker.json", policy.stamp({"schema_version": 2, "status": "failed", "mode": mode, "run_id": run_id, "error": f"{type(exc).__name__}: {exc}"[:500]}))
+        log.error("linker failed for document %s (run %s): %s: %s", rel, run_id, type(exc).__name__, exc, exc_info=True)
+        failed_marker = planning / "linker.json"
+        try:
+            write_json_atomic(failed_marker, policy.stamp({"schema_version": 2, "status": "failed", "mode": mode, "run_id": run_id, "error": f"{type(exc).__name__}: {exc}"[:500]}))
+        except Exception as marker_exc:  # noqa: BLE001 - the marker must not become the only error on disk
+            log.error("linker failure marker could not be written document=%s path=%s run=%s error=%s: %s (the error logged above is the real one)",
+                      rel, failed_marker, run_id, type(marker_exc).__name__, marker_exc, exc_info=True)
+            raise
         if on_progress:
             on_progress({"stage": "linker", "step": "failed", "document": rel, "error": str(exc)[:200]})
         raise
@@ -931,18 +1023,24 @@ async def link_documents(
     if pages:
         catalog = Catalog.open(project.linker_database, mode=mode)
         try:
-            with catalog.lock(project):
+            with _catalog_lock(catalog, project, stage="batch-render"):
                 touched_docs = await render_pages(project, catalog, pages, model=model, settings=settings, mode=mode, on_progress=on_progress)
                 aggregate.touched_documents = sorted(_raw_rel(catalog, doc) for doc in touched_docs)
                 catalog.write_links_json(project, {page.rsplit("/", 1)[0] for page in pages})
         finally:
             catalog.close()
+        log.info("linker batch rendered documents=%d pages=%d touched=%d", len(rels), len(pages), len(aggregate.touched_documents))
     for rel in rels:
         marker = Path(project.wiki_dir(rel)) / "_planning" / "linker.json"
         data = read_json(marker, default={})
         if data.get("status") == "render_pending":
             data["status"] = "complete"
-            write_json_atomic(marker, data)
+            try:
+                write_json_atomic(marker, data)
+            except OSError as exc:
+                log.error("linker completion marker could not be written document=%s path=%s error=%s: %s (the document stays marked render_pending and is linked again)",
+                          rel, marker, type(exc).__name__, exc, exc_info=True)
+                raise
     aggregate.affected_pages = sorted(pages)
     return aggregate
 
@@ -951,10 +1049,12 @@ def remove_document(project: Any, rel: str, *, settings: Any = None) -> list[str
     """Drop a document's chunks/edges and re-render every peer it was linked to."""
     document = _document(project, rel)
     if not Path(project.linker_database).exists():
+        log.warning("linker catalog is missing, nothing was unlinked document=%s path=%s (its links stay in every peer page; on a fresh project this is expected)",
+                    document, project.linker_database)
         return []
     catalog = Catalog.open(project.linker_database, mode=Catalog.stored_mode(project.linker_database) or "legacy")
     try:
-        with catalog.lock(project):
+        with _catalog_lock(catalog, project, stage="remove-document"):
             peers = catalog.delete_document(document)
             touched: set[str] = set()
             for peer in peers:
@@ -970,10 +1070,29 @@ def remove_document(project: Any, rel: str, *, settings: Any = None) -> list[str
                     inline_limit, footer_limit = render_limits(page_mode, big_document, settings)
                     choices = _valid_choices(list(page_state.get("references", [])), footer_edges(edges, page_rel=page_rel, limit=None), inline_limit=inline_limit, footer_limit=footer_limit)
                     navigation.setdefault("pages", {})[original.name] = {"candidate_ids": [], "references": choices}
-                    rendered = render_page(original.read_text(encoding="utf-8"), page_rel=page_rel, edges=edges, mode=page_mode, big_document=big_document, choices=choices, settings=settings)
-                    if write_if_changed(folder / original.name, rendered):
+                    try:
+                        source = original.read_text(encoding="utf-8")
+                    except (OSError, UnicodeDecodeError) as exc:
+                        log.error("page source could not be read page=%s path=%s error=%s: %s (the links to the removed document stay on the page)",
+                                  page_rel, original, type(exc).__name__, exc, exc_info=True)
+                        raise
+                    rendered = render_page(source, page_rel=page_rel, edges=edges, mode=page_mode, big_document=big_document, choices=choices, settings=settings)
+                    page_path = folder / original.name
+                    try:
+                        changed = write_if_changed(page_path, rendered)
+                    except OSError as exc:
+                        log.error("rendered page could not be written page=%s path=%s error=%s: %s (the links to the removed document stay on the page)",
+                                  page_rel, page_path, type(exc).__name__, exc, exc_info=True)
+                        raise
+                    if changed:
                         touched.add(_raw_rel(catalog, peer))
-                write_json_atomic(_navigation_path(project, peer), navigation)
+                navigation_path = _navigation_path(project, peer)
+                try:
+                    write_json_atomic(navigation_path, navigation)
+                except OSError as exc:
+                    log.error("page reference state could not be written document=%s path=%s error=%s: %s (the next run re-plans every page of this document)",
+                              peer, navigation_path, type(exc).__name__, exc, exc_info=True)
+                    raise
                 catalog.write_links_json(project, [peer])
             return sorted(touched)
     finally:

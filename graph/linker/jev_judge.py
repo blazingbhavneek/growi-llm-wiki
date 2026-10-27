@@ -62,7 +62,8 @@ async def check_roles(engine, chunks, settings):
         except Exception as exc:
             fallback += len(entities)
             complete = False
-            log.warning("Jev role check failed for chunk %s: %s", item.chunk_id, exc)
+            log.error("Jev role check failed stage=roles chunk=%s document=%s entities=%d error=%s: %s (entity roles stay the LLM guess, related-page edges are dropped)",
+                      item.chunk_id, item.document, len(entities), type(exc).__name__, exc, exc_info=True)
         if complete:
             item.meta.role_judge = "jev-1"
     return fallback
@@ -90,7 +91,12 @@ async def resolve_aliases(catalog, engine, team, new_names, settings):
             state = {"A": {"name": names[a], "text": _defining_text(catalog, team, a)},
                      "B": {"name": names[b], "text": _defining_text(catalog, team, b)}}
             question = JevQuestion(JEV_ALIAS_QUESTION)
-            result = (await engine.adecide_many(state, [question]))[0]
+            try:
+                result = (await engine.adecide_many(state, [question]))[0]
+            except Exception as exc:
+                log.error("Jev alias check failed stage=alias team=%s pair=%s|%s error=%s: %s (the two names stay unmerged)",
+                          team, a, b, type(exc).__name__, exc, exc_info=True)
+                raise
             cached = _p(result)
             catalog.alias_decision_put(team, a, b, ALIAS_VERSION, cached)
     parent = {name: name for name in names}
@@ -127,7 +133,12 @@ async def primary_definer(catalog, engine, team, canon, definers, settings):
         if row:
             requests.append(JevRequest({"section": str(row["body"])[:6000]},
                                        JevQuestion(JEV_MAIN_DEFINITION_QUESTION.format(name=canon), key=cid)))
-    results = await engine.adecide_batch(requests)
+    try:
+        results = await engine.adecide_batch(requests)
+    except Exception as exc:
+        log.error("Jev primary definer call failed stage=primary-definer team=%s name=%s definers=%d error=%s: %s (no definer is picked, the candidates stay unresolved)",
+                  team, canon, len(requests), type(exc).__name__, exc, exc_info=True)
+        raise
     return max(results, key=_p).key if results else ""
 
 
@@ -212,7 +223,12 @@ async def judge_edges(catalog, engine, target, candidates, settings, model=None)
             top.append((candidate, q, 1.0, row))
         else:
             screen.append((candidate, q))
-    screened = await engine.adecide_batch([JevRequest(screen_state, q) for _candidate, q in screen])
+    try:
+        screened = await engine.adecide_batch([JevRequest(screen_state, q) for _candidate, q in screen])
+    except Exception as exc:
+        log.error("Jev screening call failed stage=screen target=%s document=%s candidates=%d error=%s: %s (no related-page edges are kept for this chunk)",
+                  target.chunk_id, target.document, len(screen), type(exc).__name__, exc, exc_info=True)
+        raise
     top.extend((candidate, q, _p(result), rows[candidate.chunk_id]) for (candidate, q), result in zip(screen, screened)
                if _p(result) >= settings.wiki_linker_screen_threshold)
     top.sort(key=lambda item: item[2], reverse=True)
@@ -230,7 +246,12 @@ async def judge_edges(catalog, engine, target, candidates, settings, model=None)
             verify_reqs.append(JevRequest(verify_state, JevQuestion(
                 _candidate_block(row, body=part) + "\n" + JEV_VERIFY_QUESTION, key=candidate.chunk_id)))
             verify_owners.append(candidate.chunk_id)
-    verified = await engine.adecide_batch(verify_reqs)
+    try:
+        verified = await engine.adecide_batch(verify_reqs)
+    except Exception as exc:
+        log.error("Jev verify call failed stage=verify target=%s document=%s questions=%d error=%s: %s (no related-page edges are kept for this chunk)",
+                  target.chunk_id, target.document, len(verify_reqs), type(exc).__name__, exc, exc_info=True)
+        raise
     best = {}
     for cid, result in zip(verify_owners, verified):
         p = _p(result)
@@ -259,7 +280,8 @@ async def _llm_says_yes(model, target, row) -> bool:
     try:
         reply = await model.text(messages, max_output_tokens=TIEBREAK_MAX_TOKENS)
     except Exception as exc:  # noqa: BLE001 - no second opinion means Jev's "no" stands
-        log.warning("LLM tie-break failed for %s: %s", target.chunk_id, exc)
+        log.error("LLM tie-break failed stage=tiebreak target=%s candidate=%s error=%s: %s (Jev's no stands, the related-page edge is dropped)",
+                  target.chunk_id, row["page_rel"], type(exc).__name__, exc, exc_info=True)
         return False
     last = next((line.strip() for line in reversed(str(reply).splitlines()) if line.strip()), "")
     return "はい" in last and "いいえ" not in last
@@ -268,10 +290,15 @@ async def _llm_says_yes(model, target, row) -> bool:
 async def curate(engine, page_text, edges, settings):
     if not edges:
         return []
-    results = await engine.adecide_many(page_text, [JevQuestion(
-        JEV_CURATE_QUESTION.format(peer_title=edge.get('peer_title', ''), peer_heading=edge.get('peer_heading', ''),
-                                   peer_summary=edge.get('summary', '')), key=edge["edge_id"])
-        for edge in edges])
+    try:
+        results = await engine.adecide_many(page_text, [JevQuestion(
+            JEV_CURATE_QUESTION.format(peer_title=edge.get('peer_title', ''), peer_heading=edge.get('peer_heading', ''),
+                                       peer_summary=edge.get('summary', '')), key=edge["edge_id"])
+            for edge in edges])
+    except Exception as exc:
+        log.error("Jev page curation call failed stage=curate edges=%d first_edge=%s error=%s: %s (the page keeps all of its uncurated references)",
+                  len(edges), edges[0]["edge_id"], type(exc).__name__, exc, exc_info=True)
+        raise
     ranked = [key for _probability, key in sorted(((_p(result), result.key) for result in results if _p(result) >= .5), reverse=True)]
     # Links to other documents get their own slots, so a page's many sibling links in a
     # large document cannot push them out.
@@ -282,7 +309,12 @@ async def curate(engine, page_text, edges, settings):
 
 async def related_documents(engine, doc_cards, settings):
     requests = [JevRequest({"A": a, "B": b}, JevQuestion(JEV_DOCUMENT_RELATION_QUESTION, key=key), key) for key, a, b in doc_cards]
-    results = await engine.adecide_batch(requests)
+    try:
+        results = await engine.adecide_batch(requests)
+    except Exception as exc:
+        log.error("Jev document relation call failed stage=related-documents pairs=%d first=%s error=%s: %s (no related documents are listed)",
+                  len(requests), requests[0].key if requests else "", type(exc).__name__, exc, exc_info=True)
+        raise
     return {result.key for result in results if _p(result) >= .5}
 
 

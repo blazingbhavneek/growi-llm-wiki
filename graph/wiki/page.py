@@ -8,6 +8,7 @@ rewrite verbatim, where cross-page facts go, and which titles get linked.
 from __future__ import annotations
 
 import html
+import logging
 import re
 from collections import Counter
 from typing import Callable, Sequence
@@ -17,6 +18,8 @@ from .markdown_blocks import atomic_windows, build_block_index
 from .wire import ReferenceFact
 from graph.common.markdown import strip_image_media
 from graph.common.images import strip_images
+
+log = logging.getLogger(__name__)
 
 HEADING_RE = re.compile(r"^#{1,4} \S")
 # The third alternative covers the short letter+digit constants (``T1``, ``P0``, ``30Wh``)
@@ -115,6 +118,16 @@ def split_sections(
         merged.pop()
 
     result = [(start + s - 1, start + e - 1) for s, e in merged]
+    if not (
+        result[0][0] == start
+        and result[-1][1] == end
+        and all(result[i][1] + 1 == result[i + 1][0] for i in range(len(result) - 1))
+    ):
+        # ``assert`` is stripped by ``python -O``; this line is what survives a build that
+        # ships source lines no section owns.  The caller passes only lines and a range, so
+        # the page range is the identity available here.
+        log.error("section split does not tile the page range page_start=%d page_end=%d sections=%d first=%s last=%s sample=%s",
+                  start, end, len(result), result[0], result[-1], result[:12])
     assert result[0][0] == start and result[-1][1] == end
     assert all(result[i][1] + 1 == result[i + 1][0] for i in range(len(result) - 1))
     return result

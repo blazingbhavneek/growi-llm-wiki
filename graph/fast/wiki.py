@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from html import escape
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from graph.wiki.storage import read_json, write_json_atomic
+
+log = logging.getLogger(__name__)
 
 # "1.", "1.2 ", "（1）", "第3章": a section number ends in punctuation or a space,
 # so "2024-04", "1.5倍" and "1:1" are left alone.
@@ -312,7 +315,17 @@ def hierarchy(pages: Sequence[Any], lines: Sequence[str], *, checkpoint: Path, v
 
     from graph.formats.tree import lead
 
-    cached = read_json(checkpoint, default={}) if Path(checkpoint).exists() else {}
+    try:
+        cached = read_json(checkpoint, default={}) if Path(checkpoint).exists() else {}
+    except (OSError, ValueError) as exc:
+        # `default={}` only covers a missing file: a corrupt checkpoint raises here.
+        # graph/wiki/storage logs the file error (path + errno, or corrupt-vs-missing) on the line above.
+        log.error(
+            "page hierarchy checkpoint is unusable; the hierarchy is rebuilt from the plan path=%s",
+            checkpoint,
+            exc_info=True,
+        )
+        raise
     groups: dict[tuple[str, ...], list[Any]] = {}
     for page in pages:
         groups.setdefault(tuple(page.path[:-1]), []).append(page)
@@ -324,7 +337,15 @@ def hierarchy(pages: Sequence[Any], lines: Sequence[str], *, checkpoint: Path, v
         for page in group:
             summaries.setdefault(str(page.number), page.summary or lead(lines, page.owner_ranges[0][0], page.owner_ranges[-1][1], limit=400))
     # "policy" marks the checkpoint so the standard path never reuses it as model output.
-    write_json_atomic(checkpoint, {"parents": parents, "pages": summaries, "policy": version})
+    try:
+        write_json_atomic(checkpoint, {"parents": parents, "pages": summaries, "policy": version})
+    except OSError as exc:
+        log.error(
+            "page hierarchy checkpoint could not be written; the next run repeats the hierarchy work path=%s",
+            checkpoint,
+            exc_info=True,
+        )
+        raise
     for page in pages:
         page.summary = summaries.get(str(page.number), page.summary)
     return parents

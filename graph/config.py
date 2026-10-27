@@ -5,6 +5,7 @@ from __future__ import annotations
 import configparser
 import copy
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -17,11 +18,36 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, runtime_checkable
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-load_dotenv()
+log = logging.getLogger(__name__)
+
+# dotenv returns False for a missing or unreadable .env; without this line the run keeps
+# going on code defaults and fails later as an opaque auth or connection error.
+if not load_dotenv():
+    log.error(
+        "env file not found or unreadable, using process env and code defaults file=%s",
+        Path(__file__).resolve().parents[1] / ".env",
+    )
 
 PROJECT_ROOT: Path | None = None
+
+
+def _env_number(cast: Callable[[Any], Any], name: str, default: Any) -> Any:
+    """int/float of an env value; one ERROR naming the variable, then the same raise."""
+    value = os.environ.get(name, default)
+    try:
+        return cast(value)
+    except (TypeError, ValueError) as exc:
+        log.error(
+            "env setting is not a number setting=%s value=%r error=%s: %s",
+            name,
+            value,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
 
 
 class HumanSyncMode(str, Enum):
@@ -67,35 +93,81 @@ def resolve_project_path(value: str) -> Path:
 
 
 def app_concurrency() -> int:
-    return max(1, int(os.environ.get("OPENAI_CONCURRENCY", "4")))
+    return max(1, _env_number(int, "OPENAI_CONCURRENCY", "4"))
 
 
 def _normalize_growi_token(value: str) -> str:
     return value.strip().removeprefix("API Token:").strip()
 
 
+def _project_value(parser: configparser.ConfigParser, config_path: Path, key: str) -> str:
+    """One [project] value; one ERROR naming the INI file, then the same raise."""
+    try:
+        return parser.get("project", key)
+    except (configparser.NoSectionError, configparser.NoOptionError) as exc:
+        log.error(
+            "project config is missing a key file=%s setting=%s error=%s: %s",
+            config_path,
+            key,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
+
+
 def _project_paths(selector: str) -> tuple[str, str, str, str, str, dict[str, str]]:
     value = selector.strip()
     if not value:
+        log.error(
+            "project config not selected setting=WIKI_PROJECT error=--project is required"
+        )
         raise ValueError("--project is required (config name from configs/ or absolute INI path)")
     selected = Path(value).expanduser()
     if selected.is_absolute():
         if selected.suffix != ".ini":
+            log.error("project config path must end in .ini file=%s", selected)
             raise ValueError("absolute project config path must end in .ini")
         config_path = selected.resolve()
     else:
         if selected.name != value or selected.suffix not in ("", ".ini"):
+            log.error(
+                "project must be a name from configs/ or an absolute INI path project=%s", value
+            )
             raise ValueError("project must be a name from configs/ or an absolute INI path")
         config_path = resolve_project_path(f"configs/{selected.stem}.ini")
     parser = configparser.ConfigParser(interpolation=None)
-    if not parser.read(config_path, encoding="utf-8"):
+    try:
+        read_files = parser.read(config_path, encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        log.error(
+            "project config is not valid UTF-8 file=%s error=%s: %s",
+            config_path,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
+    if not read_files:
+        # shortcut: parser.read() swallows OSError, so a permission-denied INI lands here
+        # too; exists() only splits the log wording, the raise below is unchanged.
+        reason = "unreadable" if os.path.exists(config_path) else "missing"
+        log.error("project config could not be read file=%s reason=%s", config_path, reason)
         raise FileNotFoundError(f"project config not found: {config_path}")
-    target_name = parser.get("project", "target_name").strip()
+    target_name = _project_value(parser, config_path, "target_name").strip()
     if target_name in {"", ".", ".."} or Path(target_name).name != target_name:
+        log.error(
+            "target_name must be one folder name file=%s setting=target_name value=%r",
+            config_path,
+            target_name,
+        )
         raise ValueError(f"target_name must be one folder name: {target_name!r}")
-    data_root = resolve_project_path(parser.get("project", "data_root"))
-    mount = Path(parser.get("project", "source_mount")).expanduser()
+    data_root = resolve_project_path(_project_value(parser, config_path, "data_root"))
+    mount = Path(_project_value(parser, config_path, "source_mount")).expanduser()
     if not mount.is_absolute():
+        log.error(
+            "source_mount must be absolute file=%s setting=source_mount value=%s", config_path, mount
+        )
         raise ValueError(f"source_mount must be absolute: {mount}")
     overrides = dict(parser.items("project"))
     if parser.has_section("settings"):
@@ -337,7 +409,24 @@ class Settings(BaseModel):
 
     @classmethod
     def from_env(cls, project: str = "") -> "Settings":
+        # One ERROR for every pydantic failure (bad Literal, threshold, or INI override):
+        # the traceback alone never names the project that was being loaded.
+        try:
+            return cls._from_env(project)
+        except ValidationError as exc:
+            log.error(
+                "project settings failed validation project=%s error=%s: %s",
+                project or os.environ.get("WIKI_PROJECT", ""),
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
+
+    @classmethod
+    def _from_env(cls, project: str = "") -> "Settings":
         env = os.environ.get
+        selector = project or env("WIKI_PROJECT", "")
         (
             data_root,
             project_name,
@@ -345,7 +434,7 @@ class Settings(BaseModel):
             project_growi_url,
             project_growi_token,
             project_overrides,
-        ) = _project_paths(project or env("WIKI_PROJECT", ""))
+        ) = _project_paths(selector)
         concurrency = app_concurrency()
         settings = cls(
             chat_base_url=env("OPENAI_BASE_URL", cls.chat_base_url),
@@ -357,7 +446,7 @@ class Settings(BaseModel):
             judge_base_url=env("JUDGE_BASE_URL", cls.judge_base_url),
             judge_api_key=env("JUDGE_API_KEY", cls.judge_api_key),
             judge_model_name=env("JUDGE_MODEL_NAME", cls.judge_model_name),
-            chat_temperature=float(env("WIKI_TEMPERATURE", cls.chat_temperature)),
+            chat_temperature=_env_number(float, "WIKI_TEMPERATURE", cls.chat_temperature),
             embed_backend=env("WIKI_EMBED_BACKEND", cls.embed_backend),
             embed_base_url=env(
                 "WIKI_EMBED_BASE_URL", env("OPENAI_EMBED_BASE_URL", cls.embed_base_url)
@@ -366,46 +455,46 @@ class Settings(BaseModel):
             embed_model=env("WIKI_EMBED_MODEL", cls.embed_model),
             hf_embed_model=env("WIKI_HF_EMBED_MODEL", cls.hf_embed_model),
             hf_device=env("WIKI_HF_DEVICE", cls.hf_device),
-            embed_dim=int(env("WIKI_EMBED_DIM", cls.embed_dim)),
+            embed_dim=_env_number(int, "WIKI_EMBED_DIM", cls.embed_dim),
             rerank_backend=env("WIKI_RERANK_BACKEND", cls.rerank_backend),
             rerank_api_key=env("WIKI_RERANK_API_KEY", cls.rerank_api_key),
             hf_rerank_model=env("WIKI_HF_RERANK_MODEL", cls.hf_rerank_model),
             rerank_device=env("WIKI_RERANK_DEVICE", cls.rerank_device),
-            rerank_timeout_seconds=int(
-                env("WIKI_RERANK_TIMEOUT", cls.rerank_timeout_seconds)
+            rerank_timeout_seconds=_env_number(
+                int, "WIKI_RERANK_TIMEOUT", cls.rerank_timeout_seconds
             ),
             database_path=env("WIKI_DB", cls.database_path),
-            edge_candidate_k=int(env("WIKI_EDGE_K", cls.edge_candidate_k)),
-            vector_query_k=int(env("WIKI_VECTOR_K", cls.vector_query_k)),
-            cascade_max_hops=int(env("WIKI_CASCADE_MAX_HOPS", cls.cascade_max_hops)),
-            cascade_max_nodes=int(env("WIKI_CASCADE_MAX_NODES", cls.cascade_max_nodes)),
-            agent_max_steps=int(env("WIKI_AGENT_MAX_STEPS", cls.agent_max_steps)),
-            agent_patience=int(env("WIKI_AGENT_PATIENCE", cls.agent_patience)),
+            edge_candidate_k=_env_number(int, "WIKI_EDGE_K", cls.edge_candidate_k),
+            vector_query_k=_env_number(int, "WIKI_VECTOR_K", cls.vector_query_k),
+            cascade_max_hops=_env_number(int, "WIKI_CASCADE_MAX_HOPS", cls.cascade_max_hops),
+            cascade_max_nodes=_env_number(int, "WIKI_CASCADE_MAX_NODES", cls.cascade_max_nodes),
+            agent_max_steps=_env_number(int, "WIKI_AGENT_MAX_STEPS", cls.agent_max_steps),
+            agent_patience=_env_number(int, "WIKI_AGENT_PATIENCE", cls.agent_patience),
             agent_early_exit=env(
                 "WIKI_AGENT_EARLY_EXIT", "1" if cls.agent_early_exit else "0"
             )
             not in {"0", "false", "False", ""},
-            early_exit_candidates=int(
-                env("WIKI_EARLY_EXIT_CANDIDATES", cls.early_exit_candidates)
+            early_exit_candidates=_env_number(
+                int, "WIKI_EARLY_EXIT_CANDIDATES", cls.early_exit_candidates
             ),
-            shallow_answer_max_nodes=int(
-                env("WIKI_SHALLOW_MAX_NODES", cls.shallow_answer_max_nodes)
+            shallow_answer_max_nodes=_env_number(
+                int, "WIKI_SHALLOW_MAX_NODES", cls.shallow_answer_max_nodes
             ),
-            search_rrf_k=int(env("WIKI_SEARCH_RRF_K", cls.search_rrf_k)),
+            search_rrf_k=_env_number(int, "WIKI_SEARCH_RRF_K", cls.search_rrf_k),
             entity_dedup=env("WIKI_ENTITY_DEDUP", "1" if cls.entity_dedup else "0")
             not in {"0", "false", "False", ""},
             concurrency=concurrency,
             ingest_mode=env("WIKI_INGEST_MODE", cls.ingest_mode),
-            wiki_section_target_lines=int(
-                env("WIKI_SECTION_TARGET_LINES", cls.wiki_section_target_lines)
+            wiki_section_target_lines=_env_number(
+                int, "WIKI_SECTION_TARGET_LINES", cls.wiki_section_target_lines
             ),
-            wiki_write_attempts=int(env("WIKI_WRITE_ATTEMPTS", cls.wiki_write_attempts)),
+            wiki_write_attempts=_env_number(int, "WIKI_WRITE_ATTEMPTS", cls.wiki_write_attempts),
             wiki_planner_concurrency=max(
-                1, int(env("WIKI_PLANNER_CONCURRENCY", concurrency))
+                1, _env_number(int, "WIKI_PLANNER_CONCURRENCY", concurrency)
             ),
-            wiki_request_timeout=int(env("WIKI_REQUEST_TIMEOUT", cls.wiki_request_timeout)),
-            wiki_rewrite_concurrency=int(
-                env("WIKI_REWRITE_CONCURRENCY", concurrency)
+            wiki_request_timeout=_env_number(int, "WIKI_REQUEST_TIMEOUT", cls.wiki_request_timeout),
+            wiki_rewrite_concurrency=_env_number(
+                int, "WIKI_REWRITE_CONCURRENCY", concurrency
             ),
             wiki_output_language=env("WIKI_OUTPUT_LANGUAGE", cls.wiki_output_language),
             wiki_linker_enabled=env(
@@ -417,31 +506,31 @@ class Settings(BaseModel):
             wiki_jev_base_url=env("WIKI_JEV_BASE_URL", cls.wiki_jev_base_url),
             wiki_jev_model=env("WIKI_JEV_MODEL", cls.wiki_jev_model),
             wiki_jev_tokenizer=env("WIKI_JEV_TOKENIZER", cls.wiki_jev_tokenizer),
-            wiki_jev_http_concurrency=int(env(
-                "WIKI_JEV_HTTP_CONCURRENCY", cls.wiki_jev_http_concurrency,
-            )),
+            wiki_jev_http_concurrency=_env_number(
+                int, "WIKI_JEV_HTTP_CONCURRENCY", cls.wiki_jev_http_concurrency
+            ),
             wiki_jev_gguf_local_path=env("WIKI_JEV_GGUF_LOCAL_PATH", cls.wiki_jev_gguf_local_path),
             wiki_jev_gguf_quant=env("WIKI_JEV_GGUF_QUANT", cls.wiki_jev_gguf_quant),
             wiki_jev_gguf_many_mode=env("WIKI_JEV_GGUF_MANY_MODE", cls.wiki_jev_gguf_many_mode),
             wiki_jev_score_bin=env("WIKI_JEV_SCORE_BIN", cls.wiki_jev_score_bin),
-            wiki_linker_role_threshold=float(env("WIKI_LINKER_ROLE_THRESHOLD", cls.wiki_linker_role_threshold)),
-            wiki_linker_alias_threshold=float(env("WIKI_LINKER_ALIAS_THRESHOLD", cls.wiki_linker_alias_threshold)),
-            wiki_linker_screen_candidates=int(env("WIKI_LINKER_SCREEN_CANDIDATES", cls.wiki_linker_screen_candidates)),
-            wiki_linker_screen_threshold=float(env("WIKI_LINKER_SCREEN_THRESHOLD", cls.wiki_linker_screen_threshold)),
-            wiki_linker_verify_top=int(env("WIKI_LINKER_VERIFY_TOP", cls.wiki_linker_verify_top)),
-            wiki_linker_verify_threshold=float(env("WIKI_LINKER_VERIFY_THRESHOLD", cls.wiki_linker_verify_threshold)),
-            wiki_linker_tiebreak_floor=float(env("WIKI_LINKER_TIEBREAK_FLOOR", cls.wiki_linker_tiebreak_floor)),
-            wiki_linker_curate_keep=int(env("WIKI_LINKER_CURATE_KEEP", cls.wiki_linker_curate_keep)),
+            wiki_linker_role_threshold=_env_number(float, "WIKI_LINKER_ROLE_THRESHOLD", cls.wiki_linker_role_threshold),
+            wiki_linker_alias_threshold=_env_number(float, "WIKI_LINKER_ALIAS_THRESHOLD", cls.wiki_linker_alias_threshold),
+            wiki_linker_screen_candidates=_env_number(int, "WIKI_LINKER_SCREEN_CANDIDATES", cls.wiki_linker_screen_candidates),
+            wiki_linker_screen_threshold=_env_number(float, "WIKI_LINKER_SCREEN_THRESHOLD", cls.wiki_linker_screen_threshold),
+            wiki_linker_verify_top=_env_number(int, "WIKI_LINKER_VERIFY_TOP", cls.wiki_linker_verify_top),
+            wiki_linker_verify_threshold=_env_number(float, "WIKI_LINKER_VERIFY_THRESHOLD", cls.wiki_linker_verify_threshold),
+            wiki_linker_tiebreak_floor=_env_number(float, "WIKI_LINKER_TIEBREAK_FLOOR", cls.wiki_linker_tiebreak_floor),
+            wiki_linker_curate_keep=_env_number(int, "WIKI_LINKER_CURATE_KEEP", cls.wiki_linker_curate_keep),
             wiki_linker_hop_caps=env("WIKI_LINKER_HOP_CAPS", cls.wiki_linker_hop_caps),
-            wiki_linker_footer_max=int(env("WIKI_LINKER_FOOTER_MAX", cls.wiki_linker_footer_max)),
-            wiki_linker_inline_max=int(env("WIKI_LINKER_INLINE_MAX", cls.wiki_linker_inline_max)),
-            wiki_linker_inline_max_big=int(env("WIKI_LINKER_INLINE_MAX_BIG", cls.wiki_linker_inline_max_big)),
-            wiki_linker_inline_max_neo=int(env("WIKI_LINKER_INLINE_MAX_NEO", cls.wiki_linker_inline_max_neo)),
-            wiki_linker_edge_candidates=int(env("WIKI_LINKER_EDGE_CANDIDATES", cls.wiki_linker_edge_candidates)),
-            wiki_linker_edges_per_target=int(env("WIKI_LINKER_EDGES_PER_TARGET", cls.wiki_linker_edges_per_target)),
+            wiki_linker_footer_max=_env_number(int, "WIKI_LINKER_FOOTER_MAX", cls.wiki_linker_footer_max),
+            wiki_linker_inline_max=_env_number(int, "WIKI_LINKER_INLINE_MAX", cls.wiki_linker_inline_max),
+            wiki_linker_inline_max_big=_env_number(int, "WIKI_LINKER_INLINE_MAX_BIG", cls.wiki_linker_inline_max_big),
+            wiki_linker_inline_max_neo=_env_number(int, "WIKI_LINKER_INLINE_MAX_NEO", cls.wiki_linker_inline_max_neo),
+            wiki_linker_edge_candidates=_env_number(int, "WIKI_LINKER_EDGE_CANDIDATES", cls.wiki_linker_edge_candidates),
+            wiki_linker_edges_per_target=_env_number(int, "WIKI_LINKER_EDGES_PER_TARGET", cls.wiki_linker_edges_per_target),
             wiki_index_related_docs=env("WIKI_INDEX_RELATED_DOCS", "1" if cls.wiki_index_related_docs else "0").lower() in ("1", "true", "yes", "on"),
-            wiki_linker_concurrency=int(
-                env("WIKI_LINKER_CONCURRENCY", concurrency)
+            wiki_linker_concurrency=_env_number(
+                int, "WIKI_LINKER_CONCURRENCY", concurrency
             ),
             engine_semantic_edges=env("WIKI_ENGINE_SEMANTIC_EDGES", "0") == "1",
             data_root=data_root,
@@ -449,7 +538,7 @@ class Settings(BaseModel):
             mount_path=mount_path,
             parser_base_url=env("WIKI_PARSER_BASE_URL", cls.parser_base_url),
             parser_fallback_base_url=env("WIKI_PARSER_FALLBACK_BASE_URL", cls.parser_fallback_base_url),
-            parser_timeout=float(env("WIKI_PARSER_TIMEOUT", cls.parser_timeout)),
+            parser_timeout=_env_number(float, "WIKI_PARSER_TIMEOUT", cls.parser_timeout),
             sync_isolated=env(
                 "WIKI_SYNC_ISOLATED", "1" if cls.sync_isolated else "0"
             ).lower() in {"1", "true", "yes", "on"},
@@ -460,13 +549,13 @@ class Settings(BaseModel):
             growi_url=project_growi_url or env("GROWI_URL", cls.growi_url),
             growi_token=_normalize_growi_token(project_growi_token or env("GROWI_TOKEN", cls.growi_token)),
             growi_mode=env("GROWI_MODE", cls.growi_mode),
-            growi_timeout=float(env("GROWI_TIMEOUT", cls.growi_timeout)),
+            growi_timeout=_env_number(float, "GROWI_TIMEOUT", cls.growi_timeout),
             human_sync_mode=env("WIKI_HUMAN_SYNC_MODE", cls.human_sync_mode.value),
-            human_sync_activity_audit_seconds=int(
-                env("WIKI_HUMAN_SYNC_AUDIT_SECONDS", cls.human_sync_activity_audit_seconds)
+            human_sync_activity_audit_seconds=_env_number(
+                int, "WIKI_HUMAN_SYNC_AUDIT_SECONDS", cls.human_sync_activity_audit_seconds
             ),
-            human_sync_activity_overlap_seconds=int(
-                env("WIKI_HUMAN_SYNC_OVERLAP_SECONDS", cls.human_sync_activity_overlap_seconds)
+            human_sync_activity_overlap_seconds=_env_number(
+                int, "WIKI_HUMAN_SYNC_OVERLAP_SECONDS", cls.human_sync_activity_overlap_seconds
             ),
             vector_backend=env("WIKI_VECTOR_BACKEND", cls.vector_backend),
             qdrant_url=env("QDRANT_URL", cls.qdrant_url),
@@ -474,92 +563,95 @@ class Settings(BaseModel):
             qdrant_growi_id=env("WIKI_QDRANT_GROWI_ID", cls.qdrant_growi_id),
             engine_db=env("WIKI_ENGINE_DB", cls.engine_db),
             growi_name=env("WIKI_GROWI_NAME", cls.growi_name),
-            sync_interval_seconds=int(env("WIKI_SYNC_INTERVAL_SECONDS", cls.sync_interval_seconds)),
-            structure_target_lines=int(env("WIKI_STRUCTURE_TARGET_LINES", cls.structure_target_lines)),
-            structure_min_lines=int(env("WIKI_STRUCTURE_MIN_LINES", cls.structure_min_lines)),
+            sync_interval_seconds=_env_number(int, "WIKI_SYNC_INTERVAL_SECONDS", cls.sync_interval_seconds),
+            structure_target_lines=_env_number(int, "WIKI_STRUCTURE_TARGET_LINES", cls.structure_target_lines),
+            structure_min_lines=_env_number(int, "WIKI_STRUCTURE_MIN_LINES", cls.structure_min_lines),
             slide_delimiter=env("WIKI_SLIDE_DELIMITER", cls.slide_delimiter),
             slide_title=env("WIKI_SLIDE_TITLE", cls.slide_title),
             pdf_use_headings=env("WIKI_PDF_USE_HEADINGS", "1" if cls.pdf_use_headings else "0")
             not in {"0", "false", "False", ""},
-            tabular_slice_records=int(env("WIKI_TABULAR_SLICE_RECORDS", cls.tabular_slice_records)),
-            tabular_preview_rows=int(env("WIKI_TABULAR_PREVIEW_ROWS", cls.tabular_preview_rows)),
-            tabular_preview_cols=int(env("WIKI_TABULAR_PREVIEW_COLS", cls.tabular_preview_cols)),
+            tabular_slice_records=_env_number(int, "WIKI_TABULAR_SLICE_RECORDS", cls.tabular_slice_records),
+            tabular_preview_rows=_env_number(int, "WIKI_TABULAR_PREVIEW_ROWS", cls.tabular_preview_rows),
+            tabular_preview_cols=_env_number(int, "WIKI_TABULAR_PREVIEW_COLS", cls.tabular_preview_cols),
             ingest_concurrency=max(
-                1, int(env("WIKI_INGEST_CONCURRENCY", concurrency))
+                1, _env_number(int, "WIKI_INGEST_CONCURRENCY", concurrency)
             ),
-            recluster_every=int(env("WIKI_RECLUSTER_EVERY", cls.recluster_every)),
-            search_candidate_pool=int(
-                env("WIKI_SEARCH_POOL", cls.search_candidate_pool)
+            recluster_every=_env_number(int, "WIKI_RECLUSTER_EVERY", cls.recluster_every),
+            search_candidate_pool=_env_number(
+                int, "WIKI_SEARCH_POOL", cls.search_candidate_pool
             ),
-            rerank_top_k=int(env("WIKI_RERANK_TOP_K", cls.rerank_top_k)),
-            search_big_chunk_size=int(
-                env("WIKI_SEARCH_BIG_CHUNK_SIZE", cls.search_big_chunk_size)
+            rerank_top_k=_env_number(int, "WIKI_RERANK_TOP_K", cls.rerank_top_k),
+            search_big_chunk_size=_env_number(
+                int, "WIKI_SEARCH_BIG_CHUNK_SIZE", cls.search_big_chunk_size
             ),
-            search_big_chunk_overlap=int(
-                env("WIKI_SEARCH_BIG_CHUNK_OVERLAP", cls.search_big_chunk_overlap)
+            search_big_chunk_overlap=_env_number(
+                int, "WIKI_SEARCH_BIG_CHUNK_OVERLAP", cls.search_big_chunk_overlap
             ),
-            search_small_chunk_size=int(
-                env("WIKI_SEARCH_SMALL_CHUNK_SIZE", cls.search_small_chunk_size)
+            search_small_chunk_size=_env_number(
+                int, "WIKI_SEARCH_SMALL_CHUNK_SIZE", cls.search_small_chunk_size
             ),
-            search_small_chunk_overlap=int(
-                env("WIKI_SEARCH_SMALL_CHUNK_OVERLAP", cls.search_small_chunk_overlap)
+            search_small_chunk_overlap=_env_number(
+                int, "WIKI_SEARCH_SMALL_CHUNK_OVERLAP", cls.search_small_chunk_overlap
             ),
-            pool_node_bm25=int(env("WIKI_POOL_NODE_BM25", cls.pool_node_bm25)),
-            pool_vec_body=int(env("WIKI_POOL_VEC_BODY", cls.pool_vec_body)),
-            pool_vec_summary=int(env("WIKI_POOL_VEC_SUMMARY", cls.pool_vec_summary)),
-            pool_item_bm25=int(env("WIKI_POOL_ITEM_BM25", cls.pool_item_bm25)),
-            pool_vec_item=int(env("WIKI_POOL_VEC_ITEM", cls.pool_vec_item)),
-            weight_item_bm25=float(env("WIKI_W_ITEM_BM25", cls.weight_item_bm25)),
-            weight_title_vec=float(env("WIKI_W_TITLE_VEC", cls.weight_title_vec)),
-            weight_claim_vec=float(env("WIKI_W_CLAIM_VEC", cls.weight_claim_vec)),
-            weight_small_chunk_vec=float(
-                env("WIKI_W_SMALL_CHUNK_VEC", cls.weight_small_chunk_vec)
+            pool_node_bm25=_env_number(int, "WIKI_POOL_NODE_BM25", cls.pool_node_bm25),
+            pool_vec_body=_env_number(int, "WIKI_POOL_VEC_BODY", cls.pool_vec_body),
+            pool_vec_summary=_env_number(int, "WIKI_POOL_VEC_SUMMARY", cls.pool_vec_summary),
+            pool_item_bm25=_env_number(int, "WIKI_POOL_ITEM_BM25", cls.pool_item_bm25),
+            pool_vec_item=_env_number(int, "WIKI_POOL_VEC_ITEM", cls.pool_vec_item),
+            weight_item_bm25=_env_number(float, "WIKI_W_ITEM_BM25", cls.weight_item_bm25),
+            weight_title_vec=_env_number(float, "WIKI_W_TITLE_VEC", cls.weight_title_vec),
+            weight_claim_vec=_env_number(float, "WIKI_W_CLAIM_VEC", cls.weight_claim_vec),
+            weight_small_chunk_vec=_env_number(
+                float, "WIKI_W_SMALL_CHUNK_VEC", cls.weight_small_chunk_vec
             ),
-            weight_summary_vec=float(env("WIKI_W_SUMMARY_VEC", cls.weight_summary_vec)),
-            weight_big_chunk_vec=float(
-                env("WIKI_W_BIG_CHUNK_VEC", cls.weight_big_chunk_vec)
+            weight_summary_vec=_env_number(float, "WIKI_W_SUMMARY_VEC", cls.weight_summary_vec),
+            weight_big_chunk_vec=_env_number(
+                float, "WIKI_W_BIG_CHUNK_VEC", cls.weight_big_chunk_vec
             ),
-            weight_node_bm25=float(env("WIKI_W_NODE_BM25", cls.weight_node_bm25)),
-            weight_body_vec=float(env("WIKI_W_BODY_VEC", cls.weight_body_vec)),
-            weight_record_vec=float(env("WIKI_W_RECORD_VEC", cls.weight_record_vec)),
-            evidence_max_per_node=int(
-                env("WIKI_EVIDENCE_MAX_PER_NODE", cls.evidence_max_per_node)
+            weight_node_bm25=_env_number(float, "WIKI_W_NODE_BM25", cls.weight_node_bm25),
+            weight_body_vec=_env_number(float, "WIKI_W_BODY_VEC", cls.weight_body_vec),
+            weight_record_vec=_env_number(float, "WIKI_W_RECORD_VEC", cls.weight_record_vec),
+            evidence_max_per_node=_env_number(
+                int, "WIKI_EVIDENCE_MAX_PER_NODE", cls.evidence_max_per_node
             ),
-            evidence_max_per_field=int(
-                env("WIKI_EVIDENCE_MAX_PER_FIELD", cls.evidence_max_per_field)
+            evidence_max_per_field=_env_number(
+                int, "WIKI_EVIDENCE_MAX_PER_FIELD", cls.evidence_max_per_field
             ),
-            evidence_dedup_char_window=int(
-                env("WIKI_EVIDENCE_DEDUP_CHAR_WINDOW", cls.evidence_dedup_char_window)
+            evidence_dedup_char_window=_env_number(
+                int, "WIKI_EVIDENCE_DEDUP_CHAR_WINDOW", cls.evidence_dedup_char_window
             ),
-            evidence_rerank_pool=int(
-                env("WIKI_EVIDENCE_RERANK_POOL", cls.evidence_rerank_pool)
+            evidence_rerank_pool=_env_number(
+                int, "WIKI_EVIDENCE_RERANK_POOL", cls.evidence_rerank_pool
             ),
-            evidence_mmr_lambda=float(
-                env("WIKI_EVIDENCE_MMR_LAMBDA", cls.evidence_mmr_lambda)
+            evidence_mmr_lambda=_env_number(
+                float, "WIKI_EVIDENCE_MMR_LAMBDA", cls.evidence_mmr_lambda
             ),
-            subagent_count=int(env("WIKI_SUBAGENT_COUNT", cls.subagent_count)),
-            service_max_reads=int(env("WIKI_SERVICE_MAX_READS", cls.service_max_reads)),
-            service_max_agents=int(
-                env("WIKI_SERVICE_MAX_AGENTS", concurrency)
+            subagent_count=_env_number(int, "WIKI_SUBAGENT_COUNT", cls.subagent_count),
+            service_max_reads=_env_number(int, "WIKI_SERVICE_MAX_READS", cls.service_max_reads),
+            service_max_agents=_env_number(
+                int, "WIKI_SERVICE_MAX_AGENTS", concurrency
             ),
             enable_mermaid=env(
                 "WIKI_ENABLE_MERMAID", "1" if cls.enable_mermaid else "0"
             )
             not in {"0", "false", "False", ""},
-            mermaid_repair_attempts=int(
-                env("WIKI_MERMAID_REPAIR_ATTEMPTS", cls.mermaid_repair_attempts)
+            mermaid_repair_attempts=_env_number(
+                int, "WIKI_MERMAID_REPAIR_ATTEMPTS", cls.mermaid_repair_attempts
             ),
             mermaid_cli_bin=env("WIKI_MERMAID_CLI_BIN", cls.mermaid_cli_bin),
             mermaid_puppeteer_config=env(
                 "WIKI_MERMAID_PUPPETEER_CONFIG", cls.mermaid_puppeteer_config
             ),
-            mermaid_render_timeout=int(
-                env("WIKI_MERMAID_RENDER_TIMEOUT", cls.mermaid_render_timeout)
+            mermaid_render_timeout=_env_number(
+                int, "WIKI_MERMAID_RENDER_TIMEOUT", cls.mermaid_render_timeout
             ),
         )
         reserved = {"source_mount", "mount_path", "data_root", "target_name"}
         unknown = sorted(set(project_overrides) - set(cls.model_fields) - {"source_mount"})
         if unknown:
+            log.error(
+                "unknown project setting(s) project=%s setting=%s", selector, ", ".join(unknown)
+            )
             raise ValueError(f"unknown project setting(s): {', '.join(unknown)}")
         overrides = {
             key: value
@@ -1446,17 +1538,39 @@ def format_node_full(node: Node | None, requested_id: str, cleaned_id: str) -> s
 
 
 # mermaid validate / repair (a real subsystem; not inlined)
+def _mermaid_temp_dir() -> tempfile.TemporaryDirectory:
+    """Temp folder for one mmdc render; one ERROR, then the same OSError raise."""
+    try:
+        return tempfile.TemporaryDirectory()
+    except OSError as exc:
+        log.error(
+            "mermaid temp folder failed error=%s: %s", type(exc).__name__, exc, exc_info=True
+        )
+        raise
+
+
 def validate_mermaid(code: str, settings: Settings) -> tuple[bool, str]:
     """Render the code to SVG with mmdc; True if it parses + renders."""
     mmdc = shutil.which(settings.mermaid_cli_bin)
     if mmdc is None:
+        log.error("mermaid CLI not found in PATH binary=%s", settings.mermaid_cli_bin)
         return False, f"mermaid CLI '{settings.mermaid_cli_bin}' not found in PATH"
     config = Path(settings.mermaid_puppeteer_config).expanduser()
     cmd_prefix = [mmdc] + (["-p", str(config)] if config.exists() else [])
-    with tempfile.TemporaryDirectory() as tmp:
+    with _mermaid_temp_dir() as tmp:
         in_file = Path(tmp) / "d.mmd"
         out_file = Path(tmp) / "d.svg"
-        in_file.write_text(code, encoding="utf-8")
+        try:
+            in_file.write_text(code, encoding="utf-8")
+        except OSError as exc:
+            log.error(
+                "mermaid diagram write failed file=%s error=%s: %s",
+                in_file,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
         try:
             proc = subprocess.run(
                 [*cmd_prefix, "-i", str(in_file), "-o", str(out_file)],
@@ -1464,12 +1578,41 @@ def validate_mermaid(code: str, settings: Settings) -> tuple[bool, str]:
                 timeout=settings.mermaid_render_timeout,
             )
         except subprocess.TimeoutExpired:
+            log.error(
+                "mmdc timed out binary=%s timeout=%s",
+                mmdc,
+                settings.mermaid_render_timeout,
+            )
             return False, f"mmdc timed out after {settings.mermaid_render_timeout}s"
         except Exception as exc:  # noqa: BLE001 - mmdc failed to start
+            log.error(
+                "mmdc failed to start binary=%s error=%s: %s",
+                mmdc,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
             return False, f"mmdc failed to start: {exc}"
         if proc.returncode == 0 and out_file.exists() and out_file.stat().st_size > 0:
             return True, ""
-        return False, proc.stderr.decode("utf-8", errors="replace").strip()
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        if proc.returncode < 0:
+            # A signal kill (usually OOM) leaves no stderr, so the empty reason below is
+            # handed to the repair model as if the diagram itself were malformed.
+            log.error(
+                "mmdc killed by signal binary=%s returncode=%s (out of memory?) stderr=%s",
+                mmdc,
+                proc.returncode,
+                stderr[:300] or "-",
+            )
+        else:
+            log.error(
+                "mmdc render failed binary=%s returncode=%s stderr=%s",
+                mmdc,
+                proc.returncode,
+                stderr[:300] or "-",
+            )
+        return False, stderr
 
 
 def repair_answer_mermaid(
@@ -1480,6 +1623,10 @@ def repair_answer_mermaid(
     if not blocks:
         return answer
     if shutil.which(settings.mermaid_cli_bin) is None:
+        log.error(
+            "mermaid CLI not found in PATH, all diagrams skipped binary=%s",
+            settings.mermaid_cli_bin,
+        )
         emit({"type": "diagram_skipped", "reason": "mermaid CLI not installed"})
         return answer
     emit({"type": "diagram_pending"})
@@ -1501,7 +1648,15 @@ def repair_answer_mermaid(
             )
             try:
                 response = llm.complete(MERMAID_FIX_SYSTEM, user)
-            except Exception:  # noqa: BLE001 - repair is best-effort
+            except Exception as exc:  # noqa: BLE001 - repair is best-effort
+                # Without this a dead endpoint reads as "the model could not fix the diagram".
+                log.error(
+                    "mermaid repair model call failed attempt=%s error=%s: %s",
+                    attempt,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
                 break
             fix = _MERMAID_BLOCK_RE.search(response)
             repaired = (
@@ -1514,6 +1669,12 @@ def repair_answer_mermaid(
             code = repaired
             ok, error = validate_mermaid(code, settings)
         all_ok = all_ok and ok
+        if not ok:
+            log.error(
+                "mermaid diagram could not be repaired attempts=%s error=%s",
+                attempt,
+                (error or "")[:300] or "-",
+            )
         fixed_codes.append(code)
         new_answer = new_answer.replace(match.group(0), f"```mermaid\n{code}\n```", 1)
 
@@ -1764,7 +1925,13 @@ def _sanitize_message(message: Any) -> Any:
         cloned = copy.copy(message)
         cloned.content = sanitized_content
         return cloned
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - an unsanitizable message still goes to the model
+        log.error(
+            "message sanitize failed, sending unsanitized content error=%s: %s",
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
         return message
 
 

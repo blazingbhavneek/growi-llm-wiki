@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from runner import cli as _cli
+
+log = logging.getLogger(__name__)
 
 # Keep the existing import surface for callers that invoke command handlers
 # directly, while keeping this module limited to CLI-to-runner delegation.
@@ -100,6 +104,17 @@ def cmd_reset(args):
 
 def cmd_link(args):
     return _compat_call(_cli.cmd_link, args)
+
+
+# A renamed or new ``cmd_*`` in runner/cli.py drops out of the wrapper map without any other symptom, so name it once at import.
+_UNWRAPPED_COMMANDS = sorted(
+    name for name in dir(_cli) if name.startswith("cmd_") and callable(getattr(_cli, name)) and name not in globals()
+)
+if _UNWRAPPED_COMMANDS:
+    log.warning(
+        "compat wrapper mapping is missing commands=%s (those commands run without the main.py compat wrappers)",
+        ", ".join(_UNWRAPPED_COMMANDS),
+    )
 
 
 if __name__ == "__main__":

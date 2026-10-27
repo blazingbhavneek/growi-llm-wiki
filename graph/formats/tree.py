@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from typing import Sequence
 from graph.common.markdown import scan_markdown_fences
 from graph.wiki.markdown_blocks import BlockIndex
 from graph.wiki.wire import SeedRange
+
+log = logging.getLogger(__name__)
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(\S.*?)\s*#*\s*$")
 
@@ -31,6 +34,8 @@ def heading_tree(lines: Sequence[str], *, title: str = "document") -> Section:
     fenced: set[int] = set()
     scan = scan_markdown_fences(list(lines))
     if scan.unclosed is not None:
+        document = next((line.lstrip("# ").strip() for line in lines[:20] if line.startswith("# ")), "") or title
+        log.error("heading tree cannot be built; the document falls back to the generic planner document=%s lines=%d fence_line=%d", document, len(lines), scan.unclosed.line_number)
         raise ValueError(f"unclosed fence at line {scan.unclosed.line_number}")
     for opening, closing in zip(scan.openings, scan.closings):
         fenced.update(range(opening.line_number, closing.line_number + 1))

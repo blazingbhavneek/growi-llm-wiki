@@ -67,6 +67,7 @@ def footer_span(text: str) -> tuple[int, int] | None:
     if not markers:
         return None
     if len(markers) != 2 or [item[0] for item in markers] != [LINKS_FOOTER_START, LINKS_FOOTER_END]:
+        log.error("managed link footer is damaged: expected one start and one end marker, found=%d", len(markers))
         raise ValueError("damaged managed link footer")
     return markers[0][1], markers[1][2]
 
@@ -341,7 +342,7 @@ def _attempt(model: Any, old_w: str, cur_w: str, new_w: str, guidance: list[str]
 
 
 def _merge_window(model: Any, old_w: str, cur_w: str, new_w: str, guidance: list[str],
-                  stats: Counter) -> tuple[str, str] | None:
+                  stats: Counter, page: str = "") -> tuple[str, str] | None:
     if model is None or len(old_w) + len(cur_w) + len(new_w) > LIMIT:
         return None
     failure = ""
@@ -356,6 +357,7 @@ def _merge_window(model: Any, old_w: str, cur_w: str, new_w: str, guidance: list
             continue
         stats[f"merge_ok_{attempt}"] += 1
         return got
+    log.error("human model merge gave up attempts=%d page=%s last_error=%s (the page keeps the human text with the new source text quoted under it)", 2, page, failure)
     return None
 
 
@@ -378,7 +380,8 @@ def classify(model: Any, pairs: list[tuple[str, str]]) -> list[str]:
     try:
         items = model.classify(pairs)
     except Exception as exc:
-        log.debug("human_sync event=classify_failed reason=%s: %s", type(exc).__name__, exc)
+        # The next generation then ignores what the human asked for, so the skip has to be visible.
+        log.error("human change classify failed; structure guidance is skipped for this revision error=%s: %s", type(exc).__name__, exc, exc_info=True)
         return []
     return [str(i["instruction"]).strip() for i in items if i.get("kind") == "structure" and str(i.get("instruction") or "").strip()]
 
@@ -584,7 +587,7 @@ def rebase(old: dict[str, str], human: dict[str, str], new: dict[str, str], *,
             stats["window5"] += 1
             calls = Counter()
             merges.append((g, first, cur_w, new_w, calls,
-                           pool.submit(_merge_window, model, old_w, cur_w, new_w, guidance.get(g.q, []), calls)))
+                           pool.submit(_merge_window, model, old_w, cur_w, new_w, guidance.get(g.q, []), calls, g.q)))
     for g, first, cur_w, new_w, calls, future in merges:
         got = future.result()
         stats.update(calls)
@@ -668,8 +671,10 @@ class HumanStore:
         self.root = Path(project.metadata) / "human-sync"
         schema = self.root / "schema.json"
         if self.root.exists() and not schema.exists():
+            log.error("human store schema is missing path=%s; human edits cannot be read or written", schema)
             raise ValueError("human store schema is missing")
         if schema.exists() and read_json(schema) != {"schema_version": VERSION}:
+            log.error("human store schema is unsupported path=%s; the store was written by another version", schema)
             raise ValueError("unsupported human store schema")
 
     def _initialize(self) -> None:
@@ -688,10 +693,17 @@ class HumanStore:
 
     def get(self, digest: str) -> str:
         if not _HEX.fullmatch(digest):
+            log.error("human snapshot hash is invalid snapshot=%s", digest[:12])
             raise ValueError("invalid human snapshot hash")
-        with (self.root / "snapshots" / f"{digest}.md").open(encoding="utf-8", newline="") as stream:
-            text = stream.read()
+        path = self.root / "snapshots" / f"{digest}.md"
+        try:
+            with path.open(encoding="utf-8", newline="") as stream:
+                text = stream.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            log.error("human snapshot could not be read path=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+            raise
         if sha256_text(text) != digest:
+            log.error("human snapshot checksum mismatch path=%s (the stored text is not what the hash recorded)", path)
             raise ValueError(f"human snapshot checksum mismatch: {digest}")
         return text
 
@@ -712,6 +724,7 @@ class HumanStore:
             for path in self.root.glob(pattern):
                 data = read_json(path)
                 if not isinstance(data, dict) or data.get("schema_version") != VERSION:
+                    log.error("human store record is invalid path=%s (publishing is stopped before any remote change)", path)
                     raise ValueError(f"invalid human store record: {path.name}")
                 self.validate(data)
 
@@ -732,7 +745,11 @@ class HumanStore:
 
     @staticmethod
     def _read(directory: Path) -> dict[str, str]:
-        return {p.name: p.read_text(encoding="utf-8") for p in sorted(directory.glob("*.md"))}
+        try:
+            return {p.name: p.read_text(encoding="utf-8") for p in sorted(directory.glob("*.md"))}
+        except (OSError, UnicodeDecodeError) as exc:
+            log.error("human store pages could not be read directory=%s error=%s: %s", directory, type(exc).__name__, exc, exc_info=True)
+            raise
 
     def state(self, raw_rel: str) -> dict | None:
         return read_json(self._dir(raw_rel) / "doc.json", default={}) or None
@@ -750,7 +767,12 @@ class HumanStore:
         pages = {}
         for page in sorted(folder.glob("*.md")):
             original = folder / "_planning" / "pages" / page.name
-            pages[page.name] = (original if original.exists() else page).read_text(encoding="utf-8")
+            try:
+                pages[page.name] = (original if original.exists() else page).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                log.error("wiki page could not be read path=%s error=%s: %s", original if original.exists() else page,
+                          type(exc).__name__, exc, exc_info=True)
+                raise
         doc = {"schema_version": VERSION, "source_id": self.identity(raw_rel)[1]["source_id"],
                "raw_rel": raw_rel, "appendix": None, "guidance": {}}
         return doc, pages, dict(pages)
@@ -785,18 +807,22 @@ class HumanStore:
     def check(self, raw_rel: str) -> None:
         """Documents that cannot be handled safely are blocked (legacy journal; another source's human text)."""
         if self._legacy(raw_rel):
+            log.error("document is blocked: the legacy human journal still holds a live edit document=%s", raw_rel)
             raise ValueError("legacy human journal")
         key = self.identity(raw_rel)[0]
         for path in (self.root / "doc").glob("*/doc.json"):
             if (path.parent.name != key and read_json(path, default={}).get("raw_rel") == raw_rel
                     and self._information(path.parent)):
+                log.error("document is blocked: another source at this path holds human information document=%s store=%s", raw_rel, path.parent.name)
                 raise ValueError("a different source at this path holds human information")
 
     def assert_deletable(self, raw_rel: str) -> None:
         if self._legacy(raw_rel):
+            log.error("document is blocked: the legacy human journal still holds a live edit document=%s", raw_rel)
             raise ValueError("legacy human journal")
         directory = self._dir(raw_rel)
         if (directory / "doc.json").exists() and self._information(directory):
+            log.error("delete refused: the document holds human information document=%s; remove or move that text in GROWI first", raw_rel)
             raise ValueError("document has human information; remove or move that text in GROWI first")
 
     def _finish(self, doc: dict, pages: dict[str, str], appendix: str, entries: list[str]) -> dict[str, str]:
@@ -833,7 +859,14 @@ class HumanStore:
                 return existed
             if path.exists() and path.read_text(encoding="utf-8") == text:
                 return False
-            write_text_atomic(path, text)
+            try:
+                write_text_atomic(path, text)
+            except OSError as exc:
+                # graph/wiki/storage.py already names the path and errno; only the consequence is ours.
+                log.error("human page write failed document=%s path=%s error=%s%s", raw_rel, path, type(exc).__name__,
+                          "; the live wiki page and GROWI now disagree until the next run" if path.parent == folder
+                          else "; the human store copy of this page is not updated")
+                raise
             return True
 
         for name, text in current.items():
@@ -860,7 +893,12 @@ class HumanStore:
             put(directory / "current" / name, text)
         for name in set(before) - set(current):
             (directory / "current" / name).unlink(missing_ok=True)
-        write_json_atomic(directory / "doc.json", doc)
+        try:
+            write_json_atomic(directory / "doc.json", doc)
+        except OSError as exc:
+            log.error("human store state not committed document=%s path=%s error=%s (the pages above are written but the merge is not recorded, so the next run repeats it)",
+                      raw_rel, directory / "doc.json", type(exc).__name__)
+            raise
         if changed:
             self._drop_inline_rows(changed)
             marker = folder / "_planning" / "linker.json"
@@ -919,7 +957,12 @@ class HumanStore:
             kept = doc["guidance"].setdefault(page, [])
             kept.extend(i for i in record["guidance"] if i not in kept)
             del kept[:-GUIDANCE_KEPT]
-        write_json_atomic(self._dir(raw_rel) / "captures" / f"{name}.json", record)
+        try:
+            write_json_atomic(self._dir(raw_rel) / "captures" / f"{name}.json", record)
+        except OSError as exc:
+            log.error("human revision capture lost document=%s page=%s error=%s (this revision cannot be replayed after a rollback)",
+                      raw_rel, page, type(exc).__name__)
+            raise
         return self._commit(raw_rel, doc, pages, current, pure=pure if fresh else None)
 
     def replay_captured(self, candidate_project: Any, raw_rels: list[str], *, model: Any = None) -> None:
@@ -1191,6 +1234,8 @@ class HumanStore:
             and confirmation.get("path") == page.path
             and confirmation.get("remote_blob") == data.get("prepared_remote_blob")
         ):
+            log.error("prepared publication outcome is ambiguous page=%s revision=%s path=%s (neither rebase nor adopt is safe)",
+                      page.page_id, page.revision_id, page.path)
             raise ValueError("ambiguous prepared publication outcome")
         log.debug("human_sync event=rebase_prepared_write page=%s revision=%s", page.page_id, page.revision_id)
         return {"exact": False, "remote": body, "local": local, "attempt_id": data.get("prepared_attempt_id")}
@@ -1237,7 +1282,12 @@ class HumanStore:
 def apply_generated(project: Any, raw_rel: str, *, model: Any = None) -> Applied:
     """Run after the writer exported new pages: re-apply the human's changes to them."""
     folder = project.wiki_dir(raw_rel)
-    new = {page.name: page.read_text(encoding="utf-8") for page in sorted(folder.glob("*.md"))}
+    try:
+        new = {page.name: page.read_text(encoding="utf-8") for page in sorted(folder.glob("*.md"))}
+    except (OSError, UnicodeDecodeError) as exc:
+        log.error("generated pages could not be read folder=%s error=%s: %s (human changes cannot be re-applied)",
+                  folder, type(exc).__name__, exc, exc_info=True)
+        raise
     store = HumanStore(project)
     has_human_state = store.state(raw_rel) is not None
     applied = store.generate(raw_rel, new, model=model)

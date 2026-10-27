@@ -9,6 +9,7 @@ resumable pipeline regenerates only the pages it dropped.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import shutil
 import subprocess
@@ -28,6 +29,8 @@ from .storage import (
 )
 
 Hunk = tuple[int, int, int, int]  # old_start (1-based), old_len, new_start (1-based), new_len
+
+log = logging.getLogger(__name__)
 
 # The only numeric policy. Change these only with evidence from real runs.
 PATCH_MAX_CHURN = 0.20  # page churn at or below this is patched by the model
@@ -77,19 +80,31 @@ def line_hunks(old: Sequence[str], new: Sequence[str]) -> list[Hunk]:
         return []
     with tempfile.TemporaryDirectory(prefix="wiki-diff-") as tmp:
         old_path, new_path = Path(tmp) / "old.md", Path(tmp) / "new.md"
-        old_path.write_text(_diff_input(old), encoding="utf-8")
-        new_path.write_text(_diff_input(new), encoding="utf-8")
-        result = subprocess.run(
-            [
-                "git", "diff", "--no-index", "--no-color", "--no-ext-diff", "--text",
-                "--minimal", "-U0", "--", str(old_path), str(new_path),
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        try:
+            old_path.write_text(_diff_input(old), encoding="utf-8")
+            new_path.write_text(_diff_input(new), encoding="utf-8")
+        except OSError as exc:
+            log.error("diff input files could not be written, the incremental update cannot be decided dir=%s old_lines=%d new_lines=%d error=%s: %s (disk full, permissions, or too many open files?)",
+                      tmp, len(old), len(new), type(exc).__name__, exc, exc_info=True)
+            raise
+        try:
+            result = subprocess.run(
+                [
+                    "git", "diff", "--no-index", "--no-color", "--no-ext-diff", "--text",
+                    "--minimal", "-U0", "--", str(old_path), str(new_path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except FileNotFoundError as exc:
+            log.error("git binary not found, the incremental line diff cannot be computed binary=git old_lines=%d new_lines=%d error=%s: %s",
+                      len(old), len(new), type(exc).__name__, exc, exc_info=True)
+            raise
     if result.returncode not in (0, 1):
+        log.error("git diff failed, the incremental update cannot be decided binary=git old_lines=%d new_lines=%d returncode=%d stderr=%.500s",
+                  len(old), len(new), result.returncode, result.stderr.strip())
         raise RuntimeError(f"git diff failed: {result.stderr.strip()[:500]}")
     hunks: list[Hunk] = []
     for match in _HUNK_RE.finditer(result.stdout):
@@ -98,6 +113,8 @@ def line_hunks(old: Sequence[str], new: Sequence[str]) -> list[Hunk]:
         # With a zero count git names the line *before* the change.
         hunks.append((old_start + (old_len == 0), old_len, new_start + (new_len == 0), new_len))
     if not hunks:
+        log.error("git diff reported differences but no hunks, the incremental update cannot be decided binary=git old_lines=%d new_lines=%d stdout_bytes=%d",
+                  len(old), len(new), len(result.stdout))
         raise RuntimeError("git diff reported differences but no hunks")
     return hunks
 
@@ -193,7 +210,16 @@ class UpdateDecision:
 
 
 def _full(reason: str) -> UpdateDecision:
+    log.info("incremental update decided tier=3 reason=%s", reason)
     return UpdateDecision(tier=3, reason=reason)
+
+
+def _drop_research_cache(directory: Path) -> None:
+    # rmtree(ignore_errors=True) also swallows a caller onerror callback, so a directory
+    # that is still there afterwards is the only signal that the delete failed.
+    shutil.rmtree(directory, ignore_errors=True)
+    if directory.exists():
+        log.error("stale research cache could not be deleted, this run and the next one keep facts this edit invalidated path=%s (permission, locked file, or busy mount)", directory)
 
 
 def _overlaps(ranges: Sequence[Sequence[int]], start: int, end: int) -> bool:
@@ -258,17 +284,25 @@ def decide_update(
 ) -> UpdateDecision:
     """Pick one tier for this edit without writing anything."""
 
-    plan = read_json(Path(run_root) / "state" / "plan.json", default={})
+    plan_path = Path(run_root) / "state" / "plan.json"
+    plan = read_json(plan_path, default={})
     old, new = diff_lines(old_text), diff_lines(new_text)
     if old == new:
         return UpdateDecision(tier=0, reason="unchanged", old_count=len(old), new_count=len(new))
+    log.info("source diff for the incremental update old_lines=%d new_lines=%d", len(old), len(new))
     pages_json = list(plan.get("pages", []))
     if not pages_json or int(plan.get("source_line_count", -1)) != len(old):
+        # A missing, unreadable or permission-locked plan all arrive here as {};
+        # graph/wiki/storage.py names which of the three it was.
+        blocked = "plan file is absent or unreadable" if not plan else "stored plan does not match the source"
+        log.error("incremental update cannot reuse the stored plan, the whole document is rebuilt from scratch path=%s reason=%s plan_pages=%d plan_source_lines=%s source_lines=%d",
+                  plan_path, blocked, len(pages_json), plan.get("source_line_count"), len(old))
         return _full("plan-mismatch")
     pages = [(int(page["owner_ranges"][0][0]), int(page["owner_ranges"][-1][1])) for page in pages_json]
     names = [str(page["filename"]) for page in pages_json]
 
     hunks = split_at_cuts(line_hunks(old, new), [last for _first, last in pages[:-1]])
+    log.info("line diff for the incremental update hunks=%d old_lines=%d new_lines=%d pages=%d", len(hunks), len(old), len(new), len(pages))
     boundaries = BoundaryMap(hunks, len(old), len(new))
     new_ranges: list[list[int]] = []
     for first, last in pages:
@@ -357,6 +391,8 @@ def decide_update(
         decision.reason = "retitle"
     elif not decision.patch:
         decision.tier, decision.reason = 0, "image-representation"
+    log.info("incremental update decided tier=%d reason=%s hunks=%d patch_pages=%d regenerate_pages=%d retitle_pages=%d",
+             decision.tier, decision.reason, len(decision.hunks), len(decision.patch), len(decision.regenerate), len(decision.retitle))
     return decision
 
 
@@ -379,7 +415,7 @@ def drop_pages(run_root: Path, plan_pages: Sequence[dict[str, Any]], filenames: 
         (run_root / "wiki" / name).unlink(missing_ok=True)
         state_path.unlink(missing_ok=True)
         if name in research:
-            shutil.rmtree(run_root / "work" / f"research-{number:03d}", ignore_errors=True)
+            _drop_research_cache(run_root / "work" / f"research-{number:03d}")
     return sorted(human)
 
 
@@ -396,7 +432,12 @@ def _retitle(run_root: Path, plan_pages: list[dict[str, Any]], retitle: dict[str
             page.update(retitle[name])
     by_name = {str(page["filename"]): page for page in plan_pages}
     for path in sorted(wiki.glob("*.md")):
-        text = path.read_text(encoding="utf-8")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            log.error("published page could not be read, its renamed title and links stay unchanged file=%s error=%s: %s",
+                      path, type(exc).__name__, exc, exc_info=True)
+            raise
         updated = text
         for name, (old_title, new_title) in renames.items():
             updated = updated.replace(f"[{old_title}]({name})", f"[{new_title}]({name})")
@@ -426,6 +467,7 @@ def apply_update(run_root: Path, decision: UpdateDecision, new_source_text: str)
     """
 
     if decision.tier not in (0, 1, 2):
+        log.error("incremental update state cannot be applied, the run state is left untouched tier=%d reason=%.200s", decision.tier, decision.reason)
         raise ValueError("apply_update only handles tiers 0-2")
     run_root = Path(run_root)
     plan_path = run_root / "state" / "plan.json"
@@ -452,7 +494,7 @@ def apply_update(run_root: Path, decision: UpdateDecision, new_source_text: str)
         number = int(page["number"])
         if str(page["filename"]) in decision.research_stale:
             # Quoted text changed: this cache is stale even if the page is only patched.
-            shutil.rmtree(run_root / "work" / f"research-{number:03d}", ignore_errors=True)
+            _drop_research_cache(run_root / "work" / f"research-{number:03d}")
             continue
         cache_path = run_root / "work" / f"research-{number:03d}" / "references.json"
         cached = read_json(cache_path, default={})
@@ -468,7 +510,7 @@ def apply_update(run_root: Path, decision: UpdateDecision, new_source_text: str)
         if valid:
             write_json_atomic(cache_path, cached)
         elif cache_path.exists():
-            shutil.rmtree(cache_path.parent, ignore_errors=True)
+            _drop_research_cache(cache_path.parent)
 
     if decision.retitle:
         _retitle(run_root, plan["pages"], decision.retitle)

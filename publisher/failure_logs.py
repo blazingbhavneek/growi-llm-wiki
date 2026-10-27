@@ -2,35 +2,71 @@
 
 from __future__ import annotations
 
-import hashlib
-import io
 import json
+import datetime
 import logging
+import os
 import re
-import sys
-import time
 import traceback
-import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
 from graph import config
-from graph.wiki.storage import write_json_atomic
 from graph.workspace.parser_client import safe_endpoint
 
+log = logging.getLogger(__name__)
 
-def _redact(text: str, settings: Any) -> str:
-    for name in ("growi_token", "chat_api_key", "embed_api_key"):
-        secret = str(getattr(settings, name, "") or "")
-        if secret:
+
+def redact_log_text(text: str, settings: Any) -> str:
+    """Keep credentials and endpoint query values out of every log and summary."""
+    secrets = {
+        str(getattr(settings, name, "") or "")
+        for name in ("growi_token", "chat_api_key", "embed_api_key", "writer_api_key",
+                     "judge_api_key", "wiki_jev_api_key", "jev_api_key")
+    }
+    secrets.update(value for name, value in os.environ.items()
+                   if name.endswith(("API_KEY", "TOKEN")))
+    for secret in sorted(secrets, key=len, reverse=True):
+        # "local" is the explicit no-auth placeholder, not a minimum secret length.
+        if secret and secret != "local":
             text = text.replace(secret, "[redacted]")
     return re.sub(r"https?://[^\s\"'<>]+", lambda m: safe_endpoint(m.group()), text)
 
 
 def _log_root(settings: Any) -> Path:
     return Path(getattr(settings, "failure_log_root", "") or ((config.PROJECT_ROOT or Path.cwd()) / "logs"))
+
+
+def _project_log_root(settings: Any) -> Path:
+    return _log_root(settings) / str(settings.target_name)
+
+
+@contextmanager
+def capture_run_logs(settings: Any):
+    """Create this project's log folder; the log handlers own live.log/debug.log."""
+
+    root = _project_log_root(settings)
+    root.mkdir(parents=True, exist_ok=True)
+    yield root
+
+
+def reset_failure_summaries(settings: Any) -> None:
+    """Clear the previous run's summary; a logging-only failure must not stop the run."""
+
+    root = _project_log_root(settings)
+    paths = [_log_root(settings) / f"{settings.target_name}_failed_docs.log", root / "failed_docs.log"]
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.error("failed to remove legacy failure summary %s: %s: %s", path, type(exc).__name__, exc)
+    path = root / "failed_docs.md"
+    try:
+        path.write_text("", encoding="utf-8")  # Also clear the previous run after success.
+    except OSError as exc:
+        log.error("failed to reset failure summary %s: %s: %s", path, type(exc).__name__, exc)
 
 
 class _FailureCapture(logging.Handler):
@@ -111,24 +147,40 @@ def _mount_paths(settings: Any) -> dict[str, str]:
 
 def _write_summary(settings: Any, failures: list[str], warnings: list[str],
                    traces: list[tuple[str, str, str, list[str]]]) -> None:
-    failures = list(dict.fromkeys(failures))
-    warnings = list(dict.fromkeys(warnings))
+    def short_reason(failure: str) -> str:
+        prefix, marker, trace = failure.partition("Traceback (most recent call last):")
+        if not marker:
+            return failure
+        # Older conversion results can already contain a formatted traceback.
+        log.debug("failure details: %s", failure)
+        reason = next((line.strip() for line in reversed(trace.splitlines()) if line.strip()),
+                      "see debug.log")
+        return f"{prefix}{reason} (details: debug.log)"
+
+    failures = list(dict.fromkeys(short_reason(failure) for failure in failures))
+    warnings = list(dict.fromkeys(short_reason(warning) for warning in warnings))
     entries = failures + warnings
     aliases = _mount_paths(settings) if entries else {}
-    lines = [f"プロジェクト: {settings.target_name}"]
+    sections: dict[str, list[str]] = {}
+    failed_paths: list[str] = []
     used_traces: set[str] = set()
-    for title, rows in (("失敗ドキュメント", failures), ("インデックスのエラー（パブリッシュは継続）", warnings)):
-        if not rows:
-            continue
-        lines.extend(["", f"{title}: {len(rows)}件"])
+    for title, rows, failed in (
+        ("失敗ドキュメント", failures, True),
+        ("インデックスのエラー（パブリッシュは継続）", warnings, False),
+    ):
         for failure in rows:
             path = failure.split(": ", 1)[0].removeprefix("scan ")
             for prefix in ("index: ", "inventory: "):
                 if failure.startswith(prefix):
                     path = failure[len(prefix):].split(": ", 1)[0]
             mount = aliases.get(path) or aliases.get(path.rpartition("/")[0])
-            label = f"マウント内パス: {mount}" if mount else f"パス／ステージ: {path}"
-            lines.extend(["", f"  {label}", f"  エラー詳細（原文）: {failure}"])
+            label = (mount or path or "<shared>").replace("\n", " ")
+            if failed and label not in failed_paths:
+                failed_paths.append(label)
+            logs = sections.setdefault(label, [])
+            if logs:
+                logs.append("")
+            logs.append(f"{title}: {failure}")
             for message, error, trace, context in traces:
                 # Retried errors that recovered are deliberately omitted.
                 documents = {aliases.get(arg) or aliases.get(arg.rpartition("/")[0]) for arg in context} - {None}
@@ -137,71 +189,31 @@ def _write_summary(settings: Any, failures: list[str], warnings: list[str],
                 reason = error.partition(": ")[2]
                 if trace not in used_traces and (error[:500] in failure or (path and path in message and reason and reason[:200] in failure)):
                     used_traces.add(trace)
-                    lines.extend(["  トレースバック（原文）:", trace.rstrip()])
-    body = _redact("\n".join(lines) + "\n", settings) if entries else ""
-    path = _log_root(settings) / f"{settings.target_name}_failed_docs.log"
+                    # Full traces belong to debug.log only (audit 2.2); this report keeps the reason.
+                    logs.extend(["", f"理由: {error}", "", f"発生時刻: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}",
+                                 "詳細: logs/<project>/debug.log（サイズローテーションのため行番号は固定ではありません）"])
+    if sections:
+        blocks = [
+            "\n".join([f"## {path}", "", "```bash", *logs, "```"])
+            for path, logs in sections.items()
+        ]
+        body = redact_log_text(
+            f"# 失敗ドキュメント\n\nプロジェクト: `{settings.target_name}`\n\n"
+            + "\n\n---\n\n\n".join(blocks)
+            + "\n",
+            settings,
+        )
+    else:
+        body = ""
+    path = _project_log_root(settings) / "failed_docs.md"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body, encoding="utf-8")  # Also clear the previous run after success.
     except OSError as exc:
-        print(_redact(f"エラーログの保存に失敗: {path}: {type(exc).__name__}: {exc}", settings), file=sys.stderr)
-    if body:
-        print(body, file=sys.stderr, end="", flush=True)
-    print(_redact(f"失敗ドキュメント: {len(failures)}件、インデックスのエラー: {len(warnings)}件。ログ: {path}", settings),
-          file=sys.stderr, flush=True)
-
-
-def save_failure(settings: Any, project: Any, run_id: str, attempt: int,
-                 rel: str, details: dict[str, Any], transcript: str = "") -> str:
-    root = _log_root(settings)
-    identity = str(details.get("source_id") or rel)
-    key = hashlib.sha256(identity.encode()).hexdigest()[:16]
-    directory = root / "sync" / project.root.name / run_id / key
-    directory.mkdir(parents=True, exist_ok=True)
-    stem = f"attempt-{attempt}-{uuid.uuid4().hex[:8]}"
-    # Redact both exception text and structured evidence, including URLs.
-    body = json.dumps({"path": rel, "attempt": attempt, "recorded_at": time.time(), **details},
-                      ensure_ascii=False, default=str)
-    write_json_atomic(directory / f"{stem}.json", json.loads(_redact(body, settings)))
-    (directory / f"{stem}.log").write_text(_redact(transcript, settings), encoding="utf-8")
-    return str(directory / f"{stem}.json")
-
-
-class AttemptLog:
-    def __init__(self, settings: Any, project: Any, run_id: str, attempt: int):
-        self.settings, self.project = settings, project
-        self.run_id = run_id or ("sync-" + uuid.uuid4().hex)
-        self.attempt = attempt
-        self.stream = io.StringIO()
-        self.handler = logging.StreamHandler(self.stream)
-        self.handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-        self.events: list[dict[str, Any]] = []
-        self.started = time.monotonic()
-
-    def __enter__(self):
-        logging.getLogger().addHandler(self.handler)
-        return self
-
-    def event(self, row: dict[str, Any]) -> None:
-        self.events.append(dict(row))
-
-    def save(self, result: dict[str, Any]) -> list[str]:
-        jobs = result.get("job_versions") or [{"rel": rel} for rel in result.get("paths", ["<shared>"])]
-        return [save_failure(
-            self.settings, self.project, self.run_id, self.attempt, job["rel"],
-            {**job, "result": result, "events": self.events,
-             "elapsed_seconds": round(time.monotonic() - self.started, 2),
-             "accepted_base": job.get("base_commit", ""),
-             "recovery": "required" if result.get("recovery_required") else "settled; accepted main retained"},
-            self.stream.getvalue(),
-        ) for job in jobs]
-
-    def __exit__(self, kind, value, tb):
-        try:
-            if value is not None:
-                self.save({"failures": ["".join(traceback.format_exception(kind, value, tb))],
-                           "recovery_required": True})
-        finally:
-            logging.getLogger().removeHandler(self.handler)
-            self.handler.close()
+        log.error("failed to save failure evidence to %s: %s: %s",
+                  path, type(exc).__name__, redact_log_text(str(exc), settings))
+    # Records, not prints: the live handler must keep the run's failure list.
+    for failed_path in failed_paths:
+        log.error("document failed: %s", redact_log_text(failed_path, settings))
+    log.info("failed documents=%d index errors=%d details=%s", len(failed_paths), len(warnings), path)
 

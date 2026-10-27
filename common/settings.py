@@ -7,11 +7,14 @@ legacy detail.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .policy import resolve_policy
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -59,9 +62,39 @@ def load_settings(project: str = "", *, overrides: dict[str, Any] | None = None)
     settings = Settings.from_env(selector)
     for key, value in (overrides or {}).items():
         if not hasattr(settings, key):
+            log.error(
+                "override is not a known project setting setting=%s value=%r project=%s",
+                key,
+                value,
+                selector or "(not selected)",
+            )
             raise ValueError(f"unknown setting: {key}")
         setattr(settings, key, value)
+    log.info(
+        "project settings loaded project=%s target_name=%s data_root=%s",
+        selector or "(not selected)",
+        getattr(settings, "target_name", ""),
+        getattr(settings, "data_root", ""),
+    )
     return settings
+
+
+def _number(cast: type[int] | type[float], settings: Any, name: str, default: Any) -> int | float:
+    """int/float of a project setting; the failure names the setting, not just the value."""
+
+    value = getattr(settings, name, default)
+    try:
+        return cast(value)
+    except (TypeError, ValueError) as exc:
+        log.error(
+            "project setting is not a number setting=%s value=%r error=%s: %s",
+            name,
+            value,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
 
 
 def settings_for_root(settings: Any, root: Path) -> Any:
@@ -75,7 +108,23 @@ def settings_for_root(settings: Any, root: Path) -> Any:
     configured = Path(str(getattr(settings, "data_root", ""))) / str(getattr(settings, "target_name", ""))
     if configured.resolve() == root.resolve():
         return settings
-    (root / "mount").mkdir(parents=True, exist_ok=True)
+    try:
+        (root / "mount").mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.error(
+            "mount folder could not be created path=%s error=%s: %s (disk full, read-only, or the volume is not mounted?)",
+            root / "mount",
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
+    log.info(
+        "project root redirected for this run target_name=%s data_root=%s mount_path=%s",
+        root.name,
+        root.parent,
+        root / "mount",
+    )
     updates = {"data_root": str(root.parent), "target_name": root.name, "mount_path": str(root / "mount")}
     if hasattr(settings, "model_copy"):
         return settings.model_copy(update=updates)
@@ -90,8 +139,8 @@ def llm_config(settings: Any) -> LLMConfig:
         base_url=str(settings.chat_base_url),
         api_key=str(getattr(settings, "chat_api_key", "local")),
         model=str(settings.chat_model),
-        temperature=float(getattr(settings, "chat_temperature", 0.7)),
-        timeout=int(getattr(settings, "wiki_request_timeout", 300)),
+        temperature=_number(float, settings, "chat_temperature", 0.7),
+        timeout=_number(int, settings, "wiki_request_timeout", 300),
     )
 
 
@@ -101,7 +150,7 @@ def embed_config(settings: Any) -> EmbedConfig:
         base_url=str(settings.embed_base_url),
         api_key=str(getattr(settings, "embed_api_key", "local")),
         model=str(settings.embed_model),
-        dimension=int(getattr(settings, "embed_dim", 768)),
+        dimension=_number(int, settings, "embed_dim", 768),
     )
 
 

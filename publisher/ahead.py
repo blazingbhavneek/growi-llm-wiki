@@ -21,6 +21,7 @@ step does the work itself.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import queue
 import tempfile
@@ -64,6 +65,8 @@ class ParseAhead:
                         job.rel, type(exc).__name__, exc)
 
     def _run(self, project: Any, settings: Any, jobs: list[Any]) -> None:
+        import requests
+
         from graph.workspace.parser_client import ParserSkip, decode_text_bytes, parse_document, parser_skip_cache
 
         from .history import read_blob
@@ -78,44 +81,51 @@ class ParseAhead:
             if self._stop.is_set():
                 return
             raw_path = project.raw_file(job.raw_rel)
-            if not job.target_blob_oid:
-                continue
-            if job.from_rel and job.target_sha256 == str(sources.get(job.from_rel, {}).get("source_sha256") or ""):
-                continue
-            if Path(job.rel).suffix.lower() in VERBATIM:
-                markdown = decode_text_bytes(read_blob(project, job.target_blob_oid), source=Path(job.rel))
-                if parser_skip_cache() is not None and not markdown.strip():
-                    continue  # TEMPORARY: the builder records the empty-text skip.
-                self._ready(position, job, markdown)
-                continue
-            if raw_path.exists() and job.target_sha256 == str(sources.get(job.rel, {}).get("parsed_source_sha256") or ""):
-                self._ready(position, job, raw_path.read_text(encoding="utf-8"))
-                continue
-            # Same inputs the build passes (publisher/pipeline.py:sync_once), so the key matches.
-            previous = raw_path.read_text(encoding="utf-8") if raw_path.exists() else None
-            validating = previous is not None and job.classification != "forced"
-            target = parse_cache_file(settings, job.target_sha256, previous, validating)
-            if target is None:
-                continue
-            if target.exists():
-                self._ready(position, job, target.read_text(encoding="utf-8"))
-                continue
-            skips = parser_skip_cache()
-            skip_key = (str(target), Path(job.rel).name)
-            if skips is not None and skip_key in skips:
-                continue
-            with _PARSING_LOCK:
-                active = _PARSING.get(target.name)
-                if active is None:
-                    running = threading.Event()
-                    _PARSING[target.name] = running
-                else:
-                    running = active
-            if active is not None:
-                running.wait()
+            # Everything up to the per-job handler below reads the source, the raw cache and the
+            # parse cache; a failure there used to end the thread with only an excepthook traceback.
+            try:
+                if not job.target_blob_oid:
+                    continue
+                if job.from_rel and job.target_sha256 == str(sources.get(job.from_rel, {}).get("source_sha256") or ""):
+                    continue
+                if Path(job.rel).suffix.lower() in VERBATIM:
+                    markdown = decode_text_bytes(read_blob(project, job.target_blob_oid), source=Path(job.rel))
+                    if parser_skip_cache() is not None and not markdown.strip():
+                        continue  # TEMPORARY: the builder records the empty-text skip.
+                    self._ready(position, job, markdown)
+                    continue
+                if raw_path.exists() and job.target_sha256 == str(sources.get(job.rel, {}).get("parsed_source_sha256") or ""):
+                    self._ready(position, job, raw_path.read_text(encoding="utf-8"))
+                    continue
+                # Same inputs the build passes (publisher/pipeline.py:sync_once), so the key matches.
+                previous = raw_path.read_text(encoding="utf-8") if raw_path.exists() else None
+                validating = previous is not None and job.classification != "forced"
+                target = parse_cache_file(settings, job.target_sha256, previous, validating)
+                if target is None:
+                    continue
                 if target.exists():
                     self._ready(position, job, target.read_text(encoding="utf-8"))
-                continue
+                    continue
+                skips = parser_skip_cache()
+                skip_key = (str(target), Path(job.rel).name)
+                if skips is not None and skip_key in skips:
+                    continue
+                with _PARSING_LOCK:
+                    active = _PARSING.get(target.name)
+                    if active is None:
+                        running = threading.Event()
+                        _PARSING[target.name] = running
+                    else:
+                        running = active
+                if active is not None:
+                    running.wait()
+                    if target.exists():
+                        self._ready(position, job, target.read_text(encoding="utf-8"))
+                    continue
+            except Exception as exc:  # noqa: BLE001 - re-raised unchanged; the thread still dies, but not silently
+                log.error("parse-ahead failed outside the parse handler document=%s error=%s: %s; the remaining queued documents are parsed by the build itself",
+                          job.rel, type(exc).__name__, exc, exc_info=True)
+                raise
             started = time.monotonic()
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -138,6 +148,15 @@ class ParseAhead:
                     if skips is not None:
                         skips[skip_key] = str(exc)
                     log.warning("パースをスキップ: %s: %s", job.rel, exc)
+                elif isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+                    # "the build will parse it" would be a false promise: the parse cache and the
+                    # builder's raw tree share this full filesystem, so the same write fails again.
+                    log.error("parse-ahead cache write failed, the filesystem is full document=%s path=%s error=%s: %s",
+                              job.rel, target, type(exc).__name__, exc, exc_info=True)
+                elif isinstance(exc, requests.exceptions.Timeout):
+                    # A slow or dead parser endpoint is not a document that cannot be parsed.
+                    log.warning("parse-ahead parser request timed out document=%s error=%s: %s; the build will parse it again",
+                                job.rel, type(exc).__name__, exc)
                 else:
                     log.warning("parse-ahead %s failed; the build will parse it: %s: %s", job.rel, type(exc).__name__, exc)
             finally:
@@ -184,7 +203,9 @@ class PlannerAhead:
         try:
             model = _model(settings, project)
         except Exception as exc:  # noqa: BLE001 - the serial builder retains the normal fallback
-            log.warning("plan-ahead disabled: %s: %s", type(exc).__name__, exc)
+            log.error("plan-ahead disabled for the whole run setting=chat_base_url,chat_api_key,chat_model"
+                      " env=OPENAI_BASE_URL,OPENAI_API_KEY,OPENAI_MODEL_NAME error=%s: %s; the build plans every document itself",
+                      type(exc).__name__, exc, exc_info=True)
             return
         while True:
             item = await asyncio.to_thread(self._queue.get)
@@ -266,7 +287,9 @@ class LinkAhead:
         try:
             model = model or _model(settings, project)
         except Exception as exc:  # noqa: BLE001 - without a model the linker describes everything itself
-            log.warning("link-ahead disabled: %s: %s", type(exc).__name__, exc)
+            log.error("link-ahead disabled for the whole run setting=chat_base_url,chat_api_key,chat_model"
+                      " env=OPENAI_BASE_URL,OPENAI_API_KEY,OPENAI_MODEL_NAME error=%s: %s; the linker describes every chunk itself",
+                      type(exc).__name__, exc, exc_info=True)
             return
         engine = None
         if str(getattr(settings, "wiki_linker_judge", "llm")) == "jev":
@@ -275,7 +298,9 @@ class LinkAhead:
 
                 engine = get_engine_for(settings)
             except Exception as exc:  # noqa: BLE001 - the linker reports Jev itself
-                log.warning("link-ahead without Jev roles: %s", exc)
+                log.error("link-ahead without Jev roles for the whole run setting=wiki_linker_judge"
+                          " env=WIKI_JEV_BACKEND,WIKI_JEV_BASE_URL,WIKI_JEV_MODEL,WIKI_JEV_TOKENIZER error=%s: %s; the judge runs without the role check",
+                          type(exc).__name__, exc, exc_info=True)
         meta_version = policy.cache_key(CHUNK_META_VERSION)
         while True:
             _, _, item = await asyncio.to_thread(self._queue.get)

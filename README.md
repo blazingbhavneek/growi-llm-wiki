@@ -433,6 +433,6 @@ GROWI上で人が編集した内容を取り込み、次の同期で消えない
 - `<data_root>/<name>/raw/`: 変換後のテキスト
 - `<data_root>/<name>/wiki/`: 生成されたページ
 - `<data_root>/<name>/metadata/`: 公開状態、監視キュー
-- `logs/<name>_failed_docs.log`: 失敗した文書の記録（トークンとURLは伏字）
+- `logs/<name>/`: サイズでローテートする `live.log`（INFO以上・1MB×100ファイル・日本語1行）と `debug.log`（全ログとtraceback・10MB×100ファイル）、トークン・URLを伏せた `failed_docs.md`。`live.log` の各行は「タイムスタンプ・レベル・ランID・理由」が1行に収まり、tracebackは `debug.log` のみ。端末には進捗表示のみが出て、ログの生テキストは流れません。
 
 `<data_root>/<name>/` を削除するとローカルの公開状態は無くなりますが、GROWIのページは残ります（削除は `reset` を使ってください）。ログと生成物には社内文書が含まれます。アクセス権と保存期間を運用環境のポリシーに合わせて設定してください。

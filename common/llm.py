@@ -7,7 +7,10 @@ and offline work when optional model dependencies are not installed.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Iterable, Mapping, TypeVar
+
+log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -36,8 +39,19 @@ async def structured_call(
     # argument is retained here so phase callers can expose one consistent
     # contract while the compatibility client remains the implementation.
     del attempts
-    value = await structured_ainvoke(llm, schema, list(messages))
-    return validate(value) if validate is not None else value
+    name = getattr(schema, "__name__", schema)
+    try:
+        value = await structured_ainvoke(llm, schema, list(messages))
+    except Exception as exc:
+        log.error("stage=llm structured call failed schema=%s error=%s: %s", name, type(exc).__name__, exc, exc_info=True)
+        raise
+    if validate is None:
+        return value
+    try:
+        return validate(value)
+    except Exception as exc:
+        log.error("stage=llm answer rejected by validator schema=%s error=%s: %s", name, type(exc).__name__, exc, exc_info=True)
+        raise
 
 
 async def embed(embedder: Any, texts: list[str], *, ctx: Any = None) -> list[list[float]]:
@@ -45,7 +59,11 @@ async def embed(embedder: Any, texts: list[str], *, ctx: Any = None) -> list[lis
 
     if ctx is not None:
         ctx.count_call("embed")
-    result = await embedder.aembed_documents(texts)
+    try:
+        result = await embedder.aembed_documents(texts)
+    except Exception as exc:
+        log.error("stage=embedder failed texts=%d error=%s: %s", len(texts), type(exc).__name__, exc, exc_info=True)
+        raise
     return [list(vector) for vector in result]
 
 

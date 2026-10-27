@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sqlite3
 from pathlib import Path
 
@@ -14,6 +15,8 @@ from common.policy import policy_of
 from . import link_document
 from .catalog import Catalog
 
+log = logging.getLogger(__name__)
+
 
 def _documents(project: Project) -> list[str]:
     return sorted(
@@ -25,10 +28,18 @@ def _documents(project: Project) -> list[str]:
 def _raw_rel(project: Project, document: str) -> str:
     marker = project.wiki / document / "_planning" / "source.json"
     if marker.exists():
-        return str(__import__("json").loads(marker.read_text(encoding="utf-8")).get("raw", document))
+        try:
+            return str(__import__("json").loads(marker.read_text(encoding="utf-8")).get("raw", document))
+        except (OSError, ValueError) as exc:
+            log.error("source stamp could not be read document=%s path=%s error=%s: %s", document, marker, type(exc).__name__, exc, exc_info=True)
+            raise
     chunks = project.wiki / document / "_planning" / "chunks.json"
     if chunks.exists():
-        cached = str(__import__("json").loads(chunks.read_text(encoding="utf-8")).get("raw_rel") or "")
+        try:
+            cached = str(__import__("json").loads(chunks.read_text(encoding="utf-8")).get("raw_rel") or "")
+        except (OSError, ValueError) as exc:
+            log.error("chunk index could not be read document=%s path=%s error=%s: %s", document, chunks, type(exc).__name__, exc, exc_info=True)
+            raise
         if cached:
             return cached
     # Older output without a stamp: invert the wiki folder naming rule.
@@ -46,7 +57,10 @@ def _model_and_embedder(settings: Settings, project: Project, document: str):
     try:
         from graph.clients.embeddings import Embedder
         embedder = Embedder(settings)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - vector search is optional, but losing it silently is not
+        log.error("embedder unavailable, vector candidate search is off document=%s model=%s backend=%s endpoint=%s settings=WIKI_EMBED_BACKEND,embed_model,embed_api_key error=%s: %s",
+                  document, getattr(settings, "embed_model", ""), getattr(settings, "embed_backend", ""),
+                  getattr(settings, "embed_base_url", ""), type(exc).__name__, exc, exc_info=True)
         embedder = None
     return model, embedder
 
@@ -89,11 +103,16 @@ def calibrate_jev(project: Project, settings: Settings, sample: int) -> None:
         catalog.close()
     if not rows:
         print("No LLM edge decisions available for calibration")
+        log.info("no stored LLM edge decisions to calibrate against mode=neo path=%s", project.linker_database)
         return
     from jev import get_engine_for
     results = run_async_blocking(_calibrate(get_engine_for(settings), rows))
+    failures = [result for result in results if isinstance(result, BaseException)]
     pairs = [(float(result.p_yes), bool(row["accepted"])) for result, row in zip(results, rows)
              if not isinstance(result, BaseException)]
+    if failures:
+        log.error("Jev calibration ran on a partial sample asked=%d answered=%d failed=%d first_error=%s: %s (the precision/recall numbers below describe a subset of the sample)",
+                  len(rows), len(pairs), len(failures), type(failures[0]).__name__, str(failures[0])[:120])
     positives = sum(actual for _probability, actual in pairs)
     best = None
     for threshold in (i / 10 for i in range(3, 10)):
@@ -103,7 +122,12 @@ def calibrate_jev(project: Project, settings: Settings, sample: int) -> None:
         recall = tp / positives if positives else 0.0
         print(f"threshold={threshold:.1f} precision={precision:.3f} recall={recall:.3f} sample={len(pairs)}")
         if precision >= .9 and (best is None or recall > best[1]): best = (threshold, recall)
-    print(f"best_precision_at_least_0.9={best[0]:.1f} recall={best[1]:.3f}" if best else "no threshold reached 0.9 precision")
+    if best:
+        print(f"best_precision_at_least_0.9={best[0]:.1f} recall={best[1]:.3f}")
+        log.info("Jev calibration best threshold=%s recall=%s sample=%d positives=%d", f"{best[0]:.1f}", f"{best[1]:.3f}", len(pairs), positives)
+    else:
+        log.error("Jev calibration reached no threshold at 0.9 precision sample=%d positives=%d (Jev is not a usable replacement for the LLM judge on this sample)", len(pairs), positives)
+        print("no threshold reached 0.9 precision")
 
 
 def main() -> None:
@@ -124,9 +148,12 @@ def main() -> None:
     if args.data_root:
         settings.data_root = str(resolve_project_path(args.data_root).resolve())
     project = open_project(settings)
+    log.info("linker command started command=%s project=%s data_root=%s wiki=%s database=%s",
+             args.command, args.project, settings.data_root, project.wiki, project.linker_database)
     if args.command == "status":
         if not project.linker_database.exists():
             print({"mode": None, "documents": 0, "chunks": 0, "edges": 0})
+            log.info("linker catalog not built yet, status is empty path=%s", project.linker_database)
             return
         with sqlite3.connect(project.linker_database) as conn:
             mode = conn.execute("SELECT value FROM meta WHERE key='mode'").fetchone()
@@ -134,7 +161,10 @@ def main() -> None:
                 table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
                 for table in ("documents", "chunks", "edges")
             }
-        print({"mode": mode[0] if mode else None, **counts})
+        status = {"mode": mode[0] if mode else None, **counts}
+        print(status)
+        log.info("linker catalog status path=%s mode=%s documents=%d chunks=%d edges=%d",
+                 project.linker_database, status["mode"], counts["documents"], counts["chunks"], counts["edges"])
         return
     if args.command == "rebuild":
         rebuild(project, settings, args.mode, args.no_edges)
@@ -146,6 +176,8 @@ def main() -> None:
     if rel in _documents(project):
         rel = _raw_rel(project, rel)
     elif not project.raw_file(rel).exists():
+        log.error("unknown document project=%s document=%s wiki=%s (expected a wiki folder under the wiki tree or a raw rel path)",
+                  settings.target_name, args.document, project.wiki)
         raise SystemExit(f"unknown document: {args.document} (expected a wiki folder or raw rel path)")
     model, embedder = _model_and_embedder(settings, project, Path(rel).parent.as_posix())
     settings.wiki_linker_mode = str(getattr(settings, "wiki_linker_mode", "legacy"))
@@ -153,4 +185,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from runner.logging_support import run_standalone
+    raise SystemExit(run_standalone(main))

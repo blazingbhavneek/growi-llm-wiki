@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,8 @@ from common.legacy import build_link, link_documents, project
 from common.paths import DataLayout
 from common.policy import Policy, resolve_policy
 from common.storage import read_json
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,12 @@ def _raw_rel(layout: DataLayout, document: Path) -> str:
     source = read_json(document / "_planning" / "source.json", default={})
     if source.get("raw"):
         return str(source["raw"])
+    # read_json already names the file when it is unreadable or corrupt; this is the consequence.
+    log.error(
+        "source stamp is missing document=%s path=%s (the raw path below is guessed from the wiki folder name; a half-written _planning folder can link the wrong raw file)",
+        document.name,
+        document / "_planning" / "source.json",
+    )
     return (document.relative_to(layout.wiki).parent / f"{document.name.replace('.', '_', 1)}.md").as_posix()
 
 
@@ -81,6 +90,26 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
             regenerated_pages=set(inp.regenerated_pages) if inp.regenerated_pages else None,
         )
     touched = tuple(getattr(linked, "touched_documents", ()) or ())
+    if not hasattr(linked, "touched_documents"):
+        log.error(
+            "linker returned no touched_documents contract result=%s documents=%d wiki=%s (the touched count below is a broken return contract, not an empty run)",
+            type(linked).__name__,
+            len(documents),
+            layout.wiki,
+        )
+    elif not touched and documents:
+        log.info(
+            "linker touched no documents documents=%d catalog=%s policy=%s (every scanned document was linked and needed no new link)",
+            len(documents),
+            layout.linker_database,
+            cfg.policy.name,
+        )
+    elif not touched:
+        log.error(
+            "linker touched no documents wiki=%s catalog=%s reason=no built document found under the wiki tree (nothing was linked; is --out the project root that the wiki build wrote?)",
+            layout.wiki,
+            layout.linker_database,
+        )
     return Result(touched, cfg.policy.name, sum(ctx.calls.values()) if ctx is not None else 0)
 
 
@@ -92,9 +121,19 @@ def status(root: Path) -> dict[str, Any]:
     database = DataLayout(Path(root)).linker_database
     if not database.exists():
         return {"mode": None, "documents": 0, "chunks": 0, "edges": 0}
-    with sqlite3.connect(database) as connection:
-        mode = connection.execute("SELECT value FROM meta WHERE key='mode'").fetchone()
-        return {"mode": mode[0] if mode else None, **{table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in ("documents", "chunks", "edges")}}
+    try:
+        with sqlite3.connect(database) as connection:
+            mode = connection.execute("SELECT value FROM meta WHERE key='mode'").fetchone()
+            return {"mode": mode[0] if mode else None, **{table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in ("documents", "chunks", "edges")}}
+    except sqlite3.Error as exc:
+        log.error(
+            "linker catalog could not be read path=%s error=%s: %s (database locked, permission denied, or an old schema that needs a linker rebuild)",
+            database,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
 
 
 class _null_context:

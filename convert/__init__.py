@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,8 @@ from common.context import Context
 from common.legacy import convert_mount, open_project, parse_document, read_text_source
 from common.paths import DataLayout, raw_name_for
 from common.storage import read_json, write_json_atomic, write_text_atomic
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -75,6 +78,8 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
 
     source = Path(inp.source)
     if not source.is_file():
+        # is_file() is also False when the file or a parent directory cannot be read
+        log.error("convert source is missing or not a readable file path=%s", source)
         raise FileNotFoundError(source)
     layout = DataLayout(Path(out)).ensure()
     relative = inp.relative or source.name

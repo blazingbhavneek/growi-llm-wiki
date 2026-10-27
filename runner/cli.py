@@ -22,27 +22,150 @@ Every command selects one INI from configs/ (or an absolute INI) with --project.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import copy
+import fcntl
 import json
 import logging
 import os
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from common.policy import policy_of
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+
+from runner.logging_support import file_logging, startup_failed, startup_logs
 
 from graph import config
 from graph.config import Settings, resolve_project_path
 from graph.workspace.parser_client import parser_skip_scope
 from graph.workspace.project import open_project
-from publisher.failure_logs import capture_failure_logs
+from publisher.failure_logs import capture_failure_logs, capture_run_logs, reset_failure_summaries
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 config.PROJECT_ROOT = PROJECT_ROOT
 
 log = logging.getLogger(__name__)
-LOG_FORMAT = "%(levelname)s %(message)s"
+
+
+def _emergency(destination: str, reason: str) -> None:
+    """One short, best-effort console notice per failed log destination (audit 2.1-5)."""
+    if destination in _emergency_done:
+        return
+    _emergency_done.add(destination)
+    try:
+        sys.__stderr__.write(f"logging disabled: {destination}: {reason}\n")
+        sys.__stderr__.flush()
+    except Exception:
+        pass  # a broken stderr is best-effort too; never a second logging crash
+
+
+_emergency_done: set[str] = set()
+
+
+class _ProjectLogHandler(RotatingFileHandler):
+    """Project log file: hardened, append-mode, and rotation-safe across processes.
+
+    ``watch`` and a manual command can run for the same project, so rotation happens
+    only while holding an exclusive lock on ``<file>.lock``, and a handler whose file
+    another process rotated reopens the current file before writing.  A destination
+    that fails is disabled with one emergency notice: logging must never kill a
+    publish run, and a logging-internal traceback never reaches stderr.
+    """
+
+    def __init__(self, filename: Any, **kwargs: Any) -> None:
+        self.broken = False
+        self._lock_file: Any = None
+        super().__init__(filename, **kwargs)
+
+    def _acquire(self) -> Any:
+        if self._lock_file is None:
+            self._lock_file = open(self.baseFilename + ".lock", "a", encoding="utf-8")
+        fcntl.flock(self._lock_file, fcntl.LOCK_EX)
+        return self._lock_file
+
+    def _reopen_if_replaced(self) -> None:
+        """Our file was renamed by another process: follow the active file again."""
+        if self.stream is not None:
+            if os.fstat(self.stream.fileno()).st_ino == os.stat(self.baseFilename).st_ino:
+                return
+            self.stream.close()
+            self.stream = None
+        self._open()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self.broken:
+            return  # no repeated write attempts against a failed destination
+        try:
+            lock = self._acquire()
+            try:
+                self._reopen_if_replaced()
+                super().emit(record)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        except Exception:
+            self.handleError(record)
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        self.broken = True
+        exc_type, exc = sys.exc_info()[:2]
+        _emergency(self.baseFilename, f"{exc_type.__name__}: {exc}")
+
+    def close(self) -> None:
+        try:
+            super().close()
+        except (OSError, ValueError):
+            pass  # a broken log must not break the exit path either
+        try:
+            if self._lock_file is not None:
+                self._lock_file.close()
+        except OSError:
+            pass
+        self._lock_file = None
+
+
+def _open_log_handler(path: Path, *, level: int, max_bytes: int,
+                      formatter: logging.Formatter) -> logging.Handler | None:
+    """Constructor and open failures never reach ``handleError``, so guard them here."""
+
+    try:
+        handler = _ProjectLogHandler(path, maxBytes=max_bytes, backupCount=99, encoding="utf-8")
+    except OSError as exc:
+        _emergency(str(path), f"{type(exc).__name__}: {exc}")
+        return None
+    handler.setLevel(level)
+    handler.setFormatter(formatter)
+    return handler
+
+
+def _file_handlers(log_dir: Path, *, run_id: str, settings: Settings) -> list[logging.Handler]:
+    """live.log keeps INFO and above (1 MB x 100 files); debug.log keeps everything (10 MB x 100)."""
+
+    from publisher.failure_logs import redact_log_text
+    from publisher.progress import LiveJapaneseFormatter
+
+    class RedactedDebugFormatter(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:
+            # Redact the final text too: exception messages and chained traces can contain keys.
+            return redact_log_text(super().format(copy.copy(record)), settings)
+
+    live = _open_log_handler(log_dir / "live.log", level=logging.INFO, max_bytes=1_000_000,
+                             formatter=LiveJapaneseFormatter(run_id=run_id,
+                                                             redact=lambda text: redact_log_text(text, settings)))
+    debug = _open_log_handler(log_dir / "debug.log", level=logging.DEBUG, max_bytes=10_000_000,
+                              formatter=RedactedDebugFormatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    return [handler for handler in (live, debug) if handler is not None]
+
+
+def _thread_excepthook(args: Any) -> None:
+    """A dying thread is an ERROR record with its traceback in debug.log, not a stderr dump."""
+
+    log.error("uncaught thread error thread=%s", getattr(args.thread, "name", "?"),
+              exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 
 
 def _interrupted_fast_repair(
@@ -167,7 +290,11 @@ def _progress(event: dict[str, Any]) -> None:
 
 def _report(result: dict[str, Any], settings: Settings | None = None) -> int:
     for row in result.get("done", []):
+        # stdout JSON is a script contract; the log record is the durable copy.
         print(json.dumps(row, ensure_ascii=False))
+        log.info("processed path=%s status=%s",
+                 row.get("path") or row.get("document") or row.get("folder") or "<batch>",
+                 row.get("status", "done"))
     failures = result.get("failures", []) + result.get("scan_failures", [])
     if settings is not None and getattr(settings, "target_name", ""):
         from publisher.failure_logs import report_failure_summary
@@ -250,20 +377,24 @@ def cmd_check(args: argparse.Namespace) -> int:
     bad = 0
     for name, url in targets.items():
         if not url:
-            print(f"{name:7} skipped (not configured)")
+            log.info("check %s skipped (not configured)", name)
             continue
         try:
             response = requests.get(url, timeout=5)
-            print(f"{name:7} {response.status_code} {url}")
+            log.info("check %s status=%s url=%s", name, response.status_code, url)
             bad += response.status_code >= 400
         except Exception as exc:
-            print(f"{name:7} DOWN {url} ({type(exc).__name__})")
+            log.error("check %s unreachable url=%s error=%s: %s", name, url, type(exc).__name__, exc)
             bad += 1
     jev_line, jev_bad = _jev_check(settings)
-    print(jev_line)
+    if jev_bad:
+        log.error("check jev failed: %s", jev_line)
+    else:
+        log.info("check jev %s", jev_line)
     bad += jev_bad
     project = open_project(settings)
-    print(f"data    {project.root.resolve()}  mount={project.mount} ingest={settings.ingest_mode} linker={'off' if not settings.wiki_linker_enabled else settings.wiki_linker_mode}")
+    log.info("data root=%s mount=%s ingest=%s linker=%s", project.root.resolve(), project.mount,
+             settings.ingest_mode, "off" if not settings.wiki_linker_enabled else settings.wiki_linker_mode)
     return 1 if bad else 0
 
 
@@ -308,13 +439,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     def on_event(event: dict[str, Any]) -> None:
         progress.on_event(event)
-        if args.verbose:
-            _progress(event)
+        _progress(event)
 
     try:
         stale = pipeline.republish_if_stale(settings)
         if stale is not None:
-            print(f"growi endpoint or markers changed: full republish {stale['run_id']}", flush=True)
+            log.info("growi endpoint or markers changed: full republish %s", stale["run_id"])
             combined["failures"].extend(stale["failures"])
         with worker_lock(project):
             with pipeline._lock(project):
@@ -366,8 +496,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             from publisher.index import build_index
 
             try:
-                index_callback = on_event if args.verbose or progress.has_documents else None
-                index = build_index(settings, on_progress=index_callback)
+                index = build_index(settings, on_progress=on_event)
             except Exception as exc:  # a stale table of contents must not fail a sync
                 log.exception("インデックス処理に失敗")
                 index = {"done": [], "failures": [f"index: {type(exc).__name__}: {exc}"]}
@@ -418,7 +547,7 @@ def _run_fast_link(
     from publisher.queue import _candidate_settings, _finish_transaction, _transaction, recover, worker_lock
 
     project = open_project(settings)
-    callback = on_progress if on_progress is not None else (_progress if args.verbose else None)
+    callback = on_progress if on_progress is not None else _progress
     resetting = bool(getattr(args, "fast_link_reset", False))
     result: dict[str, Any] = {"done": [], "failures": []}
     accepted = False
@@ -545,8 +674,7 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
 
         def on_event(event: dict[str, Any]) -> None:
             progress.on_event(event)
-            if args.verbose:
-                _progress(event)
+            _progress(event)
 
         try:
             repair = FastRepair(
@@ -668,17 +796,12 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
 
 def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
     """One retry owner; each operation starts from the latest accepted main."""
-    import traceback
-    import uuid
-
     from publisher import pipeline
     from publisher.ahead import LinkAhead, ParseAhead, PlannerAhead
-    from publisher.failure_logs import save_failure
     from publisher.queue import queued_jobs, recover, retry_failed, scan, status, work_once, worker_lock
     from publisher.progress import SyncProgress
 
     project = open_project(settings)
-    run_id = "sync-" + uuid.uuid4().hex
     fast_linking = policy_of(settings).name == "fast"
     parse_ahead: ParseAhead | None = None
     planner_ahead: PlannerAhead | None = None
@@ -686,9 +809,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
     combined: dict[str, Any] = {"done": [], "failures": []}
     progress = SyncProgress()
     wanted = {item.strip().lstrip("/") for item in args.items or ()}
-    logs: dict[str, list[str]] = {}
     discovery: dict[str, str] = {}
-    recorded: set[tuple[int, str, str]] = set()
     recovered: list[str] = []
     skipped_versions: dict[str, int] = {}
     blocked = False
@@ -708,8 +829,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
         ):
             parse_ahead.advance()
         progress.on_event(event)
-        if args.verbose:
-            _progress(event)
+        _progress(event)
 
     try:
         with worker_lock(project):
@@ -750,19 +870,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 )
             }
             for rel, error in discovery.items():
-                key = (1, rel, error)
-                recorded.add(key)
-                path = save_failure(
-                    settings,
-                    project,
-                    run_id,
-                    1,
-                    rel,
-                    {"stage": "scan", "error": error},
-                    error,
-                )
-                logs.setdefault(rel, []).append(path)
-                log.error("source discovery failed: %s; log=%s", rel, path)
+                log.error("source discovery failed: %s: %s", rel, error)
             # Parse, plan and build form one bounded train; every ahead worker only
             # fills a content-addressed cache (publisher/ahead.py).
             settings.cache_dir = getattr(settings, "cache_dir", "") or str((project.metadata / "cache").resolve())
@@ -781,7 +889,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
             attempt = 1
             while True:
                 result = work_once(settings, on_event=on_event, isolated=True,
-                                   only=args.items or None, run_id=run_id, attempt=attempt,
+                                   only=args.items or None,
                                    exclude=list(discovery), defer_linker=True)
                 if result is None:
                     if attempt == 2:
@@ -800,19 +908,15 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 skipped_versions.update({row["rel"]: row["version"] for row in result.get("job_versions", [])
                                          if row["rel"] in skipped_paths})
                 progress.add_documents(paths)
-                evidence = result.get("failure_logs", [])
-                if evidence:
-                    for rel in paths:
-                        logs.setdefault(rel, []).extend(evidence)
                 if result.get("recovery_required") or result.get("cancelled"):
                     blocked = True
                     combined["failures"].extend(result.get("failures") or ["sync cancelled; pending jobs retained"])
                     break
                 if result.get("failures"):
                     if skipped_paths and set(paths) <= skipped_paths:
-                        log.warning("ドキュメントをスキップ: %s; ログ: %s", paths, evidence)
+                        log.warning("ドキュメントをスキップ: %s", paths)
                     else:
-                        log.warning("document attempt %d failed: %s; logs=%s", attempt, paths, result.get("failure_logs", []))
+                        log.warning("document attempt %d failed: %s", attempt, paths)
                     continue
                 combined["done"].extend(result.get("done", []))
                 progress.mark_completed(paths)
@@ -859,18 +963,14 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 combined["failures"].extend(published.get("failures", []))
             pending = [row for row in status(project) if selected(row)]
             for row in pending:
-                evidence = ", ".join(logs.get(row["rel"], []))
-                combined["failures"].append(
-                    f"{row['rel']}: {row.get('error') or 'pending dependent work'}"
-                    + (f"; logs: {evidence}" if evidence else "")
-                )
+                combined["failures"].append(f"{row['rel']}: {row.get('error') or 'pending dependent work'}")
             for rel, error in discovery.items():
-                combined["failures"].append(f"scan {rel}: {error}; logs: {', '.join(logs.get(rel, []))}")
+                combined["failures"].append(f"scan {rel}: {error}")
             if not blocked:
                 from publisher.index import build_index
 
                 try:
-                    index = build_index(settings, on_progress=on_event if args.verbose or progress.has_documents else None)
+                    index = build_index(settings, on_progress=on_event)
                     combined["done"].extend(index.get("done", []))
                     combined["failures"].extend(index.get("failures", []))
                 except Exception as exc:
@@ -878,14 +978,11 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                     combined["failures"].append(f"index: {type(exc).__name__}: {exc}")
         if recovered:
             print(json.dumps({"recovered_on_final_retry": recovered}, ensure_ascii=False))
-        if logs:
-            print(json.dumps({"failure_logs": logs, "run_id": run_id}, ensure_ascii=False))
+            log.info("recovered on final retry documents=%s", len(recovered))
         return _report(combined, settings)
     except Exception as exc:
         log.exception("シンク処理に失敗")
-        evidence = save_failure(settings, project, run_id, 1, "<shared>",
-                                {"stage": "sync", "error": traceback.format_exc()}, traceback.format_exc())
-        combined["failures"].append(f"shared sync failure: {type(exc).__name__}: {exc}; log: {evidence}")
+        combined["failures"].append(f"shared sync failure: {type(exc).__name__}: {exc}")
         return _report(combined, settings)
     finally:
         if parse_ahead is not None:
@@ -909,6 +1006,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     )
     if result.get("human_sync"):
         print(json.dumps({"human_sync": result["human_sync"]}, ensure_ascii=False, default=str))
+        log.info("human sync captured documents=%s", len(result["human_sync"] or []))
     return _report(result, settings)
 
 
@@ -958,7 +1056,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             interval=args.interval,
             growi_interval=args.growi_interval,
             force=args.force,
-            on_event=_progress if args.verbose else None,
+            on_event=_progress,
             continue_run=bool(getattr(args, "continue_run", False)),
         )
     except KeyboardInterrupt:
@@ -1007,8 +1105,9 @@ def cmd_convert(args: argparse.Namespace) -> int:
     settings = _settings(args)
     from runner.steps import convert
 
-    result = convert(settings, on_progress=_progress if args.verbose else None)
+    result = convert(settings, on_progress=_progress)
     print(json.dumps({key: value for key, value in result.items() if key != "failures"}, ensure_ascii=False))
+    log.info("convert done files=%d failed=%d", len(result.get("converted") or []), len(result.get("failed") or []))
     _report({"failures": result.get("failures") or result["failed"]}, settings)
     return 1 if result["failed"] else 0
 
@@ -1025,7 +1124,7 @@ def cmd_build(args: argparse.Namespace) -> int:
     settings = _settings(args)
     return _report(build(
         settings, phase=phase, only=rels or None, force=args.force,
-        on_progress=_progress if args.verbose else None,
+        on_progress=_progress,
     ), settings)
 
 
@@ -1052,8 +1151,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
             if step == "done":
                 stats["indexed"] = event.get("current", 0)
         progress.on_event(event)
-        if args.verbose:
-            _progress(event)
+        _progress(event)
 
     log.info("publish project=%s allow_unlinked=True; linking skipped", settings.target_name)
     with closing(SyncProgress()) as progress:
@@ -1090,7 +1188,7 @@ def cmd_index(args: argparse.Namespace) -> int:
 
     return _report(index(
         settings, only=args.items or None, publish=not args.no_publish,
-        on_progress=_progress if args.verbose else None,
+        on_progress=_progress,
     ), settings)
 
 
@@ -1105,8 +1203,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
     with closing(SyncProgress()) as progress:
         def on_event(event: dict[str, Any]) -> None:
             progress.on_event(event)
-            if args.verbose:
-                _progress(event)
+            _progress(event)
 
         result = reset_growi(settings, on_progress=on_event)
     return _report(result, settings)
@@ -1120,7 +1217,7 @@ def cmd_link(args: argparse.Namespace) -> int:
     project = open_project(settings)
     if args.link_command is None:
         from publisher.pipeline import link_raw
-        return _report(link_raw(settings, force=args.force, on_progress=_progress if args.verbose else None), settings)
+        return _report(link_raw(settings, force=args.force, on_progress=_progress), settings)
     if args.link_command == "status":
         import sqlite3
 
@@ -1142,10 +1239,11 @@ def cmd_link(args: argparse.Namespace) -> int:
         elif not project.raw_file(rel).exists():
             raise SystemExit(f"unknown document: {args.document} (wiki folder or raw rel path)")
         model, embedder = linker_cli._model_and_embedder(settings, project, Path(rel).parent.as_posix())
-        result = run_async_blocking(link_document(project, rel, model=model, embedder=embedder, settings=settings, on_progress=_progress if args.verbose else None))
+        result = run_async_blocking(link_document(project, rel, model=model, embedder=embedder, settings=settings, on_progress=_progress))
         print(json.dumps({"touched": result.touched_documents}, ensure_ascii=False))
+        log.info("relink done touched=%s", len(result.touched_documents))
         if result.touched_documents:
-            print("更新したドキュメントをGROWIへ反映するには `python main.py publish` を実行してください", file=sys.stderr)
+            log.info("更新したドキュメントをGROWIへ反映するには `python main.py publish` を実行してください")
     return 0
 
 
@@ -1273,36 +1371,66 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    from publisher.progress import JapaneseFormatter, ShortNameFormatter, TqdmStreamHandler
+    run_id = uuid.uuid4().hex[:12]
 
-    handler = TqdmStreamHandler(sys.stderr)
-    handler.setFormatter(ShortNameFormatter(LOG_FORMAT) if args.verbose else JapaneseFormatter())
-    logging.basicConfig(
-        level="DEBUG" if getattr(args, "verbose", False) else os.environ.get("LOG_LEVEL", "INFO"),
-        handlers=[handler],
-    )
-    # -v means "show our debug", not third-party HTTP/client chatter.
-    # Keep client warnings out of the progress display as well; real errors
-    # from these clients remain visible.
-    for noisy in (
-        "asyncio",
-        "httpx",
-        "httpx2",
-        "httpcore",
-        "h11",
-        "urllib3",
-        "openai",
-        "langchain",
-        "langchain_openai",
-        "langchain-openai",
-        "anthropic",
-    ):
-        logging.getLogger(noisy).setLevel(logging.ERROR)
-    # Daemons have no final report; do not accumulate their diagnostics forever.
-    if args.command == "watch" or (args.command == "queue" and args.queue_command == "work" and not args.once):
-        return int(args.fn(args) or 0)
-    with capture_failure_logs():
-        return int(args.fn(args) or 0)
+    try:
+        with startup_logs() as pending:
+            settings = _settings(args)
+    except Exception as exc:
+        # No log handler exists yet: one concise notice, no traceback on the terminal.
+        startup_failed(exc)
+        return 1
+
+    handlers: list[logging.Handler] = []
+    with contextlib.ExitStack() as stack:
+        try:
+            log_dir = stack.enter_context(capture_run_logs(settings))
+            handlers = _file_handlers(log_dir, run_id=run_id, settings=settings)
+        except OSError as exc:
+            # An unusable log folder is a logging problem, not a reason to stop the run.
+            _emergency("log folder", f"{type(exc).__name__}: {exc}")
+        root = stack.enter_context(file_logging(handlers))
+        for record in pending:
+            root.handle(record)
+        # Nothing logs to the terminal: it keeps tqdm, stdout contracts and these notices.
+        # file_logging supplies a NullHandler when neither file can be opened.
+        reset_failure_summaries(settings)
+        log.info("run started project=%s run=%s command=%s", settings.target_name, run_id, args.command)
+        # -v means "show our debug in debug.log", not third-party HTTP/client chatter.
+        for noisy in (
+            "asyncio",
+            "httpx",
+            "httpx2",
+            "httpcore",
+            "h11",
+            "urllib3",
+            "openai",
+            "langchain",
+            "langchain_openai",
+            "langchain-openai",
+            "anthropic",
+        ):
+            logging.getLogger(noisy).setLevel(logging.ERROR)
+        threading.excepthook = _thread_excepthook
+        outcome = "failed"
+        try:
+            try:
+                # Daemons have no final report; do not accumulate their diagnostics forever.
+                if args.command == "watch" or (args.command == "queue" and args.queue_command == "work" and not args.once):
+                    code = int(args.fn(args) or 0)
+                else:
+                    with capture_failure_logs():
+                        code = int(args.fn(args) or 0)
+            except Exception as exc:
+                # The reason goes to live.log, the traceback to debug.log, never the terminal.
+                log.error("command failed command=%s error=%s: %s",
+                          args.command, type(exc).__name__, exc, exc_info=True)
+                code = 1
+            outcome = "ok" if code == 0 else f"exit={code}"
+            return code
+        finally:
+            log.info("run finished project=%s run=%s command=%s outcome=%s",
+                     settings.target_name, run_id, args.command, outcome)
 
 
 if __name__ == "__main__":

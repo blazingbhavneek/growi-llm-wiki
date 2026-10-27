@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import logging
+import os
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -11,6 +13,8 @@ from typing import Any, Iterable
 from common.paths import generated_rels as _generated_rels
 from common.paths import raw_name_for as _raw_name_for
 from common.paths import wiki_folder_name as _wiki_folder_name
+
+log = logging.getLogger(__name__)
 
 VERBATIM = {".md", ".txt"}
 
@@ -28,6 +32,21 @@ def generated_rels(mount_rel: str) -> tuple[str, str]:
     return _generated_rels(mount_rel)
 
 
+def walk_files(root: Path) -> list[Path]:
+    """List files under root; ``Path.rglob`` drops unreadable directories without a word."""
+
+    if not root.is_dir():
+        return []
+
+    def unreadable(error: OSError) -> None:
+        log.error("scan cannot read directory path=%s error=%s: %s", getattr(error, "filename", root), type(error).__name__, error, exc_info=True)
+
+    files: list[Path] = []
+    for folder, _folders, names in os.walk(root, onerror=unreadable):
+        files.extend(Path(folder) / name for name in names)
+    return files
+
+
 def assert_unique_generated_paths(mount_rels: Iterable[str]) -> None:
     """Reject mount layouts that cannot be represented without overwriting output."""
 
@@ -42,6 +61,7 @@ def assert_unique_generated_paths(mount_rels: Iterable[str]) -> None:
         ):
             previous = owners.get(generated)
             if previous is not None and previous != rel:
+                log.error("mount paths write the same output kind=%s output=%s mount=%s other=%s", kind, generated, rel, previous)
                 raise ValueError(
                     f"mount paths resolve to the same {kind} {generated!r}: "
                     f"{previous!r}, {rel!r}"
@@ -57,6 +77,7 @@ def assert_unique_generated_paths(mount_rels: Iterable[str]) -> None:
                 break
             parent_owner = raw_owners.get(parent_rel)
             if parent_owner is not None:
+                log.error("generated raw path is both a file and a directory path=%s owner=%s other=%s", parent_rel, parent_owner, owner)
                 raise ValueError(
                     f"generated raw path is both a file and a directory {parent_rel!r}: "
                     f"{parent_owner!r}, {owner!r}"
@@ -143,14 +164,18 @@ class Project:
 
     def ensure(self) -> "Project":
         for directory in (self.raw, self.metadata, self.wiki):
-            directory.mkdir(parents=True, exist_ok=True)
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                log.error("project folder create failed path=%s error=%s: %s", directory, type(exc).__name__, exc, exc_info=True)
+                raise
         return self
 
     def raw_files(self) -> list[str]:
         return sorted(
             path.relative_to(self.raw).as_posix()
-            for path in self.raw.rglob("*.md")
-            if ".git" not in path.parts
+            for path in walk_files(self.raw)
+            if path.name.endswith(".md") and ".git" not in path.parts
         )
 
     def teams(self) -> list[str]:
@@ -168,9 +193,11 @@ def open_project(settings: Any) -> Project:
     name = str(getattr(settings, "target_name", "")).strip()
     mount_value = str(getattr(settings, "mount_path", "")).strip()
     if not name or not mount_value:
+        log.error("project config is missing required settings target_name=%s source_mount=%s", name, mount_value)
         raise ValueError("project config did not provide target_name and source_mount")
     mount = Path(mount_value)
     if not mount.is_dir():
+        log.error("mount directory not found path=%s project=%s", mount, name)
         raise FileNotFoundError(f"mount directory not found: {mount}")
     return Project(Path(settings.data_root) / name, mount).ensure()
 
@@ -178,9 +205,15 @@ def open_project(settings: Any) -> Project:
 def zip_wiki(project: Project, team: str | None = None) -> bytes:
     buffer = io.BytesIO()
     base = project.wiki / team if team else project.wiki
+    # The whole archive is built in RAM, so name the tree before it is read.
+    log.info("wiki zip started path=%s team=%s", base, team or "")
+    files = 0
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(base.rglob("*")):
+        for path in sorted(walk_files(base)):
             if not path.is_file() or "_planning" in path.parts:
                 continue
             archive.write(path, path.relative_to(project.wiki).as_posix())
-    return buffer.getvalue()
+            files += 1
+    payload = buffer.getvalue()
+    log.info("wiki zip finished files=%d bytes=%d", files, len(payload))
+    return payload

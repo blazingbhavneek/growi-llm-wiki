@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import posixpath
 import re
 import zipfile
@@ -13,6 +14,8 @@ from xml.etree import ElementTree
 from openpyxl import load_workbook
 from openpyxl.formula import Tokenizer
 from openpyxl.utils import get_column_letter
+
+log = logging.getLogger(__name__)
 
 _RID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
 _PROC_RE = re.compile(
@@ -32,15 +35,19 @@ def has_vba(path: Path) -> bool:
     try:
         with zipfile.ZipFile(path) as archive:
             return "xl/vbaProject.bin" in archive.namelist()
-    except (OSError, zipfile.BadZipFile):
+    except (OSError, zipfile.BadZipFile) as exc:
+        # The caller treats this as "not a macro file" and publishes the workbook unchecked.
+        log.error("workbook is unreadable, treated as a workbook without macros workbook=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
         return False
 
 
-def _sheet_refs(text: str, names: set[str]) -> set[str]:
+def _sheet_refs(text: str, names: set[str], workbook: Any = None) -> set[str]:
     refs: set[str] = set()
     try:
         tokens = Tokenizer(text).items if text.startswith("=") else ()
-    except Exception:
+    except Exception as exc:
+        # The formula keeps no lineage dependencies, so the sheet graph loses this edge.
+        log.error("formula lineage lost, the formula could not be parsed workbook=%s formula=%s error=%s: %s", workbook, text, type(exc).__name__, exc, exc_info=True)
         tokens = ()
     for token in tokens:
         if token.type != "OPERAND" or token.subtype != "RANGE" or "!" not in token.value:
@@ -119,7 +126,10 @@ def _buttons(path: Path, workbook: Any) -> list[dict[str, str]]:
                     for anchor in (node for node in root.iter() if _local(node.tag) in {"oneCellAnchor", "twoCellAnchor", "absoluteAnchor"}):
                         macro = next((value for node in anchor.iter() for key, value in node.attrib.items() if _local(key) == "macro" and value), "")
                         if macro:
-                            output.append({"sheet": name, "cells": _anchor_cells(anchor), "procedure": macro.rsplit("!", 1)[-1]})
+                            cells = _anchor_cells(anchor)
+                            if cells == "unknown":
+                                log.error("button cell anchor unresolved workbook=%s sheet=%s macro=%s", path, name, macro.rsplit("!", 1)[-1])
+                            output.append({"sheet": name, "cells": cells, "procedure": macro.rsplit("!", 1)[-1]})
                     continue
                 for client in (node for node in root.iter() if _local(node.tag) == "ClientData"):
                     values = {_local(child.tag): (child.text or "").strip() for child in client}
@@ -128,7 +138,9 @@ def _buttons(path: Path, workbook: Any) -> list[dict[str, str]]:
                         anchor = [int(value.strip()) for value in values["Anchor"].split(",")]
                         start = f"{get_column_letter(anchor[0] + 1)}{anchor[2] + 1}"
                         end = f"{get_column_letter(anchor[4] + 1)}{anchor[6] + 1}"
-                    except (KeyError, ValueError, IndexError):
+                    except (KeyError, ValueError, IndexError) as exc:
+                        if macro:
+                            log.error("button cell anchor unresolved workbook=%s sheet=%s macro=%s error=%s: %s", path, name, macro, type(exc).__name__, exc, exc_info=True)
                         start = end = "unknown"
                     if macro:
                         output.append({"sheet": name, "cells": start if start == end else f"{start}:{end}", "procedure": macro})
@@ -355,14 +367,18 @@ def build_manifest(path: Path) -> dict[str, Any] | None:
     path = Path(path)
     if not has_vba(path):
         return None
-    workbook = load_workbook(path, data_only=False, keep_vba=True, keep_links=False)
+    try:
+        workbook = load_workbook(path, data_only=False, keep_vba=True, keep_links=False)
+    except Exception as exc:
+        log.error("workbook open failed workbook=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        raise
     try:
         names = {sheet.title for sheet in workbook.worksheets}
         dependencies = {name: set() for name in names}
         chart_counts = {sheet.title: len(sheet._charts) for sheet in workbook.worksheets}
         image_counts = {sheet.title: len(sheet._images) for sheet in workbook.worksheets}
         charts: dict[str, list[dict[str, Any]]] = {sheet.title: [] for sheet in workbook.worksheets}
-        defined = {item.name: _sheet_refs(str(item.attr_text or ""), names) for item in workbook.defined_names.values()}
+        defined = {item.name: _sheet_refs(str(item.attr_text or ""), names, workbook=path) for item in workbook.defined_names.values()}
         defined_lookup = {name.casefold(): refs for name, refs in defined.items()}
         defined_re = re.compile(
             r"(?<![\w.])(" + "|".join(map(re.escape, sorted(defined, key=len, reverse=True))) + r")(?![\w.])",
@@ -370,7 +386,7 @@ def build_manifest(path: Path) -> dict[str, Any] | None:
         ) if defined else None
 
         def refs(text: str) -> set[str]:
-            found = _sheet_refs(text, names)
+            found = _sheet_refs(text, names, workbook=path)
             if defined_re:
                 for match in defined_re.finditer(text):
                     found.update(defined_lookup[match.group(1).casefold()])
@@ -460,6 +476,10 @@ def build_manifest(path: Path) -> dict[str, Any] | None:
             ],
             "procedures": procedures,
         }
+    except Exception as exc:
+        # openpyxl and the drawing parts report no workbook path of their own.
+        log.error("xlsm lineage inspection failed workbook=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+        raise
     finally:
         workbook.close()
 

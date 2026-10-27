@@ -83,7 +83,12 @@ def document_cards(folder: Path) -> list[dict[str, Any]]:
         page_chunks = chunks.get(filename, {}).get("chunks", [])
         title = manifest.get(filename, {}).get("title") or cov.get("title")
         if not title:
-            title = next((l[2:].strip() for l in page.read_text(encoding="utf-8").splitlines() if l.startswith("# ")), filename[:-3])
+            try:
+                title = next((l[2:].strip() for l in page.read_text(encoding="utf-8").splitlines() if l.startswith("# ")), filename[:-3])
+            except (OSError, UnicodeDecodeError) as exc:
+                log.error("wiki page could not be read path=%s error=%s: %s (the index cannot fall back to its first heading)",
+                          page, type(exc).__name__, exc, exc_info=True)
+                raise
         cards.append({
             "filename": filename,
             "title": _one_line(title, 200),
@@ -188,9 +193,15 @@ def _related_documents(settings: Any, folders: dict[str, Path], summaries: dict[
             from graph.linker.jev_judge import related_documents
             accepted = asyncio.run(related_documents(engine, pending, settings))
             decisions.update({key: key in accepted for key, _a, _b in pending})
-            write_text_atomic(cache_path, json.dumps(cache, ensure_ascii=False, indent=2) + "\n")
         except Exception as exc:
-            log.warning("Jev related document judge failed: %s", exc)
+            log.error("Jev related document judge failed: %s", exc)
+        else:
+            # A disk failure here is not a judge failure: the decisions still apply to this run.
+            try:
+                write_text_atomic(cache_path, json.dumps(cache, ensure_ascii=False, indent=2) + "\n")
+            except OSError as exc:
+                log.error("related document cache not written path=%s error=%s (the decisions are used this run only and are judged again next time)",
+                          cache_path, type(exc).__name__)
     output: dict[str, list[tuple[str, str]]] = {doc: [] for doc in folders}
     for (a, b), (key, _text_a, _text_b) in cards.items():
         if decisions.get(key):
@@ -384,7 +395,12 @@ def _delete_local_index(path: Path, index_root: Path) -> bool:
     path = Path(path)
     if not path.exists():
         return False
-    path.unlink()
+    try:
+        path.unlink()
+    except OSError as exc:
+        log.error("local index could not be deleted path=%s error=%s: %s (the stale index page stays in metadata/index/)",
+                  path, type(exc).__name__, exc, exc_info=True)
+        raise
     root = Path(index_root).resolve(strict=False)
     current = path.parent.resolve(strict=False)
     while current != root and root in current.parents:
@@ -478,6 +494,7 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
     connection = _connection(settings)
     publisher = _publisher(settings) if publish else None
     if publish and publisher is None:
+        log.error("GROWI_URL is not configured project=%s; the index cannot be published", getattr(settings, "target_name", ""))
         raise RuntimeError("GROWI_URL is required for index (use --no-publish to only write metadata/index/)")
     run_id = "idx-" + uuid.uuid4().hex[:16]
     done: list[dict[str, Any]] = []
@@ -493,6 +510,8 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
             remote_path = _index_link(connection, rel)
             previous = remote_owners.get(remote_path)
             if previous is not None and previous != rel:
+                log.error("index locations collide path=%s documents=%s and %s; one would overwrite the other's index page",
+                          remote_path, previous, rel)
                 raise ValueError(
                     f"index locations resolve to the same GROWI path {remote_path!r}: "
                     f"{previous!r}, {rel!r}"
@@ -547,7 +566,7 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
                                                         write_path=connection.write_path, root_path=connection.root_path))
                     status = "indexed" if changed else "unchanged"
                 except Exception as exc:  # one document must not stop the others
-                    log.warning("ドキュメントのインデックス処理に失敗: %s", document, exc_info=True)
+                    log.error("ドキュメントのインデックス処理に失敗: %s", document, exc_info=True)
                     failures.append(f"{document}: {type(exc).__name__}: {exc}")
                     continue
             indexed += 1
@@ -564,7 +583,7 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
                         if asyncio.run(_delete_if_index(publisher.client, _index_link(connection, folder))):
                             status = "deleted"
                     except Exception as exc:
-                        log.warning("フォルダーのインデックス処理に失敗: %s", folder, exc_info=True)
+                        log.error("フォルダーのインデックス処理に失敗: %s", folder, exc_info=True)
                         failures.append(f"folder {folder}: {type(exc).__name__}: {exc}")
                 done.append({"folder": folder, "status": status})
                 continue
@@ -575,7 +594,7 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
                     try:
                         asyncio.run(_delete_if_index(publisher.client, _index_link(connection, folder)))
                     except Exception as exc:
-                        log.warning("フォルダーのインデックス処理に失敗: %s", folder, exc_info=True)
+                        log.error("フォルダーのインデックス処理に失敗: %s", folder, exc_info=True)
                         failures.append(f"folder {folder}: {type(exc).__name__}: {exc}")
                 done.append({"folder": folder, "status": status})
                 continue
@@ -593,7 +612,7 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
                         mode=connection.mode, write_path=connection.write_path, root_path=connection.root_path))
                     status = "indexed" if changed else "unchanged"
             except Exception as exc:
-                log.warning("フォルダーのインデックス処理に失敗: %s", folder, exc_info=True)
+                log.error("フォルダーのインデックス処理に失敗: %s", folder, exc_info=True)
                 failures.append(f"folder {folder}: {type(exc).__name__}: {exc}")
             done.append({"folder": folder, "status": status})
             indexed += 1
@@ -624,6 +643,8 @@ def build_index(settings: Any, *, only: list[str] | None = None, publish: bool =
                     if removed_remote:
                         done.append({"stale_growi_indexes": removed_remote, "status": "deleted"})
                 except Exception as exc:
+                    log.error("stale index cleanup failed root=%s run=%s error=%s: %s; index pages that are no longer used stay published",
+                              growi_path(connection.write_path), run_id, type(exc).__name__, exc, exc_info=True)
                     failures.append(f"stale indexes: {type(exc).__name__}: {exc}")
     if on_progress:
         on_progress({"stage": "index", "step": "done", "current": indexed, "total": total, "run_id": run_id})
@@ -640,6 +661,7 @@ def delete_index_pages(
     connection = _connection(settings)
     publisher = _publisher(settings)
     if publisher is None:
+        log.error("GROWI_URL is not configured project=%s; index pages cannot be deleted", getattr(settings, "target_name", ""))
         raise RuntimeError("GROWI_URL is required")
     if hasattr(publisher.client, "list_all_pages"):
         deleted = asyncio.run(_delete_stale_indexes(
@@ -690,8 +712,8 @@ def delete_document_index(publisher: Any, document: str) -> None:
         path = growi_path(publisher.connection.write_path, document, INDEX_NAME)
         asyncio.run(_delete_if_index(publisher.client, path))
     except Exception as exc:
-        log.warning("index page for %s: %s: %s", document, type(exc).__name__, exc,
-                    exc_info=True, extra={"failure_summary": f"index: {document}: {type(exc).__name__}: {exc}"})
+        log.error("index page for %s: %s: %s", document, type(exc).__name__, exc,
+                  exc_info=True, extra={"failure_summary": f"index: {document}: {type(exc).__name__}: {exc}"})
 
 
 __all__ = ["FolderNode", "build_index", "data_blocks", "delete_document_index", "delete_index_pages", "document_cards", "document_records", "document_summary", "folder_summary", "folder_tree", "render_document_card", "render_document_index", "render_folder_card", "render_folder_index"]

@@ -141,6 +141,7 @@ def decode_text_bytes(raw: bytes, *, source: Path | None = None) -> str:
             continue
     if not candidates:
         label = str(source) if source is not None else "<bytes>"
+        log.error("text encoding not supported file=%s encodings=utf-8,euc_jp,cp932,iso2022_jp error=UnicodeError: unsupported text encoding", label)
         raise UnicodeError(f"unsupported text encoding: {label}")
     return max(candidates, key=_legacy_text_score)
 
@@ -177,6 +178,9 @@ def preflight_document(path: Path) -> None:
             with path.open("rb") as handle:
                 reader = PdfReader(handle)
                 encrypted = reader.is_encrypted and not reader.decrypt("")
+    except ModuleNotFoundError as exc:
+        # A missing dependency disables encryption detection for this whole format; the file still reaches the parser.
+        log.warning("parser preflight dependency missing file=%s module=%s error=%s: %s", path.name, exc.name, type(exc).__name__, exc, exc_info=True)
     except Exception:  # Inspection is advisory: unknown/corrupt formats still reach the parser.
         log.debug("parser preflight inconclusive: %s", path.name, exc_info=True)
     if encrypted:
@@ -245,7 +249,13 @@ def parse_document(
         started = time.monotonic()
         # Opening/preparing a local source is not an endpoint failure. Each
         # request gets a fresh stream of the same immutable queued source.
-        with _open_parser_upload(Path(path)) as handle:
+        try:
+            upload = _open_parser_upload(Path(path))
+        except Exception as exc:
+            # Upload preparation sits outside the request try, so nothing else would name this file.
+            log.error("parser upload preparation failed file=%s error=%s: %s", path.name, type(exc).__name__, exc, exc_info=True)
+            raise
+        with upload as handle:
             try:
                 log.info("stage=parser endpoint=%s attempt=%d file=%s timeout=%.0fs",
                          safe_endpoint(endpoint), index + 1, path.name, timeout_s)
@@ -285,8 +295,13 @@ def parse_document(
                 if validate_markdown is not None:
                     validate_markdown(markdown)
             except Exception as exc:
-                log.exception("stage=parser endpoint=%s elapsed=%.2fs fallback=%s",
-                              safe_endpoint(endpoint), time.monotonic() - started, index + 1 < len(endpoints))
+                # requests reports a read timeout without the configured duration.
+                suffix = f" read timeout after {timeout_s:.0f}s" if isinstance(exc, requests.exceptions.ReadTimeout) else ""
+                reason = f"{type(exc).__name__}{suffix}: {exc}"
+                # Only the last endpoint is a file-level failure; an earlier one just triggers the fallback.
+                report = log.error if index + 1 == len(endpoints) else log.warning
+                report("stage=parser failed file=%s endpoint=%s elapsed=%.2fs attempt=%d/%d error=%s",
+                       path.name, safe_endpoint(endpoint), time.monotonic() - started, index + 1, len(endpoints), reason, exc_info=True)
                 if index + 1 == len(endpoints):
                     if TEMPORARY_PARSER_PREFLIGHT and unsupported_endpoints == len(endpoints):
                         raise ParserSkip(f"スキップ: 全パーサーがフォーマットを認識できません: {exc}") from exc
@@ -295,17 +310,22 @@ def parse_document(
                 log.info("stage=parser endpoint=%s elapsed=%.2fs characters=%d",
                          safe_endpoint(endpoint), time.monotonic() - started, len(markdown))
                 break
-    if previous_markdown is not None:
-        # Reuse descriptions already present in the previous output. New
-        # descriptions come from the parser service and its own configuration.
-        describe = lambda _data_url, _alt: ""
-        markdown = reuse_image_descriptions(
-            previous_markdown,
-            markdown,
-            describe,
-            repeat_descriptions=Path(path).suffix.lower() != ".pptx",
-        )
-    return _repair_image_description_fences(markdown)
+    # A completed parse must not be thrown away by post-processing nobody named.
+    try:
+        if previous_markdown is not None:
+            # Reuse descriptions already present in the previous output. New
+            # descriptions come from the parser service and its own configuration.
+            describe = lambda _data_url, _alt: ""
+            markdown = reuse_image_descriptions(
+                previous_markdown,
+                markdown,
+                describe,
+                repeat_descriptions=Path(path).suffix.lower() != ".pptx",
+            )
+        return _repair_image_description_fences(markdown)
+    except Exception as exc:
+        log.error("stage=parser post-processing failed file=%s error=%s: %s", path.name, type(exc).__name__, exc, exc_info=True)
+        raise
 
 
 __all__ = [

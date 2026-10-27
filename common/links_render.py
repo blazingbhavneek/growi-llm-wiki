@@ -7,19 +7,30 @@ the publisher and future phase code one stable import surface.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 def render_page(*args: Any, **kwargs: Any) -> str:
     from graph.linker.render import render_page as render_legacy
 
-    return render_legacy(*args, **kwargs)
+    try:
+        return render_legacy(*args, **kwargs)
+    except Exception as exc:
+        log.error("stage=link page render failed page=%s error=%s: %s", kwargs.get("page_rel", ""), type(exc).__name__, exc, exc_info=True)
+        raise
 
 
 def footer_edges(*args: Any, **kwargs: Any) -> Any:
     from graph.linker.render import footer_edges as footer_legacy
 
-    return footer_legacy(*args, **kwargs)
+    try:
+        return footer_legacy(*args, **kwargs)
+    except Exception as exc:
+        log.error("stage=link footer edges failed page=%s error=%s: %s", kwargs.get("page_rel", ""), type(exc).__name__, exc, exc_info=True)
+        raise
 
 
 def relative_link(*args: Any, **kwargs: Any) -> str:

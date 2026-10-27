@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
+
+
+log = logging.getLogger(__name__)
 
 
 def make_llm(model: str, base_url: str, api_key: str, temperature: float = 0.7, timeout: int = 300) -> ChatOpenAI:
@@ -27,6 +31,42 @@ def make_llm(model: str, base_url: str, api_key: str, temperature: float = 0.7, 
 # it and a math-heavy chunk then fails every retry. After a failure only, keep such
 # backslashes literal. Kept as is: \\, \", \/, \uXXXX and a lone \b \f \n \r \t.
 _ESCAPE_RE = re.compile(r'\\(\\|"|/|u[0-9a-fA-F]{4}|[A-Za-z]+|.)', re.S)
+
+
+def _endpoint(llm: Any) -> tuple[str, str]:
+    """base_url and model for failure lines; fast's _OutputCappedLlm hides the client in .llm."""
+
+    for _ in range(3):
+        if getattr(llm, "openai_api_base", None):
+            break
+        inner = getattr(llm, "llm", None)
+        if inner is None:
+            break
+        llm = inner
+    return str(getattr(llm, "openai_api_base", "") or ""), str(getattr(llm, "model_name", "") or "")
+
+
+def _sample(text: Any) -> str:
+    """First ~120 characters of a response, whitespace collapsed; never the whole body."""
+
+    return " ".join(str(text).split())[:120]
+
+
+_cap_noted: set[str] = set()
+
+
+def _note_cap_disabled(limit: int, base_url: str, model: str) -> None:
+    """One live.log line per process for the commented-out max_tokens cap in this file."""
+
+    if "max_tokens" in _cap_noted:
+        return
+    _cap_noted.add("max_tokens")
+    log.error(
+        "model output token cap is disabled requested_max_tokens=%s endpoint=%s model=%s (unbounded responses can exhaust memory)",
+        limit,
+        base_url,
+        model,
+    )
 
 
 def _literal_backslashes(text: str) -> str:
@@ -60,10 +100,29 @@ def extract_json_from_text(text: str) -> Any:
         text = match.group(1).strip()
     try:
         return _loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as error:
         start, end = text.find("{"), text.rfind("}")
         if start >= 0 and end > start:
-            return _loads(text[start : end + 1])
+            try:
+                return _loads(text[start : end + 1])
+            except json.JSONDecodeError as final_error:
+                log.error(
+                    "model response json could not be repaired response=%r characters=%d error=%s: %s",
+                    _sample(text),
+                    len(text),
+                    type(final_error).__name__,
+                    final_error,
+                    exc_info=True,
+                )
+                raise
+        log.error(
+            "model response contains no json object response=%r characters=%d error=%s: %s",
+            _sample(text),
+            len(text),
+            type(error).__name__,
+            error,
+            exc_info=True,
+        )
         raise ValueError("could not extract valid JSON from model response")
 
 
@@ -82,10 +141,22 @@ async def structured_ainvoke(
     full reasoning capability.
     """
 
+    base_url, model = _endpoint(llm)
     request_timeout = getattr(llm, "request_timeout", None)
     try:
         hard_timeout = float(request_timeout) if request_timeout is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
+        # A non-numeric request_timeout does not just fall back: it removes the hard
+        # timeout, so every call through this client can hang forever.
+        log.error(
+            "chat request_timeout is not a number, hard timeout is disabled setting=request_timeout value=%r endpoint=%s model=%s error=%s: %s",
+            request_timeout,
+            base_url,
+            model,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
         hard_timeout = None
 
     async def invoke(runnable: Any, payload: list[Any]) -> Any:
@@ -103,6 +174,9 @@ async def structured_ainvoke(
         limits["temperature"] = temperature
     call_llm = llm.bind(**limits, extra_body={"chat_template_kwargs": {"enable_thinking": thinking}})
 
+    if max_output_tokens is not None:
+        _note_cap_disabled(max_output_tokens, base_url, model)
+
     try:
         # Output-token limiting is temporarily disabled above. Thinking stays
         # at the server default on this attempt, as before.
@@ -115,9 +189,35 @@ async def structured_ainvoke(
         # A timed-out prompt will time out again; re-sending it twice more only
         # triples the loss. Let the caller's retry policy decide.
         if isinstance(structured_error, TimeoutError) or "Timeout" in type(structured_error).__name__:
+            log.error(
+                "structured model call hit its timeout hard_timeout=%s endpoint=%s model=%s error=%s: %s",
+                hard_timeout,
+                base_url,
+                model,
+                type(structured_error).__name__,
+                structured_error,
+                exc_info=True,
+            )
             raise
+        # The type name is the difference between "the endpoint is dead" and
+        # "the model answered wrongly"; the caller cannot tell them apart.
+        log.error(
+            "structured model call failed schema=%s endpoint=%s model=%s error=%s: %s",
+            getattr(schema_cls, "__name__", schema_cls),
+            base_url,
+            model,
+            type(structured_error).__name__,
+            structured_error,
+            exc_info=True,
+        )
         schema_json = json.dumps(schema_cls.model_json_schema(), indent=2)
         last_error: Exception = structured_error
+        log.info(
+            "structured output failed, retrying with a plain json prompt schema=%s model=%s endpoint=%s",
+            getattr(schema_cls, "__name__", schema_cls),
+            model,
+            base_url,
+        )
         # A streaming model can still return malformed JSON after the
         # structured-output call fails. Give it two bounded, concise requests;
         # do not create an unbounded retry loop.
@@ -139,12 +239,24 @@ async def structured_ainvoke(
                     )
                 )
             )
+            text = ""
             try:
                 raw = await invoke(call_llm, fallback_messages)
                 text = raw.content if hasattr(raw, "content") else str(raw)
                 return schema_cls.model_validate(extract_json_from_text(str(text)))
             except Exception as fallback_error:
                 last_error = fallback_error
+                log.error(
+                    "json fallback attempt failed attempt=%s schema=%s endpoint=%s model=%s response=%r error=%s: %s",
+                    retry + 1,
+                    getattr(schema_cls, "__name__", schema_cls),
+                    base_url,
+                    model,
+                    _sample(text),
+                    type(fallback_error).__name__,
+                    fallback_error,
+                    exc_info=True,
+                )
         raise last_error from structured_error
 
 

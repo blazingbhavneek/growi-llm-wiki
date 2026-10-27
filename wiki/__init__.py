@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,8 @@ from common.legacy import build_wiki_output, project, publish_output
 from common.paths import DataLayout
 from common.policy import STANDARD, Policy, resolve_policy
 from common.storage import read_json, write_json_atomic
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -71,13 +74,41 @@ def _settings(cfg: Config) -> Any:
 def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Result:
     source = Path(inp.raw)
     if not source.is_file():
+        log.error(
+            "wiki source file is missing path=%s out=%s error=not a file (check --in and that the convert step wrote the raw Markdown)",
+            source,
+            out,
+        )
         raise FileNotFoundError(source)
     layout = DataLayout(Path(out)).ensure()
     raw_rel = inp.relative or source.name
     raw_target = layout.raw_file(raw_rel)
-    raw_target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        raw_target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.error(
+            "raw folder could not be created path=%s document=%s error=%s: %s (disk full, read-only, or the volume is not mounted?)",
+            raw_target.parent,
+            raw_rel,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
     if source.resolve() != raw_target.resolve():
-        shutil.copyfile(source, raw_target)
+        try:
+            shutil.copyfile(source, raw_target)
+        except OSError as exc:
+            log.error(
+                "raw copy failed source=%s target=%s document=%s error=%s: %s (disk full, or the output volume is read-only)",
+                source,
+                raw_target,
+                raw_rel,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
     document = layout.document(raw_rel)
     settings = _settings(cfg)
     settings.policy = cfg.policy.name
@@ -105,6 +136,14 @@ def run(cfg: Config, inp: Input, out: Path, ctx: Context | None = None) -> Resul
             write_json_atomic(state_dir / "run.json", stamp)
     plan = read_json(state_dir / "state" / "plan.json", default={})
     pages = tuple(str(item.get("filename")) for item in plan.get("pages", []) if item.get("filename"))
+    if not pages:
+        log.error(
+            "build claimed success with no pages document=%s plan=%s mode=%s policy=%s (the plan is missing or empty: the published wiki folder keeps its previous content)",
+            document,
+            state_dir / "state" / "plan.json",
+            cfg.mode,
+            cfg.policy.name,
+        )
     return Result(document, raw_rel, 3 if inp.force_full else 0, "forced" if inp.force_full else "built", pages, pages, cfg.policy.name)
 
 

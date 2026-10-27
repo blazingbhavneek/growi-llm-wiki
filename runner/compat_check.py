@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import shlex
 import shutil
 import sys
@@ -20,6 +21,8 @@ import tempfile
 from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
+
+log = logging.getLogger(__name__)
 
 COMMANDS = ("sync", "build all", "index --no-publish")
 
@@ -30,7 +33,18 @@ def tree_hash(root: Path) -> dict[str, str]:
         if not path.is_file() or ".venv" in path.parts or "__pycache__" in path.parts:
             continue
         relative = path.relative_to(root).as_posix()
-        result[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            log.error(
+                "compat check file could not be hashed path=%s error=%s: %s (disk full, unreadable, or the file vanished mid-run)",
+                path,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
+        result[relative] = digest
     return result
 
 
@@ -82,30 +96,86 @@ def main() -> int:
     from runner import cli
 
     settings = load_settings(args.project)
+    log.info(
+        "compat check started project=%s config=%s data_root=%s commands=%d",
+        getattr(settings, "target_name", ""),
+        args.project,
+        args.data_root or "(from config)",
+        len(args.command or COMMANDS),
+    )
     data_root = Path(args.data_root or settings.data_root)
     source = data_root / settings.target_name
     if not source.is_dir():
+        log.error("project data folder not found path=%s project=%s error=not a directory", source, settings.target_name)
         parser.error(f"project data not found: {source}")
     calls: list[str] = []
     report: dict[str, object] = {"project": str(source), "commands": {}}
-    with tempfile.TemporaryDirectory(prefix="llm-wiki-compat-") as temporary:
-        copy = Path(temporary) / settings.target_name
-        shutil.copytree(source, copy, symlinks=True)
+    try:
+        temporary = tempfile.TemporaryDirectory(prefix="llm-wiki-compat-")
+    except OSError as exc:
+        log.error(
+            "compat check temp folder failed project=%s source=%s error=%s: %s (disk full?)",
+            settings.target_name,
+            source,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
+    with temporary:
+        copy = Path(temporary.name) / settings.target_name
+        try:
+            shutil.copytree(source, copy, symlinks=True)
+        except OSError as exc:
+            log.error(
+                "compat check data copy failed source=%s target=%s error=%s: %s (disk full, or the data tree is unreadable)",
+                source,
+                copy,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
         before = tree_hash(copy)
         with fail_fast(calls):
             for command in args.command or COMMANDS:
-                argv = ["main.py", *shlex.split(command), "--project", args.project, "--data-root", temporary]
+                argv = ["main.py", *shlex.split(command), "--project", args.project, "--data-root", temporary.name]
                 with mock.patch.object(sys, "argv", argv):
                     try:
                         report["commands"][command] = cli.main()
                     except BaseException as exc:  # noqa: BLE001 - report every command
+                        log.error(
+                            "compat check command crashed command=%s project=%s error=%s: %s (the full traceback is in debug.log)",
+                            command,
+                            settings.target_name,
+                            type(exc).__name__,
+                            exc,
+                            exc_info=True,
+                        )
                         report["commands"][command] = f"{type(exc).__name__}: {exc}"[:500]
         report["calls"] = calls
         report["tree"] = tree_diff(before, tree_hash(copy))
     print(json.dumps(report, ensure_ascii=False, indent=2))
     changed = any(report["tree"].values())
+    if calls or changed:
+        tree = report["tree"]
+        log.error(
+            "compat check failed project=%s blocked_calls=%d added=%d removed=%d changed=%d (an unchanged project must be a no-op for this code)",
+            settings.target_name,
+            len(calls),
+            len(tree["added"]),
+            len(tree["removed"]),
+            len(tree["changed"]),
+        )
+    else:
+        log.info(
+            "compat check passed project=%s commands=%d (no blocked call and no changed byte)",
+            settings.target_name,
+            len(report["commands"]),
+        )
     return 1 if calls or changed else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from runner.logging_support import run_standalone
+    raise SystemExit(run_standalone(main))

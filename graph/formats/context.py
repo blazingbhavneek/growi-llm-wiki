@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -11,6 +12,8 @@ from common.policy import policy_of
 from graph.wiki.storage import read_json, write_json_atomic
 
 from .tree import lead
+
+log = logging.getLogger(__name__)
 
 
 class PageLine(BaseModel):
@@ -47,7 +50,13 @@ async def summarize_hierarchy(
     deterministic = await policy_of(config).hierarchy(pages, lines, checkpoint=checkpoint)
     if deterministic is not None:
         return deterministic
-    cached = read_json(checkpoint, default={}) if checkpoint.exists() else {}
+    document = getattr(config, "document_slug", "")
+    try:
+        cached = read_json(checkpoint, default={}) if checkpoint.exists() else {}
+    except (OSError, ValueError):
+        # graph/wiki/storage logs the file error (path + errno, or corrupt-vs-missing) on the line above.
+        log.error("hierarchy checkpoint could not be read document=%s file=%s", document, checkpoint, exc_info=True)
+        raise
     if cached.get("policy"):
         cached = {}  # written without the model by another policy; never reuse it as model output
     groups: dict[tuple[str, ...], list[Any]] = {}
@@ -64,14 +73,20 @@ async def summarize_hierarchy(
         try:
             result = await model.structured(ParentSummary, [HumanMessage(content=_prompt(chain, group, lines, config.output_language))])
             by_number = {int(item.number): item.summary.strip() for item in result.pages}
-        except Exception:
+        except Exception as exc:
+            log.error("hierarchy summary model call failed; the section summary falls back to a plain source lead document=%s section=%s page=%s error=%s: %s", document, key, group[0].title, type(exc).__name__, exc, exc_info=True)
             result, by_number = ParentSummary(), {}
         parents[key] = result.parent_summary.strip() or lead(lines, group[0].owner_ranges[0][0], group[-1].owner_ranges[-1][1], limit=400)
         for page in group:
             summaries[str(page.number)] = by_number.get(page.number) or page.summary or lead(lines, page.owner_ranges[0][0], page.owner_ranges[-1][1])
-        write_json_atomic(checkpoint, {"parents": parents, "pages": summaries})
+        try:
+            write_json_atomic(checkpoint, {"parents": parents, "pages": summaries})
+        except OSError:
+            log.error("hierarchy checkpoint write failed, the summaries are lost and recomputed next run document=%s file=%s", document, checkpoint, exc_info=True)
+            raise
     for page in pages:
         page.summary = summaries.get(str(page.number), page.summary)
+    log.info("hierarchy summaries ready document=%s parents=%d pages=%d file=%s", document, len(parents), len(summaries), checkpoint)
     return parents
 
 

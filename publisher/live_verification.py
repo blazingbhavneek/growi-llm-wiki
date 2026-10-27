@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,8 @@ from typing import Any
 
 from graph.config import now_iso
 from graph.wiki.storage import hash_of, read_json, write_json_atomic
+
+log = logging.getLogger(__name__)
 
 REPORT_VERSION = 1
 LIVE_CASES = (
@@ -57,6 +60,8 @@ def boundary_confirmation(url: str, path: str) -> str:
 def verify_boundary_confirmation(url: str, path: str, confirmation: str) -> None:
     expected = boundary_confirmation(url, path)
     if not confirmation or confirmation != expected:
+        log.error("live verification boundary is not confirmed endpoint=%s path=%s confirmation=%s",
+                  _redact_url(url), path, "missing" if not confirmation else "is not the generated plan code")
         raise PermissionError(
             "live verification boundary is not confirmed; generate the local plan and explicitly provide its confirmation code"
         )
@@ -79,17 +84,27 @@ class LiveVerificationReport:
         root = "/" + disposable_path.strip("/")
         configured = "/" + str(settings.target_name).strip("/")
         if root == "/" or not (root == configured or root.startswith(configured + "/")):
+            log.error("live verification path escapes the project boundary path=%s boundary=%s", root, configured)
             raise ValueError("disposable live path must stay below the configured project boundary")
         url = str(getattr(settings, "growi_url", "")).rstrip("/")
         if not url:
             raise ValueError("GROWI URL is required to create a live verification plan")
         commit = ""
         if (Path(project.root) / ".git").is_dir():
-            result = subprocess.run(
-                ["git", "-C", str(project.root), "rev-parse", "HEAD"],
-                check=False, capture_output=True, text=True,
-            )
-            commit = result.stdout.strip() if result.returncode == 0 else ""
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(project.root), "rev-parse", "HEAD"],
+                    check=False, capture_output=True, text=True,
+                )
+            except FileNotFoundError as exc:  # git missing from PATH is an environment failure, not a repo state
+                log.error("git is not installed so the report commit is unknown root=%s error=%s: %s",
+                          project.root, type(exc).__name__, exc, exc_info=True)
+                raise
+            if result.returncode == 0:
+                commit = result.stdout.strip()
+            else:
+                log.error("git rev-parse failed root=%s returncode=%d stderr=%s",
+                          project.root, result.returncode, result.stderr.strip()[:200])
         report_dir = Path(project.metadata) / "human-sync" / "live-reports"
         report_path = report_dir / (now_iso().replace(":", "-") + ".json")
         configured_mode = getattr(settings, "human_sync_mode", "off")
@@ -127,6 +142,8 @@ class LiveVerificationReport:
     def open(cls, path: Path) -> "LiveVerificationReport":
         data = read_json(path)
         if data.get("schema_version") != REPORT_VERSION:
+            log.error("live verification report is unusable file=%s found=%r expected=%s",
+                      path, data.get("schema_version"), REPORT_VERSION)
             raise ValueError("unsupported live verification report")
         return cls(Path(path), data)
 
@@ -159,6 +176,9 @@ class LiveVerificationReport:
             "reason_codes": reason_codes or [],
         }
         self.data["status"] = "running" if passed else "failed_rollback_required"
+        if not passed:
+            log.error("live verification case failed case=%s operation=%s expected=%s actual=%s reason_codes=%s",
+                      name, operation, str(expected)[:120], str(actual)[:120], sorted(set(reason_codes or [])))
         write_json_atomic(self.path, self.data)
 
     def record_constraint(self, name: str, *, reason_codes: list[str]) -> None:
@@ -189,7 +209,12 @@ class LiveVerificationReport:
             else "Remain off and resolve every failed or pending case before rollout."
         )
         self.data["completed_at"] = now_iso()
-        write_json_atomic(self.path, self.data)
+        try:
+            write_json_atomic(self.path, self.data)
+        except Exception as exc:  # noqa: BLE001 - storage names the errno; only here knows the whole matrix is lost
+            log.error("live verification report could not be finalized file=%s error=%s: %s; the whole test matrix result was not saved",
+                      self.path, type(exc).__name__, exc, exc_info=True)
+            raise
         return self.data
 
 

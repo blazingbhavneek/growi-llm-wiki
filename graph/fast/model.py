@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
@@ -12,6 +13,8 @@ from pydantic import BaseModel
 
 from graph.wiki.config import WikiConfig
 from graph.wiki.model import ChatModelPort, ModelPair
+
+log = logging.getLogger(__name__)
 
 
 JUDGE_MAX_OUTPUT_TOKENS = 16_000
@@ -216,6 +219,18 @@ def model_pair(config: WikiConfig) -> ModelPair:
     )
     concurrency = max(1, int(config.rewrite_concurrency))
     gate = _gate(writer_config, judge_config, concurrency)
+    # One line per run so a later 401 or timeout can be attributed to one of these endpoints.
+    # ``fallback`` means the judge/writer key was blank and the chat key is being reused.
+    log.info(
+        "fast model endpoints writer=%s writer_model=%s judge=%s judge_model=%s "
+        "writer_key=%s judge_key=%s",
+        writer_config.chat_base_url,
+        writer_config.chat_model,
+        judge_config.chat_base_url,
+        judge_config.chat_model,
+        "set" if config.writer_api_key else "chat fallback",
+        "set" if config.judge_api_key else "chat fallback",
+    )
     return FastModelPair(
         FastModelPort(writer_config, gate=gate, role="writer"),
         FastModelPort(judge_config, gate=gate, role="judge"),

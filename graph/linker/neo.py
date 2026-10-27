@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from common.policy import policy_of
@@ -12,6 +13,8 @@ from .legacy import EDGE_GROUP_SIZE, rrf_fuse
 from .prompts import EDGE_VERSION_NEO, neo_edge_messages
 from .wire import NeoEdgeSuggestions
 from .chunks import normalize_name
+
+log = logging.getLogger(__name__)
 
 NEO_SIMILAR_K = 5
 HOP1_MAX, HOP2_MAX, HOP3_MAX = 8, 8, 4
@@ -85,7 +88,9 @@ def candidates(catalog: Catalog, chunk: Any, *, team: str | None = None, setting
     if judge and settings is not None:
         # Fewer values than hops means fewer hops: "40,30" disables the 3-hop expansion.
         try: caps = ([int(value) for value in settings.wiki_linker_hop_caps.split(",")] + [0, 0, 0])[:3]
-        except (AttributeError, TypeError, ValueError): pass
+        except (AttributeError, TypeError, ValueError) as exc:
+            log.error("hop caps setting is invalid, defaults kept setting=wiki_linker_hop_caps value=%r caps=%s error=%s: %s",
+                      getattr(settings, "wiki_linker_hop_caps", None), caps, type(exc).__name__, exc, exc_info=True)
     obvious = set() if judge else set(_similar_ids(catalog, chunk, team))
     for cid, _score in catalog.behaviour_chunks(team, entity_names, exclude_page=chunk.page_rel)[:caps[0]]:
         if cid not in obvious and cid not in selected_ids and (not judge or not (_entity_names(catalog, cid) & entity_names)):
@@ -153,6 +158,8 @@ async def filter_candidates(catalog: Catalog, model: Any, chunk: Any, selected: 
         pairs = [(item, catalog.chunk(item.chunk_id)) for item in group]
         pairs = [(item, row) for item, row in pairs if row is not None]
         target_row = catalog.chunk(chunk.chunk_id)
+        if target_row is None:
+            log.error("target chunk missing from catalog chunk=%s document=%s page=%s; no edges are judged for this chunk", chunk.chunk_id, chunk.document, chunk.page_rel)
         if target_row is None or not pairs:
             continue
         messages = neo_edge_messages(_view(target_row), [{**_view(row), "via": item.via} for item, row in pairs])
@@ -162,7 +169,9 @@ async def filter_candidates(catalog: Catalog, model: Any, chunk: Any, selected: 
             except TypeError:
                 result = await model.structured(NeoEdgeSuggestions, messages)
             result = result if isinstance(result, NeoEdgeSuggestions) else NeoEdgeSuggestions.model_validate(result)
-        except Exception:
+        except Exception as exc:
+            log.error("edge model call failed, candidate group dropped chunk=%s document=%s candidates=%s error=%s: %s",
+                      chunk.chunk_id, chunk.document, [item.chunk_id for item, _row in pairs], type(exc).__name__, exc, exc_info=True)
             continue
         allowed = {item.chunk_id for item, _row in pairs}
         used_entities: set[str] = set()

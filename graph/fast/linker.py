@@ -77,12 +77,17 @@ async def describe_pages(chunks: Sequence[Chunk], *, model: Any, output_language
 
     async def describe(number: int, group: list[Chunk]) -> None:
         if stop_check and stop_check():
+            log.info(
+                "fast chunk metadata batch skipped, linker cancelled page=%s batch=%d sections=%d",
+                group[0].page_rel, number, len(group),
+            )
             raise RuntimeError("linker cancelled")
         prompt = chunk_meta_batch_prompt(
             page_title=group[0].title, document=group[0].document, output_language=output_language,
             sections=[(f"S{index}", item.heading, meta_text(item)) for index, item in enumerate(group, 1)],
         )
         stem = f"meta-batch-{number}-{Path(group[0].filename).stem}"
+        answered = 0
         if artifact_dir:
             artifact_dir.mkdir(parents=True, exist_ok=True)
             write_text_atomic(artifact_dir / f"{stem}.prompt.md", prompt.render())
@@ -91,6 +96,13 @@ async def describe_pages(chunks: Sequence[Chunk], *, model: Any, output_language
                 raw = await model.text(prompt.messages(), max_output_tokens=META_MAX_TOKENS * 2, temperature=META_TEMPERATURE)
                 answer = extract_json_from_text(raw)
             except Exception as exc:  # noqa: BLE001 - every section falls back to its own call
+                # Logged before the artifact write so a failed write cannot hide the reason.
+                log.error(
+                    "fast chunk metadata call failed; every section of the batch falls back "
+                    "to its own call page=%s document=%s batch=%d sections=%d error=%s: %s",
+                    group[0].page_rel, group[0].document, number, len(group),
+                    type(exc).__name__, exc, exc_info=True,
+                )
                 if artifact_dir:
                     write_text_atomic(artifact_dir / f"{stem}-error.txt", f"{type(exc).__name__}: {exc}")
                 return
@@ -98,17 +110,41 @@ async def describe_pages(chunks: Sequence[Chunk], *, model: Any, output_language
             write_json_atomic(artifact_dir / f"{stem}.json", answer)
         for value in answer.get("sections", []) if isinstance(answer, dict) else []:
             if not isinstance(value, dict):
+                log.error(
+                    "fast chunk metadata answer item is not an object; section dropped "
+                    "page=%s batch=%d", group[0].page_rel, number,
+                )
                 continue
             key = str(value.pop("section", ""))
             index = int(key[1:]) - 1 if key[:1] == "S" and key[1:].isdigit() else -1
             if not 0 <= index < len(group):
+                log.error(
+                    "fast chunk metadata answer carries an unknown section id; section dropped "
+                    "page=%s batch=%d section=%s", group[0].page_rel, number, key or "(none)",
+                )
                 continue
             try:
                 meta = validate_meta(ChunkMeta.model_validate(value), group[index].text)
-            except Exception:  # noqa: BLE001 - invalid section: its own call retries it
+            except Exception as exc:  # noqa: BLE001 - invalid section: its own call retries it
+                log.error(
+                    "fast chunk metadata answer failed validation; section dropped "
+                    "page=%s batch=%d section=%s error=%s: %s",
+                    group[0].page_rel, number, key, type(exc).__name__, exc, exc_info=True,
+                )
                 continue
             if meta.summary and (meta.keywords or meta.search_terms):
                 found[group[index].text_sha256] = meta
+                answered += 1
+            else:
+                log.error(
+                    "fast chunk metadata answer is empty; section dropped page=%s batch=%d section=%s",
+                    group[0].page_rel, number, key,
+                )
+        if answered < len(group):
+            log.info(
+                "fast chunk metadata batch answered partially page=%s batch=%d answered=%d of=%d",
+                group[0].page_rel, number, answered, len(group),
+            )
 
     await asyncio.gather(*(describe(number, group) for number, group in enumerate(batches, 1)))
     return found, len(batches)
@@ -167,7 +203,13 @@ async def filter_target(*, catalog: Any, target: Any, candidates_: Sequence[Any]
         try:
             accepted += await judge_edges(catalog, jev_engine, target, leads, settings, model=None)
         except Exception as exc:
-            log.warning("fast Jev edge judge failed for %s: %s", target.chunk_id, exc)
+            # graph/linker/jev_judge.py logs this failure at ERROR with document + chunk + the
+            # consequence; keep only the fast-path detail here so live.log gets one ERROR per failure.
+            log.debug(
+                "fast Jev edge judge failed; all related-page edges for the chunk are dropped "
+                "chunk=%s leads=%d error=%s: %s",
+                target.chunk_id, len(leads), type(exc).__name__, exc, exc_info=True,
+            )
             return accepted, len(leads), 1
         return accepted, len(leads), 0
     return accepted, 0, 0

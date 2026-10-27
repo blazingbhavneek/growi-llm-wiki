@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
 from .tabular import _letter, _slug, source_page_title, write_tables
+
+log = logging.getLogger(__name__)
 
 SHEET_RE = re.compile(r"^## (?:Sheet|シート): (.+?)\s*$")
 VBA_REFS_RE = re.compile(
@@ -191,7 +194,12 @@ async def _append_story(
     state_root = Path(config.run_dir or (run_dir / "wiki-state"))
     story_source = state_root / "excel-story-source.md"
     story_run = state_root / "excel-story"
-    write_text_atomic(story_source, story_text)
+    try:
+        write_text_atomic(story_source, story_text)
+    except OSError as exc:
+        # graph/wiki/storage logs the file error (path + errno, or corrupt-vs-missing) on the line above.
+        log.error("excel story source could not be written workbook=%s file=%s", source_path.name, story_source, exc_info=True)
+        raise
     story_config = config.model_copy(
         update={
             "run_dir": str(story_run),
@@ -209,27 +217,40 @@ async def _append_story(
         on_progress=on_progress,
         stop_check=stop_check,
     )
-    plan = read_json(story_run / "state" / "plan.json")
-    if on_progress:
-        on_progress({
-            "stage": "excel-story",
-            "step": "planned",
-            "parts": len(spans),
-            "pages": len(plan["pages"]),
-        })
-    offset = len(files)
-    titles = {
-        page["filename"]: _replace_line_references(page["title"], spans)
-        for page in plan["pages"]
-    }
-    renames = {
-        page["filename"]: f"{offset + number:03d}-解説-{_slug(titles[page['filename']])}.md"
-        for number, page in enumerate(plan["pages"], 1)
-    }
+    plan_path = story_run / "state" / "plan.json"
+    try:
+        plan = read_json(plan_path)
+    except (OSError, ValueError) as exc:
+        log.error("excel story plan could not be read, the story run did not finish workbook=%s run=%s file=%s", source_path.name, story_run, plan_path, exc_info=True)
+        raise
+    try:
+        if on_progress:
+            on_progress({
+                "stage": "excel-story",
+                "step": "planned",
+                "parts": len(spans),
+                "pages": len(plan["pages"]),
+            })
+        offset = len(files)
+        titles = {
+            page["filename"]: _replace_line_references(page["title"], spans)
+            for page in plan["pages"]
+        }
+        renames = {
+            page["filename"]: f"{offset + number:03d}-解説-{_slug(titles[page['filename']])}.md"
+            for number, page in enumerate(plan["pages"], 1)
+        }
+    except (KeyError, TypeError) as exc:
+        log.error("excel story plan has an unexpected shape workbook=%s run=%s file=%s key=%s", source_path.name, story_run, plan_path, exc, exc_info=True)
+        raise
     for story_number, page in enumerate(plan["pages"], 1):
         old_name = page["filename"]
         new_name = renames[old_name]
-        body = (story_run / "wiki" / old_name).read_text(encoding="utf-8")
+        try:
+            body = (story_run / "wiki" / old_name).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            log.error("excel story page file could not be read workbook=%s run=%s file=%s error=%s: %s", source_path.name, story_run, story_run / "wiki" / old_name, type(exc).__name__, exc, exc_info=True)
+            raise
         ranges = page.get("owner_ranges", [])
         used_spans = [
             span
@@ -256,7 +277,11 @@ async def _append_story(
         for old_link, new_link in renames.items():
             body = body.replace(f"({old_link})", f"({new_link})")
         body = _replace_line_references(body, spans)
-        write_text_atomic(run_dir / "docs" / new_name, body)
+        try:
+            write_text_atomic(run_dir / "docs" / new_name, body)
+        except OSError as exc:
+            log.error("excel story page write failed workbook=%s file=%s", source_path.name, run_dir / "docs" / new_name, exc_info=True)
+            raise
         files.append(
             {
                 "filename": new_name,
@@ -301,14 +326,29 @@ def decide_update(state_root: Path, new_text: str, wiki_dir: Path) -> tuple[Any,
     from graph.wiki.storage import read_json
 
     story_run, old_path = Path(state_root) / "excel-story", Path(state_root) / "excel-story-source.md"
-    plan = read_json(story_run / "state" / "plan.json", default={})
+    plan_path = story_run / "state" / "plan.json"
+    try:
+        plan = read_json(plan_path, default={})
+    except (OSError, ValueError) as exc:
+        log.error("stored excel story plan is corrupt or unreadable, so the workbook cannot be decided incrementally run=%s file=%s", story_run, plan_path, exc_info=True)
+        raise
     if not old_path.exists() or not plan.get("pages"):
+        log.debug("no previous excel story run to update from, the workbook is rebuilt file=%s plan=%s", old_path, plan_path)
         return None
     new_story, _spans = _story_source(split_sheets(new_text.splitlines()))
-    marker = read_json(Path(wiki_dir) / "_planning" / "source.json", default={})
+    marker_path = Path(wiki_dir) / "_planning" / "source.json"
+    try:
+        marker = read_json(marker_path, default={})
+    except (OSError, ValueError) as exc:
+        log.error("workbook source marker is corrupt or unreadable file=%s", marker_path, exc_info=True)
+        raise
     if marker.get("sha256") == hashlib.sha256(new_text.encode("utf-8")).hexdigest():
         return UpdateDecision(tier=0, reason="unchanged"), new_story
-    old_story = old_path.read_text(encoding="utf-8")
+    try:
+        old_story = old_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        log.error("previous excel story text could not be read file=%s error=%s: %s", old_path, type(exc).__name__, exc, exc_info=True)
+        raise
 
     def shape(text: str) -> list[tuple[str, tuple[int, int]]]:
         # Sheet names and each sheet's column span; a big sheet's size-cut parts
@@ -323,9 +363,13 @@ def decide_update(state_root: Path, new_text: str, wiki_dir: Path) -> tuple[Any,
         return list(sheets.items())
 
     old_lines, new_lines = source_lines(old_story), source_lines(new_story)
-    if (shape(old_story) != shape(new_story) or len(old_lines) != len(new_lines)
-            or int(plan.get("source_line_count", -1)) != len(old_lines)):
-        return UpdateDecision(tier=3, reason="sheets-or-columns-changed"), new_story
+    try:
+        if (shape(old_story) != shape(new_story) or len(old_lines) != len(new_lines)
+                or int(plan.get("source_line_count", -1)) != len(old_lines)):
+            return UpdateDecision(tier=3, reason="sheets-or-columns-changed"), new_story
+    except (KeyError, TypeError, ValueError) as exc:
+        log.error("stored excel story plan has an unexpected shape run=%s file=%s error=%s: %s", story_run, plan_path, type(exc).__name__, exc, exc_info=True)
+        raise
     # Same sheets in the same order, one story line each: lines map one to one, so a
     # changed sheet regenerates every 解説 page that covers or quotes it (no stale value).
     changed = {number for number, (old, new) in enumerate(zip(old_lines, new_lines), 1) if old != new}
@@ -333,8 +377,12 @@ def decide_update(state_root: Path, new_text: str, wiki_dir: Path) -> tuple[Any,
     def touches(ranges: list[list[int]]) -> bool:
         return any(int(first) <= number <= int(last) for first, last in ranges for number in changed)
 
-    stale = {str(page["filename"]) for page in plan["pages"] if touches(page.get("reference_ranges", []))}
-    regenerate = stale | {str(page["filename"]) for page in plan["pages"] if touches(page.get("owner_ranges", []))}
+    try:
+        stale = {str(page["filename"]) for page in plan["pages"] if touches(page.get("reference_ranges", []))}
+        regenerate = stale | {str(page["filename"]) for page in plan["pages"] if touches(page.get("owner_ranges", []))}
+    except (KeyError, TypeError, ValueError) as exc:
+        log.error("stored excel story plan has an unexpected shape run=%s file=%s error=%s: %s", story_run, plan_path, type(exc).__name__, exc, exc_info=True)
+        raise
     if len(regenerate) > FULL_MIN_REGEN_SHARE * len(plan["pages"]):
         return UpdateDecision(tier=3, reason="most-pages-changed"), new_story
     return UpdateDecision(
@@ -344,7 +392,11 @@ def decide_update(state_root: Path, new_text: str, wiki_dir: Path) -> tuple[Any,
 
 
 async def run(source_path: Path, *, run_dir: Path, model: Any, config: Any, on_progress=None, stop_check=None):
-    lines = source_path.read_text(encoding="utf-8").splitlines()
+    try:
+        lines = source_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        log.error("excel source file could not be read file=%s error=%s: %s", source_path, type(exc).__name__, exc, exc_info=True)
+        raise
     sheets = split_sheets(lines)
     files = await write_tables(
         sheets=sheets,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 import hashlib
 import json
@@ -11,6 +12,8 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 from graph.config import app_concurrency
+
+log = logging.getLogger(__name__)
 
 StopCheck = Callable[[], bool] | None
 Progress = Callable[[dict[str, Any]], None] | None
@@ -252,7 +255,11 @@ def _apply_incremental_edits(
                     raise ValueError("; ".join(errors))
                 return final if final == original else final.rstrip() + "\n"
             except (ValueError, TypeError) as exc:
+                log.warning("incremental patch rejected page=%s attempt=%s/%s error=%s: %s",
+                            filename, _attempt + 1, attempts, type(exc).__name__, str(exc)[:200])
                 feedback = [str(exc)]
+        log.error("incremental page edit failed page=%s attempts=%s error=RuntimeError: %s",
+                  filename, attempts, feedback[-1][:200])
         raise RuntimeError(f"model could not apply incremental edits to {filename}: {feedback[-1]}")
 
     async def edit_all() -> dict[str, Any]:
@@ -277,12 +284,21 @@ def _apply_incremental_edits(
         path = state_root / "wiki" / filename
         if outcome == path.read_text(encoding="utf-8"):
             continue
-        write_text_atomic(path, outcome)
+        try:
+            write_text_atomic(path, outcome)
+        except OSError:
+            # graph/wiki/storage.py already logged the path and errno; only the consequence is ours.
+            log.error("patched page was not saved page=%s; the page keeps its previous content", path)
+            raise
         state_path = state_root / "state" / "pages" / f"{int(pages[filename]['number']):03d}.json"
         state = read_json(state_path, default={})
         if state:
             state["content_sha256"] = sha256_text(outcome)
-            write_json_atomic(state_path, state)
+            try:
+                write_json_atomic(state_path, state)
+            except OSError:
+                log.error("page state hash was not saved path=%s; the page will look out of date on the next run", state_path)
+                raise
         changed.add(filename)
     return changed, failed
 @dataclass(frozen=True)
@@ -490,18 +506,32 @@ def publish_output(staged: Path, target: Path) -> int:
         if path.exists():
             preserved[name] = path.read_bytes()
     if target.exists():
-        shutil.rmtree(target)
-    target.mkdir(parents=True)
+        try:
+            shutil.rmtree(target)
+        except OSError as exc:
+            log.error("PUBLISHED WIKI IS HALF-DELETED path=%s error=%s: %s "
+                      "(the delete stopped partway: the published wiki at this path is incomplete and the new pages were not published)",
+                      target, type(exc).__name__, exc, exc_info=True)
+            raise
     count = 0
-    for page in sorted((staged / "docs").glob("*.md")):
-        shutil.copyfile(page, target / page.name)
-        count += 1
-    if (staged / "_planning").exists():
-        shutil.copytree(staged / "_planning", target / "_planning")
-    if preserved:
-        (target / "_planning").mkdir(parents=True, exist_ok=True)
-        for name, payload in preserved.items():
-            (target / "_planning" / name).write_bytes(payload)
+    try:
+        target.mkdir(parents=True)
+        for page in sorted((staged / "docs").glob("*.md")):
+            shutil.copyfile(page, target / page.name)
+            count += 1
+        if (staged / "_planning").exists():
+            shutil.copytree(staged / "_planning", target / "_planning")
+        if preserved:
+            (target / "_planning").mkdir(parents=True, exist_ok=True)
+            for name, payload in preserved.items():
+                (target / "_planning" / name).write_bytes(payload)
+    except Exception as exc:
+        # shortcut: the old tree is already deleted here, so shutil gives no errno-free
+        # "how much survived" answer; count names how far the copy got.
+        log.error("PUBLISHED WIKI IS INCOMPLETE path=%s pages_copied=%s error=%s: %s "
+                  "(the previous output was already deleted: this wiki directory is deleted or half-published and must be rebuilt)",
+                  target, count, type(exc).__name__, exc, exc_info=True)
+        raise
     return count
 
 
@@ -615,6 +645,9 @@ def write_wiki_pages(
     wiki_document = Path(project.wiki_dir(rel)).relative_to(project.wiki)
     # Old reverse-sync versions put human text into generator state; a rebuild would drop it.
     if _human_edited(state_root):
+        log.error("legacy human state blocks the rebuild document=%s state_pages=%s "
+                  "(an older reverse-sync stored human text inside the generator state; a rebuild would drop it, so this document is not built)",
+                  rel, state_root / "state" / "pages")
         raise ValueError("legacy human state")
     from publisher.human_changes import HumanStore, LlmHumanModel, apply_generated
 
@@ -673,7 +706,14 @@ def write_wiki_pages(
                     settings=settings, llm=llm, stop_check=stop_check, guidance=guidance,
                 )
             if failed:
-                plan_pages = read_json(state_root / "state" / "plan.json")["pages"]
+                log.error("incremental page patches failed document=%s failed_pages=%s; those pages are rebuilt instead of patched",
+                          rel, len(failed))
+                try:
+                    plan_pages = read_json(state_root / "state" / "plan.json")["pages"]
+                except KeyError as exc:
+                    log.error("wiki plan has no page list file=%s key=%s document=%s error=%s: %s",
+                              state_root / "state" / "plan.json", exc, rel, type(exc).__name__, exc, exc_info=True)
+                    raise
                 human += drop_pages(state_root, plan_pages, set(failed), research=set())
                 decision.regenerate |= set(failed)
                 decision.tier, decision.reason = 2, "patch-escalated"
@@ -689,7 +729,9 @@ def write_wiki_pages(
                         state_dir=state_root, on_progress=on_progress, stop_check=stop_check,
                         source_kind=kind, resume=True, require_resume=True, human_guidance=guidance,
                     ).out_dir
-                except ResumeUnavailable:
+                except ResumeUnavailable as exc:
+                    log.error("wiki resume unavailable document=%s error=%s: %s; a full rebuild redoes every page",
+                              rel, type(exc).__name__, exc, exc_info=True)
                     decision = UpdateDecision(tier=3, reason="resume-failed")
             else:
                 out_dir = export_ingest_layout(state_root, work / "out", document_name=rel)
@@ -702,6 +744,9 @@ def write_wiki_pages(
             human = sorted(set(human) | set(_human_edited(state_root)))
             if not resume_initial_build:
                 shutil.rmtree(state_root, ignore_errors=True)
+                if state_root.exists():
+                    # shortcut: ignore_errors=True swallows the errno, so a leftover tree is the only evidence.
+                    log.error("wiki state delete failed path=%s document=%s; the full rebuild starts on top of leftover state", state_root, rel)
             out_dir = build_wiki_output(
                 source_path=project.raw_file(rel), document_name=rel, out_dir=work / "out",
                 mode=mode, settings=settings, llm=llm, embedder=embedder,
@@ -761,6 +806,9 @@ def write_wiki_pages(
         )
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        if work.exists():
+            # shortcut: ignore_errors=True swallows the errno, so a leftover tree is the only evidence.
+            log.error("build work directory cleanup failed path=%s document=%s; leftover build output stays on disk", work, rel)
 def write_wiki(
     project: Any, rel: str, *, mode: str, settings: Any, llm: Any, embedder: Any,
     on_progress: Progress = None, stop_check: StopCheck = None,
@@ -817,6 +865,9 @@ def run_linker(
             embedder = Embedder(settings)
         except Exception as exc:
             embedder = None
+            log.error("embedder unavailable, vector candidate search is off document=%s model=%s backend=%s endpoint=%s settings=WIKI_EMBED_BACKEND,embed_model,embed_api_key error=%s: %s",
+                      rel, getattr(settings, "embed_model", ""), getattr(settings, "embed_backend", ""),
+                      getattr(settings, "embed_base_url", ""), type(exc).__name__, exc, exc_info=True)
             if on_progress:
                 on_progress({"stage": "linker", "step": "embedder_unavailable", "error": str(exc)[:200]})
     from graph.linker import link_document
@@ -871,10 +922,15 @@ def _sha256_file(path: Path) -> str:
 
 def write_source_stamp(target: Path, raw_file: Path, rel: str, *, identity_seed: str | None = None) -> None:
     planning = Path(target) / "_planning"
-    planning.mkdir(exist_ok=True)
-    tmp = planning / "source.json.tmp"
-    tmp.write_text(json.dumps({"raw": rel, "sha256": _sha256_file(raw_file), "id_seed": identity_seed or rel}), encoding="utf-8")
-    tmp.replace(planning / "source.json")
+    try:
+        planning.mkdir(exist_ok=True)
+        tmp = planning / "source.json.tmp"
+        tmp.write_text(json.dumps({"raw": rel, "sha256": _sha256_file(raw_file), "id_seed": identity_seed or rel}), encoding="utf-8")
+        tmp.replace(planning / "source.json")
+    except OSError as exc:
+        log.error("source stamp write failed path=%s document=%s error=%s: %s (the file may be locked, or the mount cannot rename-over; without the stamp the document is rebuilt on every run)",
+                  planning / "source.json", rel, type(exc).__name__, exc, exc_info=True)
+        raise
 
 
 def wiki_up_to_date(project: Any, rel: str) -> bool:
@@ -884,11 +940,28 @@ def wiki_up_to_date(project: Any, rel: str) -> bool:
     for name, key in (("source.json", "sha256"), ("manifest.json", "source_sha256")):
         path = planning / name
         if not path.exists():
+            # exists() is also False for a permission problem; stat names which one this was.
+            try:
+                path.stat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                log.error("up-to-date stamp is unreadable file=%s document=%s error=%s: %s; the document is rebuilt",
+                          path, rel, type(exc).__name__, exc, exc_info=True)
+                continue
+            log.debug("up-to-date stamp reported missing but stat succeeded file=%s document=%s", path, rel)
             continue
         try:
-            if json.loads(path.read_text(encoding="utf-8")).get(key) != current:
-                return False
-        except (OSError, ValueError):
+            stamp = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            log.error("up-to-date stamp is unreadable file=%s document=%s error=%s: %s; the document is rebuilt",
+                      path, rel, type(exc).__name__, exc, exc_info=True)
+            return False
+        except ValueError as exc:
+            log.error("up-to-date stamp is corrupt, not missing file=%s document=%s error=%s: %s; the document is rebuilt",
+                      path, rel, type(exc).__name__, exc, exc_info=True)
+            return False
+        if stamp.get(key) != current:
             return False
         return True
     return False
@@ -898,7 +971,16 @@ def links_up_to_date(project: Any, rel: str, *, mode: str | None = None) -> bool
     marker = project.wiki_dir(rel) / "_planning" / "linker.json"
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        log.debug("linker marker is absent file=%s document=%s", marker, rel)
+        return False
+    except OSError as exc:
+        log.error("linker marker is unreadable file=%s document=%s error=%s: %s; the links are re-run",
+                  marker, rel, type(exc).__name__, exc, exc_info=True)
+        return False
+    except ValueError as exc:
+        log.error("linker marker is corrupt, not missing file=%s document=%s error=%s: %s; the links are re-run",
+                  marker, rel, type(exc).__name__, exc, exc_info=True)
         return False
     if data.get("status") not in ("complete", "disabled"):
         return False
@@ -919,6 +1001,11 @@ def write_index(project: Any) -> None:
         lines.extend(f"- [{page[:-3]}]({rel}/{page})" for page in pages)
         lines.append("")
     project.wiki.mkdir(parents=True, exist_ok=True)
-    (project.wiki / "index.md").write_text(
-        "\n".join(lines).rstrip() + "\n", encoding="utf-8"
-    )
+    try:
+        (project.wiki / "index.md").write_text(
+            "\n".join(lines).rstrip() + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        log.error("wiki index write failed path=%s error=%s: %s (the published wiki index page is missing or stale)",
+                  project.wiki / "index.md", type(exc).__name__, exc, exc_info=True)
+        raise

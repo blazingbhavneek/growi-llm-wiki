@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from typing import Any, Coroutine
+
+log = logging.getLogger(__name__)
 
 
 def run_async_blocking(awaitable: Coroutine[Any, Any, Any]) -> Any:
@@ -22,7 +25,12 @@ def run_async_blocking(awaitable: Coroutine[Any, Any, Any]) -> Any:
             error.append(exc)
 
     thread = threading.Thread(target=runner)
-    thread.start()
+    try:
+        thread.start()
+    except (RuntimeError, OSError) as exc:
+        # "can't start new thread": thread or file limit reached, or the process is out of memory.
+        log.error("async worker thread could not start error=%s: %s (thread or file limit, or out of memory)", type(exc).__name__, exc, exc_info=True)
+        raise
     thread.join()
     if error:
         raise error[0]

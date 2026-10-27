@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import datetime
 import logging
 import re
 import sys
@@ -17,29 +18,14 @@ try:
 except ImportError:  # pragma: no cover - tqdm is an optional terminal aid
     tqdm = None
 
+log = logging.getLogger("progress")
+
 
 NAME_KEEP = 5
 NAME_THRESHOLD = 25
 NAME_JOIN = "....."
-LEVEL_WIDTH = 8
-STAGE_WIDTH = 14
 # 5 + 5 + 5 characters are at most 25 columns when CJK counts as two.
 DOC_WIDTH = 25
-
-# Long source paths (CJK folder + file names) eat whole terminal lines, so hide
-# the middle of anything that looks like a path or a filename.  URLs stay whole
-# so error lines stay diagnosable.
-_TOKEN = re.compile(r"""[^\s"',\[\]{}()|=]+""")
-_EXTENSION = re.compile(r"\.\w{1,5}$")
-_LINE = re.compile(r"^(?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+(?P<rest>.*)$", re.DOTALL)
-_TAG = re.compile(r"^\[(?P<tag>[^\]]{1,%d})\]\s*" % STAGE_WIDTH)
-# The document column is hoisted from whichever key the sync path happens to log.
-_NAMED = (
-    (re.compile(r'"document": "([^"]+)"'), '"document": "{}"'),
-    (re.compile(r'"file": "([^"]+)"'), '"file": "{}"'),
-    # Source paths contain spaces, so a field runs until the next `key=`.
-    (re.compile(r"path=(.+?)(?=\s+\w+=|$)"), "path={}"),
-)
 
 
 def _cells(value: str) -> int:
@@ -47,72 +33,11 @@ def _cells(value: str) -> int:
     return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in value)
 
 
-def _pad(value: str, width: int) -> str:
-    return value + " " * max(0, width - _cells(value))
-
-
 def shorten_name(value: str, threshold: int = NAME_THRESHOLD) -> str:
     """Keep the first and last NAME_KEEP characters of a name wider than threshold."""
     if _cells(value) <= threshold:
         return value
     return f"{value[:NAME_KEEP]}{NAME_JOIN}{value[-NAME_KEEP:]}"
-
-
-def _looks_like_name(token: str) -> bool:
-    if "://" in token:
-        return False
-    return "/" in token or bool(_EXTENSION.search(token))
-
-
-def mask_names(message: str) -> str:
-    return _TOKEN.sub(
-        lambda match: shorten_name(match.group()) if _looks_like_name(match.group()) else match.group(),
-        message,
-    )
-
-
-def _hoist(rest: str) -> tuple[str, str]:
-    """Pull the document name out of the message so it is not printed twice."""
-    for pattern, _ in _NAMED:
-        found = pattern.search(rest)
-        if not found:
-            continue
-        value = found.group(1)
-        for _, template in _NAMED:
-            pair = template.format(value)
-            for needle in (f"{pair}, ", f", {pair}", pair):
-                rest = rest.replace(needle, "")
-        return value, rest
-    return "", rest
-
-
-class ShortNameFormatter(logging.Formatter):
-    """Render `LEVEL STAGE DOCUMENT : info` in fixed left columns.
-
-    The stage is the leading ``[stage]`` of the message or the module logger name;
-    the document is the first ``document``/``file``/``path`` the line carries, with
-    its middle hidden and the key dropped from the info so nothing repeats.
-    """
-
-    def format(self, record: logging.LogRecord) -> str:
-        line = mask_names(super().format(record))
-        match = _LINE.match(line)
-        if not match:
-            return line
-        rest = match.group("rest").lstrip()
-        tag_match = _TAG.match(rest)
-        if tag_match:
-            stage, rest = tag_match.group("tag"), rest[tag_match.end():]
-        else:
-            stage = record.name.rsplit(".", 1)[-1]
-        document, rest = _hoist(rest)
-        info = re.sub(r"\s{2,}", " ", rest).strip()
-        columns = (
-            _pad(match.group("level"), LEVEL_WIDTH),
-            _pad(stage[:STAGE_WIDTH], STAGE_WIDTH),
-            _pad(shorten_name(document, DOC_WIDTH), DOC_WIDTH),
-        )
-        return f"{''.join(columns)}  : {info}".rstrip()
 
 
 class JapaneseFormatter(logging.Formatter):
@@ -128,14 +53,13 @@ class JapaneseFormatter(logging.Formatter):
         "fast repair GROWI preflight failed": "ファストリペアのGROWIチェックに失敗",
         "fast repair project=%s documents=%d page_limit=%s concurrency=%d": "ファストリペア: プロジェクト=%s、ドキュメント=%d、ページ上限=%s、並列数=%d",
         "continuing interrupted fast repair versions=%s checkpoints=%d without a preflight GROWI pull; accepted pages will be reused": "中断したファストリペアを再開: バージョン=%s、チェックポイント=%d。GROWIのプルをスキップし、確定ページを再利用します",
-        "fast repair progress callback failed: %s": "ファストリペアのプログレス更新に失敗: %s",
-        "fast repair checkpoint failed for %s page %s": "ファストリペアのチェックポイント保存に失敗: %s、ページ=%s",
-        "fast repair initial judge failed for page %s": "ファストリペアの初回チェックに失敗: ページ=%s",
-        "source discovery failed: %s; log=%s": "ソースのスキャンに失敗: %s、ログ=%s",
+        "fast repair progress callback failed step=%s error=%s: %s": "ファストリペアのプログレス更新に失敗: ステップ=%s、エラー=%s: %s",
+        "fast repair pending checkpoint failed document=%s page=%s error=%s: %s": "ファストリペアのチェックポイント保存に失敗: ドキュメント=%s、ページ=%s、エラー=%s: %s",
+        "fast repair initial judge failed document=%s page=%s error=%s: %s": "ファストリペアの初回チェックに失敗: ドキュメント=%s、ページ=%s、エラー=%s: %s",
+        "source discovery failed: %s: %s": "ソースのスキャンに失敗: %s、%s",
         "first pass complete; final retry documents=%d discovery=%d": "初回パス完了。最終リトライ: ドキュメント=%d、スキャンエラー=%d",
-        "document attempt %d failed: %s; logs=%s": "ドキュメントの処理に失敗: トライ=%d、パス=%s、ログ=%s",
+        "document attempt %d failed: %s": "ドキュメントの処理に失敗: トライ=%d、パス=%s",
         "publish project=%s allow_unlinked=True; linking skipped": "パブリッシュ: プロジェクト=%s、リンク処理をスキップ",
-        "publish project=%s allow_unlinked=False; pending links will be checked": "パブリッシュ: プロジェクト=%s、未処理リンクをチェック",
         "publish completed documents=%s pages=%s indexes=%s failures=%d": "パブリッシュ完了: ドキュメント=%s、ページ=%s、インデックス=%s、エラー=%d",
         "linker first pass complete; final retry documents=%d": "リンク初回パス完了。最終リトライ: ドキュメント=%d",
         "linker document attempt %d failed: %s: %s": "リンク処理に失敗: トライ=%d、ドキュメント=%s、エラー=%s",
@@ -144,64 +68,178 @@ class JapaneseFormatter(logging.Formatter):
         "parse-ahead %s failed; the build will parse it: %s: %s": "先行パースに失敗。ビルド時にリトライ: %s、%s: %s",
         "plan-ahead %s failed; the build will plan it: %s: %s": "先行プランに失敗。ビルド時にリトライ: %s、%s: %s",
         "plan-ahead enqueue %s failed; the build will plan it: %s: %s": "先行プランのキュー登録に失敗。ビルド時にリトライ: %s、%s: %s",
-        "plan-ahead disabled: %s: %s": "先行プランを停止: %s: %s",
-        "link-ahead disabled: %s: %s": "先行リンクを停止: %s: %s",
-        "link-ahead without Jev roles: %s": "先行リンクのJevロールをスキップ: %s",
+        "plan-ahead disabled for the whole run setting=chat_base_url,chat_api_key,chat_model env=OPENAI_BASE_URL,OPENAI_API_KEY,OPENAI_MODEL_NAME error=%s: %s; the build plans every document itself": "先行プランを全面停止（設定=chat_base_url,chat_api_key,chat_model / 環境変数=OPENAI_BASE_URL,OPENAI_API_KEY,OPENAI_MODEL_NAME）: エラー=%s: %s、ビルド側で全ドキュメントをプランします",
+        "link-ahead disabled for the whole run setting=chat_base_url,chat_api_key,chat_model env=OPENAI_BASE_URL,OPENAI_API_KEY,OPENAI_MODEL_NAME error=%s: %s; the linker describes every chunk itself": "先行リンクを全面停止（設定=chat_base_url,chat_api_key,chat_model / 環境変数=OPENAI_BASE_URL,OPENAI_API_KEY,OPENAI_MODEL_NAME）: エラー=%s: %s、リンク側で全チャンクを解析します",
+        "link-ahead without Jev roles for the whole run setting=wiki_linker_judge env=WIKI_JEV_BACKEND,WIKI_JEV_BASE_URL,WIKI_JEV_MODEL,WIKI_JEV_TOKENIZER error=%s: %s; the judge runs without the role check": "先行リンクのJevロールチェックを全面スキップ（設定=wiki_linker_judge / 環境変数=WIKI_JEV_BACKEND,WIKI_JEV_BASE_URL,WIKI_JEV_MODEL,WIKI_JEV_TOKENIZER）: エラー=%s: %s、判定はロールチェックなしで実行",
         "link-ahead %s failed; the linker will describe it: %s: %s": "先行リンクに失敗。リンク時にリトライ: %s、%s: %s",
         "link-ahead %s: %d chunks, %d calls, %.1fs": "先行リンク: %s、チャンク=%d、コール=%d、%.1f秒",
         "Jev related document judge failed: %s": "Jevの関連ドキュメントチェックに失敗: %s",
         "index page for %s: %s: %s": "インデックスのエラー: %s、%s: %s",
-        "Jev role check failed for chunk %s: %s": "Jevのロールチェックに失敗: チャンク=%s、%s",
-        "LLM tie-break failed for %s: %s": "LLMの同点判定に失敗: %s、%s",
+        "Jev role check failed stage=roles chunk=%s document=%s entities=%d error=%s: %s (entity roles stay the LLM guess, related-page edges are dropped)": "Jevのロールチェックに失敗（エンティティ役割はLLM推定のまま、関連ページエッジは破棄）: ステップ=役割、チャンク=%s、ドキュメント=%s、エンティティ=%d、エラー=%s: %s",
+        "LLM tie-break failed stage=tiebreak target=%s candidate=%s error=%s: %s (Jev's no stands, the related-page edge is dropped)": "LLMの同点判定に失敗（Jevの否が優先され関連ページエッジは破棄）: ステップ=同点判定、対象=%s、候補=%s、エラー=%s: %s",
         "Jev page curation failed for %s: %s": "Jevのページチェックに失敗: %s、%s",
         "Jev linker engine unavailable for page curation: %s": "Jevのリンクエンジンを利用できません: %s",
-        "Jev edge judge failed for %s: %s": "Jevのリンクチェックに失敗: %s、%s",
-        "fast Jev edge judge failed for %s: %s": "ファストJevのリンクチェックに失敗: %s、%s",
+        "Jev edge judge unavailable for %s; using the LLM judge instead: %s": "Jevのリンクチェックを利用できないためLLM判定に切替: %s、%s",
+        "fast Jev edge judge failed; all related-page edges for the chunk are dropped chunk=%s leads=%d error=%s: %s": "ファストJevのリンクチェックに失敗（関連ページエッジは保持されません）: チャンク=%s、候補=%d、エラー=%s: %s",
         "Jev linker engine unavailable; using LLM: %s": "Jevのリンクエンジンを利用できないため、LLMを使用します: %s",
         "Jev alias resolution failed for %s: %s": "Jevのエイリアス解決に失敗: %s、%s",
         "Jev primary definer failed for %s: %s": "Jevの定義元チェックに失敗: %s、%s",
+        "failed to save failure evidence to %s: %s: %s": "失敗ログの保存に失敗: %s、%s: %s",
+        "failed to reset failure summary %s: %s: %s": "失敗ドキュメントの初期化に失敗: %s、%s: %s",
+        "failed to remove legacy failure summary %s: %s: %s": "旧失敗ログの削除に失敗: %s、%s: %s",
+        "document failed: %s": "失敗ドキュメント: %s",
+        "failed documents=%d index errors=%d details=%s": "失敗ドキュメント=%d件、インデックスのエラー=%d件、詳細=%s",
+        "processed path=%s status=%s": "処理完了: パス=%s、状態=%s",
+        "check %s unreachable url=%s error=%s: %s": "接続チェック失敗: %s、URL=%s、エラー=%s: %s",
+        "check %s skipped (not configured)": "接続チェックをスキップ: %s（未設定）",
+        "check %s status=%s url=%s": "接続チェック: %s、ステータス=%s、URL=%s",
+        "check jev failed: %s": "Jev接続チェック失敗: %s",
+        "check jev %s": "Jev接続チェック: %s",
+        "data root=%s mount=%s ingest=%s linker=%s": "データ: ルート=%s、マウント=%s、取り込み=%s、リンク=%s",
+        "recovered on final retry documents=%s": "最終リトライで復旧: ドキュメント=%s",
+        "human sync captured documents=%s": "GROWIの人手編集を収集: ドキュメント=%s",
+        "convert done files=%d failed=%d": "コンバート完了: ファイル=%d、エラー=%d",
+        "relink done touched=%s": "リンク再処理完了: 更新=%s",
+        "growi endpoint or markers changed: full republish %s": "GROWIの設定またはマーカーが変更ため全面リパブリッシュ: %s",
+        "run started project=%s run=%s command=%s": "実行開始: プロジェクト=%s、ランID=%s、コマンド=%s",
+        "run finished project=%s run=%s command=%s outcome=%s": "実行終了: プロジェクト=%s、ランID=%s、コマンド=%s、結果=%s",
+        "command failed command=%s error=%s: %s": "コマンド失敗: %s、エラー=%s: %s",
+        "uncaught thread error thread=%s": "スレッドで未捕捉の異常: スレッド=%s",
+        # --- recurring sites collected from logs/audit-notes/templates.txt (count >= 2) ---
+        "atomic write failed path=%s error=%s: %s (disk full, permissions, or file locked?)": "ファイルの書き込みに失敗: パス=%s、エラー=%s: %s（ディスク容量不足・権限・ファイルロックを確認）",
+        "json serialize failed path=%s error=%s: %s": "JSON化に失敗: パス=%s、エラー=%s: %s",
+        "json file is absent file=%s reason=%s": "JSONファイルがありません: ファイル=%s、理由=%s",
+        "json file could not be read file=%s reason=%s; the default value was used instead": "JSONファイルを読み込めないため既定値を使用: ファイル=%s、理由=%s",
+        "json file could not be read file=%s error=%s: %s": "JSONファイルの読み込みに失敗: ファイル=%s、エラー=%s: %s",
+        "json file is corrupt, not missing file=%s error=%s: %s": "JSONファイルが破損しています（欠損ではありません）: ファイル=%s、エラー=%s: %s",
+        "text file could not be read file=%s reason=%s; the default value was used instead": "テキストファイルを読み込めないため既定値を使用: ファイル=%s、理由=%s",
+        "text file could not be read file=%s error=%s: %s": "テキストファイルの読み込みに失敗: ファイル=%s、エラー=%s: %s",
+        "workdir create failed path=%s error=%s: %s (the old contents are already deleted: half-deleted state)": "作業ディレクトリの作成に失敗: パス=%s、エラー=%s: %s（旧内容は削除済みのため不完全な状態）",
+        "workdir delete failed path=%s error=%s: %s (the directory may be half-deleted)": "作業ディレクトリの削除に失敗: パス=%s、エラー=%s: %s（ディレクトリが半分削除されている可能性があります）",
+        "temp file left behind path=%s temp=%s error=%s: %s (the failed write below is the real error)": "一時ファイルが残りました: パス=%s、一時=%s、エラー=%s: %s（後続の書き込み失敗が本来のエラーです）",
+        "artifact write failed path=%s error=%s: %s": "アーティファクトの書き込みに失敗: パス=%s、エラー=%s: %s",
+        "wiki page scan failed path=%s error=%s: %s (permission, unreadable mount, or too many open files?)": "Wikiページの走査に失敗: パス=%s、エラー=%s: %s（権限・マウント・FD上限を確認）",
+        "stored excel story plan has an unexpected shape run=%s file=%s error=%s: %s": "保存済みExcelストーリー計画の形式が不正: ランID=%s、ファイル=%s、エラー=%s: %s",
+        "GROWI page marker seed could not be read document=%s file=%s error=%s: %s": "GROWIページのマーカー初期値を読み込めません: ドキュメント=%s、ファイル=%s、エラー=%s: %s",
+        "embedder unavailable, vector candidate search is off document=%s model=%s backend=%s endpoint=%s settings=WIKI_EMBED_BACKEND,embed_model,embed_api_key error=%s: %s": "エンベディングを利用できないためベクター検索を停止: ドキュメント=%s、モデル=%s、バックエンド=%s、エンドポイント=%s、設定=WIKI_EMBED_BACKEND,embed_model,embed_api_key、エラー=%s: %s",
+        "run=%s embedder disabled (WIKI_EMBED_BACKEND=off)": "ランID=%s エンベディング無効（WIKI_EMBED_BACKEND=off）",
+        "run=%s stage=embedder error=%s: %s": "ランID=%s ステップ=エンベディング エラー=%s: %s",
+        "run=%s stage=index error=%s": "ランID=%s ステップ=インデックス エラー=%s",
+        "run=%s stage=index error=%s: %s": "ランID=%s ステップ=インデックス エラー=%s: %s",
+        "chunk metadata call failed after retry stage=describe chunk=%s document=%s page=%s error=%s: %s (the chunk keeps a degraded 300-character summary)": "チャンク要約のモデル呼び出しがリトライ後も失敗（300文字の簡易要約のまま）: ステップ=チャンク解析、チャンク=%s、ドキュメント=%s、ページ=%s、エラー=%s: %s",
+        "describe prompt artifact could not be written stage=describe chunk=%s document=%s path=%s error=%s: %s (an optional artifact aborts the whole describe pass)": "チャンク解析のプロンプト保存に失敗（任意アーティファクトの原因で全チャンク処理が中断）: ステップ=チャンク解析、チャンク=%s、ドキュメント=%s、パス=%s、エラー=%s: %s",
+        "describe result artifact could not be written stage=describe chunk=%s path=%s error=%s: %s (an optional artifact aborts the whole describe pass)": "チャンク解析の結果保存に失敗（任意アーティファクトの原因で全チャンク処理が中断）: ステップ=チャンク解析、チャンク=%s、パス=%s、エラー=%s: %s",
+        "page reference state could not be written document=%s path=%s error=%s: %s (the next run re-plans every page of this document)": "ページの参照状態を保存できません（次回は全ページを再プラン）: ドキュメント=%s、パス=%s、エラー=%s: %s",
+        "wiki plan has no page list file=%s key=%s document=%s error=%s: %s": "Wikiプランにページ一覧がありません: ファイル=%s、キー=%s、ドキュメント=%s、エラー=%s: %s",
+        "up-to-date stamp is unreadable file=%s document=%s error=%s: %s; the document is rebuilt": "最新化スタンプを読み込めないため再構築します: ファイル=%s、ドキュメント=%s、エラー=%s: %s",
     }
     _STAGES = {
-        "parser": "パーサー", "index": "インデックス", "generate": "ドキュメント生成",
+        "parser": "パーサー", "parse": "パース", "index": "インデックス", "generate": "ドキュメント生成",
         "publish": "パブリッシュ", "preflight": "事前チェック", "delete": "削除",
-        "embedder": "エンベディング", "link": "リンク", "operation": "処理", "recovery": "リカバリー",
+        "embedder": "エンベディング", "embeddings": "エンベディング", "link": "リンク", "links": "リンク",
+        "operation": "処理", "recovery": "リカバリー", "describe": "チャンク解析", "chunk": "チャンク",
+        "snapshot": "スナップショット", "llm": "LLM", "verify": "検証", "tiebreak": "同点判定",
+        "sync": "同期", "semantic": "意味解析", "seed": "初期値", "screen": "スクリーニング",
+        "convert": "コンバート", "repair": "リペア", "export": "エクスポート", "plan": "プラン",
+        "judge": "チェック", "checkpoint": "チェックポイント", "jev": "Jev", "storage": "ストレージ",
+        "human": "人手編集", "mount": "マウント", "scan": "スキャン", "queue": "キュー",
+        "watch": "監視", "hierarchy": "階層化", "compile": "コンパイル", "region": "領域分割",
+        "window": "ウィンドウ", "intro": "序論生成", "writer": "本文生成", "research": "調査",
     }
+    # Field labels for templates that have no exact _MESSAGES entry, so live.log keeps
+    # Japanese field names with the original reason text instead of raw English.
+    _KEYS = {
+        "run": "ランID", "project": "プロジェクト", "document": "ドキュメント", "documents": "ドキュメント数",
+        "page": "ページ", "pages": "ページ数", "path": "パス", "file": "ファイル", "error": "エラー",
+        "last_error": "最終エラー", "reason": "理由", "setting": "設定", "settings": "設定", "value": "値",
+        "model": "モデル", "backend": "バックエンド", "endpoint": "エンドポイント", "url": "URL",
+        "attempt": "トライ", "attempts": "トライ数", "retries": "リトライ数", "elapsed": "経過時間",
+        "timeout": "タイムアウト", "chunk": "チャンク", "chunks": "チャンク数", "sheet": "シート",
+        "workbook": "ワークブック", "section": "セクション", "window": "ウィンドウ", "region": "領域",
+        "state": "状態", "schema": "スキーマ", "mode": "モード", "kind": "種別", "event": "イベント",
+        "command": "コマンド", "binary": "コマンド", "repo": "リポジトリ", "revision": "リビジョン",
+        "device": "デバイス", "dtype": "データ型", "batch": "バッチ", "status": "ステータス",
+        "question": "質問", "questions": "質問数", "request": "リクエスト", "requests": "リクエスト数",
+        "thread": "スレッド", "version": "バージョン", "run_id": "ランID", "step": "ステップ",
+        "lines": "行数", "line": "行", "source_lines": "元行数", "old_lines": "旧行数", "new_lines": "新行数",
+        "characters": "文字数", "bytes": "バイト数", "size": "サイズ", "count": "件数", "dir": "ディレクトリ",
+        "folder": "フォルダー", "mount": "マウント", "target": "対象", "source": "ソース", "key": "キー",
+        "policy": "ポリシー", "stage": "ステップ", "threshold": "しきい値", "sample": "サンプル数",
+        "env": "環境変数", "entities": "エンティティ数", "candidates": "候補数", "leads": "候補数",
+        "temp": "一時ファイル", "encoding": "エンコーディング", "encodings": "エンコーディング", "code": "終了コード",
+        "returncode": "終了コード", "root": "ルート", "operation": "オペレーションID", "out": "出力先",
+        "stderr": "標準エラー", "failures": "失敗件数", "errors": "エラー件数", "expected": "期待値",
+        "edges": "エッジ数", "config": "設定ファイル", "boundary": "境界", "team": "チーム",
+        "phase": "フェーズ", "name": "名前", "missing": "欠損", "commit": "コミット",
+        "touched": "更新件数", "tier": "ティア", "sections": "セクション数", "score": "スコア",
+        "scope": "スコープ", "data_root": "データルート", "action": "処置", "target_name": "プロジェクト名",
+        "response": "応答", "output": "出力", "files": "ファイル数", "dest": "保存先",
+        "slides": "スライド数", "valid": "有効値", "found": "検出数", "first": "最初の1件",
+        "max_batch_requests": "最大バッチ数", "max_batch_tokens": "最大バッチトークン",
+        "batch_wait_ms": "バッチ待機ms", "concurrency": "並列数", "record": "記録",
+    }
+    _KEY_RE = re.compile(
+        r"(?<![A-Za-z0-9_])(" + "|".join(sorted(_KEYS, key=len, reverse=True)) + r")="
+    )
 
     def format(self, record: logging.LogRecord) -> str:
+        localized = self._localize(record)
+        return logging.Formatter("%(levelname)s %(message)s").format(localized)
+
+    def _localize(self, record: logging.LogRecord) -> logging.LogRecord:
+        """Return a translated COPY of the record; never touch the shared original."""
         localized = copy.copy(record)
+        # live.log must stay traceback-free even when the debug handler already
+        # formatted (and cached) the exception for this same record.
+        localized.exc_info = None
+        localized.exc_text = None
+        localized.stack_info = None
         template = str(record.msg)
         if template in self._MESSAGES:
             template = self._MESSAGES[template]
-        elif "stage=" in template:
+        else:
             for stage, label in self._STAGES.items():
-                template = template.replace(f"stage={stage}", f"ステージ={label}")
-            for key, label in (("run", "ランID"), ("operation", "オペレーションID"), ("path", "パス"),
-                               ("document", "ドキュメント"), ("file", "ファイル"), ("error", "エラー"),
-                               ("endpoint", "エンドポイント"), ("attempt", "トライ"), ("timeout", "タイムアウト"),
-                               ("elapsed", "経過時間"), ("fallback", "フォールバック"), ("characters", "文字数")):
-                template = template.replace(f"{key}=", f"{label}=")
-            template = template.replace("retry_later", "後でリトライ").replace("failed", "失敗")
-        elif template.isascii():
-            template = "ログ詳細（原文）: " + template
+                template = template.replace(f"stage={stage}", f"ステップ={label}")
+            template = self._KEY_RE.sub(lambda m: self._KEYS[m.group(1)] + "=", template)
+            # only tokens are reworded here; prose stays verbatim so the reason is never mangled
+            template = template.replace("retry_later", "後でリトライ").replace("not found", "見つかりません")
+            if template.isascii():
+                template = "ログ詳細（原文）: " + template
         localized.msg = template
         localized.levelname = {"INFO": "インフォ", "WARNING": "ワーニング", "ERROR": "エラー",
                                "CRITICAL": "重大エラー", "DEBUG": "デバッグ"}.get(record.levelname, record.levelname)
-        return logging.Formatter("%(levelname)s %(message)s").format(localized)
+        return localized
 
 
-class TqdmStreamHandler(logging.StreamHandler):
-    """Log handler that clears the bars first, so every line starts at column 0.
+class LiveJapaneseFormatter(JapaneseFormatter):
+    """One timestamped Japanese line per live record; full traces stay in debug.log.
 
-    Plain ``StreamHandler`` output lands in the middle of a redrawn tqdm row,
-    which is what makes sync -v look like it is indented with tabs.
+    Never emits a traceback, ANSI escape or carriage return, so ``live.log`` stays a
+    staff-readable single-line record whatever the debug handler does with the same record.
     """
 
-    def emit(self, record: logging.LogRecord) -> None:
-        if tqdm is None:  # pragma: no cover - tqdm is an optional terminal aid
-            super().emit(record)
-            return
-        with tqdm.external_write_mode(file=self.stream):
-            super().emit(record)
+    _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])")
+
+    def __init__(self, *, run_id: str = "", redact: Any = None) -> None:
+        super().__init__("%(message)s")
+        self.run_id = run_id
+        self.redact = redact
+
+    def format(self, record: logging.LogRecord) -> str:
+        localized = self._localize(record)
+        text = localized.getMessage()
+        exception = record.exc_info[1] if record.exc_info and record.exc_info[1] is not None else None
+        if exception is not None:
+            text = f"{text} error={type(exception).__name__}: {exception}"
+        text = self._ANSI.sub("", text)
+        if self.redact is not None:
+            text = self.redact(text)
+        stamp = datetime.datetime.fromtimestamp(record.created).astimezone().isoformat(timespec="seconds")
+        fields = [stamp, localized.levelname]
+        if self.run_id:
+            fields.append(f"run={self.run_id}")
+        fields.append(" ".join(text.split()))  # one physical line: no CR/LF, no traceback
+        return " ".join(field for field in fields if field)
 
 
 @dataclass
@@ -239,7 +277,8 @@ class SyncProgress:
 
     def __init__(self, *, stream: Any = None) -> None:
         self.stream = stream or sys.stderr
-        self._tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self._progress_stream = self.stream
+        self._tty = bool(getattr(self._progress_stream, "isatty", lambda: False)())
         self._bars_enabled = tqdm is not None and self._tty
         self._documents: set[str] = set()
         self._completed: set[str] = set()
@@ -256,7 +295,7 @@ class SyncProgress:
                 leave=True,
                 dynamic_ncols=True,
                 disable=not self._bars_enabled,
-                file=self.stream,
+                file=self._progress_stream,
             )
 
     def add_documents(self, paths: Iterable[Any]) -> None:
@@ -321,10 +360,8 @@ class SyncProgress:
         return shorten_name(value)
 
     def _write(self, message: str) -> None:
-        if tqdm is not None:
-            tqdm.write(message, file=self.stream)
-        else:
-            print(message, file=self.stream, flush=True)
+        """Progress milestones are log records, so live.log gets them without a tee."""
+        log.info(message)
 
     def _close_visible(self) -> None:
         if self._stage_bar is not None:
@@ -344,6 +381,7 @@ class SyncProgress:
             self._phases[key] = phase
         if phase.started is None:
             phase.started = time.monotonic()
+            log.info("[%s] %s: 開始", key[0].replace('<batch>', '<バッチ>'), phase.label)
         if total is not None and total > 0:
             phase.total = total
         if self._active_key != key:
@@ -358,7 +396,7 @@ class SyncProgress:
                     leave=False,
                     dynamic_ncols=True,
                     disable=not self._bars_enabled,
-                    file=self.stream,
+                    file=self._progress_stream,
                 )
         elif self._stage_bar is not None and phase.total != self._stage_bar.total:
             self._stage_bar.total = phase.total
@@ -397,9 +435,8 @@ class SyncProgress:
         if self._active_key == key:
             self._update_bar(phase, step=status)
             self._close_visible()
-        label = {"failed": "エラー", "review": "レビュー", "pending": "保留", "cancelled": "キャンセル"}.get(status, status)
-        suffix = "" if status == "done" else f" ({label})"
-        self._write(f"[{key[0].replace('<batch>', '<バッチ>')}] {phase.label}: {elapsed:.1f}秒{suffix}")
+        label = {"done": "完了", "failed": "エラー", "review": "レビュー", "pending": "保留", "cancelled": "キャンセル"}.get(status, status)
+        self._write(f"[{key[0].replace('<batch>', '<バッチ>')}] {phase.label}: {elapsed:.1f}秒 ({label})")
 
     def on_event(self, event: dict[str, Any]) -> None:
         event = dict(event)

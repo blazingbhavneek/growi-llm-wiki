@@ -69,7 +69,12 @@ def _add_columns(conn: sqlite3.Connection, table: str, definitions: dict[str, st
 
 @contextmanager
 def _connect(project: Project):
-    conn = sqlite3.connect(project.queue_database, timeout=30)
+    try:
+        conn = sqlite3.connect(project.queue_database, timeout=30)
+    except sqlite3.Error as exc:
+        log.error("queue database open failed file=%s error=%s: %s",
+                  project.queue_database, type(exc).__name__, exc, exc_info=True)
+        raise
     conn.row_factory = sqlite3.Row
     try:
         conn.executescript(
@@ -134,6 +139,11 @@ def _connect(project: Project):
         })
         yield conn
         conn.commit()
+    except sqlite3.Error as exc:
+        log.error("queue database read/write failed file=%s error=%s: %s",
+                  project.queue_database, type(exc).__name__, exc, exc_info=True)
+        conn.rollback()
+        raise
     except BaseException:
         conn.rollback()
         raise
@@ -184,10 +194,12 @@ def _classification(
         return {"kind": "large", "ratio": 1.0, "hunks": 0, "reason": f"classification-failed:{type(exc).__name__}"}
 
 
-def _docx_similarity(old: bytes, new: bytes) -> float:
+def _docx_similarity(old_rel: str, old: bytes, new_rel: str, new: bytes) -> float:
     try:
         return SequenceMatcher(None, _docx_text(old), _docx_text(new), autojunk=False).ratio()
-    except Exception:
+    except Exception as exc:
+        log.error("docx move detection disabled for this pair old=%s new=%s error=%s: %s",
+                  old_rel, new_rel, type(exc).__name__, exc, exc_info=True)
         return 0.0
 
 
@@ -352,7 +364,7 @@ def scan(
             for new_rel in appeared - set(moves.values()):
                 if Path(new_rel).suffix.lower() != ".docx" or new_rel not in staged:
                     continue
-                if _docx_similarity(old_payload, read_blob(project, staged[new_rel].oid)) >= MOVE_SIMILARITY:
+                if _docx_similarity(old_rel, old_payload, new_rel, read_blob(project, staged[new_rel].oid)) >= MOVE_SIMILARITY:
                     fuzzy.setdefault(old_rel, []).append(new_rel)
                     reverse_fuzzy.setdefault(new_rel, []).append(old_rel)
         for old_rel, candidates in fuzzy.items():
@@ -528,7 +540,9 @@ def _resumable_transaction(project: Project) -> dict[str, Any] | None:
     """
     try:
         base = last_good(project)
-    except Exception:
+    except Exception as exc:
+        log.error("resume check failed, last-good commit is unknown and work will restart root=%s error=%s: %s",
+                  project.root, type(exc).__name__, exc, exc_info=True)
         return None
     with _connect(project) as conn:
         rows = list(conn.execute("SELECT * FROM transactions ORDER BY started_at"))
@@ -540,7 +554,9 @@ def _resumable_transaction(project: Project) -> dict[str, Any] | None:
             continue
         try:
             exists = candidate_project(project, str(data.get("operation_id") or "")).root.exists()
-        except (ValueError, OSError):
+        except (ValueError, OSError) as exc:
+            log.error("candidate worktree unreadable, left behind on disk and not resumable operation=%s error=%s: %s",
+                      data.get("operation_id"), type(exc).__name__, exc, exc_info=True)
             continue
         if exists:
             return data
@@ -580,7 +596,9 @@ def _adopt_resumable_orphan(project: Project) -> str | None:
             if head != base or candidate_is_clean(staged, base):
                 continue
             candidates.append((staged.root.stat().st_mtime_ns, operation_id))
-        except (OSError, subprocess.CalledProcessError, ValueError):
+        except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+            log.error("candidate inspection failed, worktree left behind and resume restarts from scratch operation=%s error=%s: %s",
+                      operation_id, type(exc).__name__, exc, exc_info=True)
             continue
     if not candidates:
         return None
@@ -603,7 +621,9 @@ def _prune_orphan_candidates(project: Project, *, keep: str | None = None) -> No
             continue
         try:
             remove_candidate(project, operation_id)
-        except (ValueError, OSError):
+        except (ValueError, OSError) as exc:
+            log.error("candidate worktree could not be removed, left behind on disk operation=%s error=%s: %s",
+                      operation_id, type(exc).__name__, exc, exc_info=True)
             continue
 
 
@@ -622,6 +642,7 @@ def recover(project: Project, settings: Any | None = None, *, preserve_operation
         transactions = list(conn.execute("SELECT * FROM transactions ORDER BY started_at"))
         jobs = [_job_from_row(row) for row in conn.execute("SELECT * FROM jobs")]
     if any(str(row["phase"]) == "publishing" for row in transactions) and settings is None:
+        log.error("recovery refused, publisher settings are missing for an interrupted GROWI publication root=%s", project.root)
         raise RuntimeError("publisher settings are required to recover an interrupted GROWI publication")
     if transactions:
         from .pipeline import candidate_publication_complete, restore_publication
@@ -633,11 +654,13 @@ def recover(project: Project, settings: Any | None = None, *, preserve_operation
             staged = candidate_project(project, operation_id)
             if phase == "restored":
                 if not commit or last_good(project) != commit:
+                    log.error("cannot recover publication operation=%s error=restored commit is missing commit=%s", operation_id, commit)
                     raise RuntimeError(f"cannot recover publication {operation_id}: restored commit is missing")
                 _finish_transaction(project, operation_id)
                 continue
             if phase == "restoring" and last_good(project) != str(transaction["base_commit"]):
                 if not candidate_publication_complete(settings, project):
+                    log.error("cannot recover publication operation=%s error=restored state is incomplete base=%s", operation_id, transaction["base_commit"])
                     raise RuntimeError(f"cannot recover publication {operation_id}: restored state is incomplete")
                 _finish_transaction(project, operation_id)
                 continue
@@ -667,10 +690,12 @@ def recover(project: Project, settings: Any | None = None, *, preserve_operation
                 continue
             if last_good(project) != str(transaction["base_commit"]):
                 # A publishing operation may have written pages from that older base.
+                log.error("cannot recover publication operation=%s error=last-good changed since the operation base=%s", operation_id, transaction["base_commit"])
                 raise RuntimeError(f"cannot recover publication {operation_id}: last-good changed")
             if phase in {"publishing", "restoring"}:
                 if not staged.root.exists():
                     if not commit:
+                        log.error("cannot recover publication operation=%s error=candidate commit is missing phase=%s", operation_id, phase)
                         raise RuntimeError(f"cannot recover publication {operation_id}: candidate commit is missing")
                     staged = reopen_candidate(project, operation_id, commit)
                 if commit and candidate_is_clean(staged, commit) and candidate_publication_complete(settings, staged):
@@ -1145,7 +1170,7 @@ def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool
                 if on_event:
                     on_event({"stage": "history", "step": "rollback", "base_commit": base})
     except Exception as exc:
-        log.exception("operation=%s stage=operation failed", operation_id)
+        log.exception("operation=%s stage=operation failed error=%s: %s", operation_id, type(exc).__name__, exc)
         recovery_error = ""
         if publishing:
             try:
@@ -1156,7 +1181,7 @@ def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool
                 _transaction(project, operation_id, base, "restored", restored)
                 publishing = False
             except Exception as restore_exc:
-                log.exception("operation=%s stage=recovery failed", operation_id)
+                log.exception("operation=%s stage=recovery failed error=%s: %s", operation_id, type(restore_exc).__name__, restore_exc)
                 recovery_error = f"; recovery: {type(restore_exc).__name__}: {restore_exc}"
         prefix = "recovery required: " if publishing else ""
         error = f"{prefix}{type(exc).__name__}: {exc}{recovery_error}"
@@ -1183,7 +1208,6 @@ def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool
 
 def work_once(settings: Any, *, on_event: Any = None, continue_run: bool = False,
               isolated: bool = False, only: list[str] | None = None,
-              run_id: str = "", attempt: int = 1,
               exclude: list[str] | None = None,
               defer_linker: bool = False) -> dict[str, Any] | None:
     """Promote one candidate, then reconcile derived indexes from live state."""
@@ -1191,18 +1215,9 @@ def work_once(settings: Any, *, on_event: Any = None, continue_run: bool = False
 
     with _lock(open_project(settings)):
         if isolated:
-            from .failure_logs import AttemptLog
-
-            with AttemptLog(settings, open_project(settings), run_id, attempt) as evidence:
-                def event(row: dict[str, Any]) -> None:
-                    evidence.event(row)
-                    if on_event:
-                        on_event(row)
-                result = _work_once_locked(settings, on_event=event, continue_run=continue_run,
-                                           isolated=True, only=only, exclude=exclude,
-                                           defer_linker=defer_linker)
-                if result and result.get("failures"):
-                    result["failure_logs"] = evidence.save(result)
+            result = _work_once_locked(settings, on_event=on_event, continue_run=continue_run,
+                                       isolated=True, only=only, exclude=exclude,
+                                       defer_linker=defer_linker)
         else:
             result = _work_once_locked(
                 settings,
@@ -1232,7 +1247,10 @@ def work_once(settings: Any, *, on_event: Any = None, continue_run: bool = False
                 "updated": len(index.get("done", [])),
                 "failures": list(index.get("failures", [])),
             }
+            if result["index"]["failures"]:
+                log.error("index reconcile reported failures after promote failures=%s", "; ".join(result["index"]["failures"]))
         except Exception as exc:
+            log.error("index reconcile failed after promote error=%s: %s", type(exc).__name__, exc, exc_info=True)
             result["index"] = {
                 "updated": 0,
                 "failures": [f"index: {type(exc).__name__}: {exc}"],
@@ -1249,6 +1267,8 @@ def worker_lock(project: Project):
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
+            log.error("queue worker lock held by another worker path=%s error=%s: %s",
+                      path, type(exc).__name__, exc, exc_info=True)
             raise RuntimeError("queue worker already running") from exc
         try:
             yield
@@ -1286,9 +1306,13 @@ def serve(
         while not stop.is_set():
             try:
                 result = scan(settings, only=only, settle_seconds=interval, force=force and first)
+                if result.get("errors"):
+                    log.error("scan reported %d unreadable paths, delete detection skipped", len(result["errors"]))
                 if first or any(result.get(key) for key in ("added", "updated", "deleted", "cancelled", "moved")):
                     emit("scan", result)
             except Exception as exc:
+                log.error("watch scan failed, mount changes are not being queued error=%s: %s",
+                          type(exc).__name__, exc, exc_info=True)
                 emit("scan-error", f"{type(exc).__name__}: {exc}")
             first = False
             stop.wait(max(1.0, interval))
@@ -1323,6 +1347,7 @@ def serve(
 
                             emit("index", build_index(settings, on_progress=on_event))
                         except Exception as exc:
+                            log.error("watch index reconcile failed error=%s: %s", type(exc).__name__, exc, exc_info=True)
                             emit("index-error", f"{type(exc).__name__}: {exc}")
                     scan(settings, only=only, settle_seconds=interval, verify_content=True)
                     next_growi = time.monotonic() + growi_interval

@@ -7,6 +7,7 @@ import csv as _csv
 import hashlib
 import io
 import json
+import logging
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -18,6 +19,8 @@ from pydantic import BaseModel, Field
 
 from common.policy import policy_of
 from graph.config import app_concurrency
+
+log = logging.getLogger(__name__)
 
 Cell = tuple[int, int]
 
@@ -304,7 +307,8 @@ async def decide_structure(sheet: str, grid: Grid, regions: Sequence[Region], *,
             f"シート「{sheet}」の表は、1行を1件として読む表ですか、それとも1列を1件として読む表ですか。\n\n"
             f"{previews}\n\n回答は「行」または「列」の一語だけにしてください。"
         ))])
-    except Exception:
+    except Exception as exc:
+        log.error("table orientation model call failed; the sheet is read row-first, which can produce wrong records and statistics sheet=%s error=%s: %s", sheet, type(exc).__name__, exc, exc_info=True)
         return row_structure
     choice = answer.strip().splitlines()[-1].strip("。. `").casefold() if answer.strip() else ""
     return column_structure if choice in {"列", "column", "columns"} else row_structure
@@ -383,7 +387,14 @@ def spec_comment(sheet: str, spec: TableSpec) -> str:
 
 
 def specs_in_page(body: str) -> list[dict[str, Any]]:
-    return [json.loads(match.group(1)) for match in SPEC_RE.finditer(body)]
+    specs: list[dict[str, Any]] = []
+    for match in SPEC_RE.finditer(body):
+        try:
+            specs.append(json.loads(match.group(1)))
+        except ValueError as exc:
+            log.error("table-spec comment in a page is malformed spec=%.120s error=%s: %s", match.group(1), type(exc).__name__, exc, exc_info=True)
+            raise
+    return specs
 
 
 def grids_in_page(body: str) -> list[Grid]:
@@ -409,17 +420,25 @@ def records_from_page(body: str) -> list[tuple[dict[str, Any], list[str], list[R
         grids = [grid_from_gfm(table)] if table else []
     output = []
     for index, spec_dict in enumerate(specs_in_page(body)):
-        spec = TableSpec.model_validate({k: v for k, v in spec_dict.items() if k != "sheet"})
-        # Rendered pages may contain a statistics table before the original
-        # GFM source; the last table is the source table in that format.
-        grid = grids[index] if "<table>" in body and index < len(grids) else (grids[-1] if grids else Grid(cells={}))
-        columns, records = records_for(grid, spec)
+        try:
+            spec = TableSpec.model_validate({k: v for k, v in spec_dict.items() if k != "sheet"})
+            # Rendered pages may contain a statistics table before the original
+            # GFM source; the last table is the source table in that format.
+            grid = grids[index] if "<table>" in body and index < len(grids) else (grids[-1] if grids else Grid(cells={}))
+            columns, records = records_for(grid, spec)
+        except (IndexError, ValueError) as exc:
+            log.error("table-spec in a page cannot be read as records region=%s title=%s error=%s: %s", spec_dict.get("region"), spec_dict.get("title"), type(exc).__name__, exc, exc_info=True)
+            raise
         output.append((spec_dict, columns, records))
     return output
 
 
 def query_records(columns: Sequence[str], records: Sequence[Record], sql: str, *, limit: int = 200) -> str:
-    conn = sqlite3.connect(":memory:")
+    try:
+        conn = sqlite3.connect(":memory:")
+    except sqlite3.Error as exc:
+        log.error("record query database could not be created error=%s: %s", type(exc).__name__, exc, exc_info=True)
+        raise
     quoted = ", ".join(f'"{name.replace(chr(34), chr(34) * 2)}"' for name in ["key", "label", *columns])
     conn.execute(f"CREATE TABLE t ({quoted})")
     rows = []
@@ -439,6 +458,7 @@ def query_records(columns: Sequence[str], records: Sequence[Record], sql: str, *
     conn.set_authorizer(authorizer)
     statement = sql.strip().rstrip(";")
     if ";" in statement:
+        log.error("record SQL query rejected, more than one statement sql=%.120s", sql)
         return "error: one statement only"
     if not re.search(r"\blimit\b", statement, re.IGNORECASE):
         statement += f" LIMIT {limit}"
@@ -450,6 +470,7 @@ def query_records(columns: Sequence[str], records: Sequence[Record], sql: str, *
         writer.writerows(cursor.fetchmany(limit))
         return output.getvalue()[:8000]
     except sqlite3.Error as exc:
+        log.error("record SQL query failed error=%s: %s sql=%.120s", type(exc).__name__, exc, sql, exc_info=True)
         return f"error: {exc}"
     finally:
         conn.close()
@@ -515,7 +536,11 @@ async def write_tables(
     from graph.wiki.storage import read_json, write_json_atomic, write_text_atomic
 
     docs = Path(run_dir) / "docs"
-    docs.mkdir(parents=True, exist_ok=True)
+    try:
+        docs.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.error("page directory could not be created, no page can be written run=%s error=%s: %s", run_dir, type(exc).__name__, exc, exc_info=True)
+        raise
     files: list[dict[str, Any]] = []
     prepared = []
     link_renames: dict[str, str] = {}
@@ -550,7 +575,12 @@ async def write_tables(
             # Another policy's answers are keyed apart so a standard run never reuses them.
             digest = hashlib.sha256(f"{sheet}\0{table_text}{policy_of(config).cache_key('')}".encode("utf-8")).hexdigest()[:32]
             cache = Path(config.run_dir) / "sheet-cache" / f"{digest}.json" if getattr(config, "run_dir", None) else None
-            cached = read_json(cache, default={}) if cache else {}
+            try:
+                cached = read_json(cache, default={}) if cache else {}
+            except (OSError, ValueError) as exc:
+                # graph/wiki/storage logs the file error (path + errno, or corrupt-vs-missing) on the line above.
+                log.error("sheet cache file is corrupt or unreadable sheet=%s file=%s", sheet, cache, exc_info=True)
+                raise
             if cached:
                 description = VbaDescription.model_validate(cached["vba"]) if cached.get("vba") else None
                 structure = SheetStructure.model_validate(cached["structure"])
@@ -566,16 +596,28 @@ async def write_tables(
                     tables=[],
                 ) if description else SheetStructure(summary="（大きすぎるため原本のみ）", tables=[]) if not regions or "_Sparse cell view" in table_text else await decide_structure(sheet, grid, regions, model=model, config=config)
                 if cache:
-                    write_json_atomic(cache, {"vba": description.model_dump() if description else None, "structure": structure.model_dump()})
+                    try:
+                        write_json_atomic(cache, {"vba": description.model_dump() if description else None, "structure": structure.model_dump()})
+                    except OSError as exc:
+                        log.error("sheet cache write failed, the next workbook update pays for this sheet again sheet=%s file=%s", sheet, cache, exc_info=True)
+                        raise
             tables = []
             for spec in structure.tables:
-                columns, records = records_for(grid, spec)
+                try:
+                    columns, records = records_for(grid, spec)
+                except (IndexError, ValueError) as exc:
+                    log.error("table spec has an empty or unusable data range, the sheet page cannot be built sheet=%s region=%s title=%s error=%s: %s", sheet, spec.region, spec.title, type(exc).__name__, exc, exc_info=True)
+                    raise
                 if records:
                     tables.append((spec, columns, records, stats_for(columns, records)))
             page_title = f"マクロ-{description.title}" if description else source_page_title(sheet, is_vba=False) if config.source_kind == "xlsx" else sheet
             name = f"{number:03d}-{_slug(page_title)}.md"
             old_name = f"{number:03d}-{_slug(source_page_title(sheet, is_vba=True))}.md" if is_vba else name
-            write_text_atomic(docs / name, render_table_page(page_title if is_vba else sheet, structure, tables, table_text, grid))
+            try:
+                write_text_atomic(docs / name, render_table_page(page_title if is_vba else sheet, structure, tables, table_text, grid))
+            except OSError as exc:
+                log.error("sheet page write failed, the run stops with a partial page set sheet=%s file=%s error=%s: %s", sheet, docs / name, type(exc).__name__, exc, exc_info=True)
+                raise
             completed += 1
             if on_progress:
                 on_progress({
@@ -602,12 +644,20 @@ async def write_tables(
 
     if link_renames:
         for path in docs.glob("*.md"):
-            body = path.read_text(encoding="utf-8")
+            try:
+                body = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                log.error("page could not be read for the link rename sweep file=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+                raise
             rewritten = body
             for old_name, new_name in link_renames.items():
                 rewritten = rewritten.replace(f"({old_name})", f"({new_name})")
             if rewritten != body:
-                write_text_atomic(path, rewritten)
+                try:
+                    write_text_atomic(path, rewritten)
+                except OSError as exc:
+                    log.error("renamed page links could not be written, the old links stay broken file=%s error=%s: %s", path, type(exc).__name__, exc, exc_info=True)
+                    raise
 
     number = len(prepared)
     for sheet, source_range, name, tables in prepared:
@@ -622,26 +672,39 @@ async def write_tables(
                 feedback: list[str] = []
                 text = ""
                 for _ in range(3):
-                    text = await model.text([HumanMessage(content=analysis_prompt(sheet, spec, columns, subset, stats, language=config.output_language, feedback=feedback))])
+                    try:
+                        text = await model.text([HumanMessage(content=analysis_prompt(sheet, spec, columns, subset, stats, language=config.output_language, feedback=feedback))])
+                    except Exception as exc:
+                        log.error("table analysis model call failed sheet=%s table=%s part=%s error=%s: %s", sheet, spec.title, suffix, type(exc).__name__, exc, exc_info=True)
+                        raise
                     feedback = check_citations(text, subset)
                     if not feedback:
                         break
                 if feedback:
+                    log.error("table analysis citations failed after 3 attempts, the page publishes statistics only sheet=%s table=%s part=%s reason=%s", sheet, spec.title, suffix, "; ".join(feedback))
                     text = "> 引用チェックに失敗したため、統計のみを掲載します。\n\n" + json.dumps(stats, ensure_ascii=False, indent=1)
                 number += 1
                 prefix = "解説" if config.source_kind == "xlsx" else "series"
                 filename = f"{number:03d}-{prefix}-{_slug(sheet)}-{_slug(spec.title)}-{suffix}.md"
-                write_text_atomic(docs / filename, f"# {spec.title} — {suffix}\n\n元の表: [{sheet}]({name})（{spec.title}）\n\n{text}\n")
+                try:
+                    write_text_atomic(docs / filename, f"# {spec.title} — {suffix}\n\n元の表: [{sheet}]({name})（{spec.title}）\n\n{text}\n")
+                except OSError as exc:
+                    log.error("analysis page write failed sheet=%s file=%s error=%s: %s", sheet, docs / filename, type(exc).__name__, exc, exc_info=True)
+                    raise
                 files.append({"filename": filename, "title": f"{spec.title} — {suffix}", "kind": "analysis", "source_ranges": [list(source_range)], "summary": text.strip().splitlines()[0][:120] if text.strip() else ""})
         if on_progress:
             on_progress({"stage": "tabular", "sheet": sheet, "tables": len(tables)})
     if on_progress:
         on_progress({"stage": progress_stage, "step": "complete", "current": len(sheets), "total": len(sheets)})
     planning = Path(run_dir) / "_planning"
-    planning.mkdir(exist_ok=True)
-    write_json_atomic(planning / "manifest.json", {"planning": {"ingest_mode": "wiki", "strategy": "tabular"}, "files": files})
-    write_json_atomic(planning / "coverage.json", {"files": [{"title": item["title"], "filename": re.sub(r"^\d+-", "", item["filename"]), "summary": item["summary"], "header": "VBA" if item["kind"] == "vba" else "表", "source_start": item["source_ranges"][0][0], "source_end": item["source_ranges"][0][1]} for item in files]})
-    write_json_atomic(planning / "metadata.json", {"files": [{"name": re.sub(r"^\d+-", "", item["filename"]), "header": "VBA" if item["kind"] == "vba" else "表"} for item in files]})
+    try:
+        planning.mkdir(exist_ok=True)
+        write_json_atomic(planning / "manifest.json", {"planning": {"ingest_mode": "wiki", "strategy": "tabular"}, "files": files})
+        write_json_atomic(planning / "coverage.json", {"files": [{"title": item["title"], "filename": re.sub(r"^\d+-", "", item["filename"]), "summary": item["summary"], "header": "VBA" if item["kind"] == "vba" else "表", "source_start": item["source_ranges"][0][0], "source_end": item["source_ranges"][0][1]} for item in files]})
+        write_json_atomic(planning / "metadata.json", {"files": [{"name": re.sub(r"^\d+-", "", item["filename"]), "header": "VBA" if item["kind"] == "vba" else "表"} for item in files]})
+    except OSError as exc:
+        log.error("planning manifests could not be written, the built pages are not published as a run run=%s error=%s: %s", run_dir, type(exc).__name__, exc, exc_info=True)
+        raise
     return files
 
 

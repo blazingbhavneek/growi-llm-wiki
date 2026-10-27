@@ -12,8 +12,11 @@ branch on a policy name.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,11 @@ class Policy:
 
     def offline_seed_plan(self, lines: Sequence[str]) -> Any:
         """Plan used when ``offline`` and no model client exists."""
+        log.error(
+            "policy cannot plan without a model policy=%s lines=%d (the policy name comes from the settings policy field, --policy or --set policy=)",
+            self.name,
+            len(lines),
+        )
         raise NotImplementedError(f"policy {self.name} cannot plan without a model")
 
     async def hierarchy(self, pages: Sequence[Any], lines: Sequence[str], *, checkpoint: Any) -> dict[str, str] | None:
@@ -139,22 +147,48 @@ def _same(text: str) -> str:
 STANDARD = Policy()
 
 
+# shortcut: one live.log INFO per distinct policy name per process; policy_of() runs for
+# every stage of every document, so an unguarded INFO would drown a run.
+_RESOLVED: set[str] = set()
+
+
+def _note_resolved(policy: Policy) -> Policy:
+    if policy.name not in _RESOLVED:
+        _RESOLVED.add(policy.name)
+        log.info("policy resolved policy=%s version=%s", policy.name, policy.version)
+    return policy
+
+
 def resolve_policy(value: str | Policy | None) -> Policy:
     if isinstance(value, Policy):
         return value
     normalized = str(value or "standard").strip().lower()
     if normalized in {"", "standard", "standard-v1"}:
-        return STANDARD
+        if value is not None and not str(value).strip():
+            log.warning(
+                "policy field is empty, standard policy is used instead policy=%r (check the settings policy field, --policy or --set policy=)",
+                value,
+            )
+        return _note_resolved(STANDARD)
     if normalized == "fast" or normalized.startswith("fast-v"):
         from graph.fast.policy import FAST  # the standard path never reaches this import
 
-        return FAST
+        return _note_resolved(FAST)
+    log.error(
+        "policy name is not a known policy policy=%r error=policy must be standard or fast (the value comes from the settings policy field, --policy or --set policy=)",
+        value,
+    )
     raise ValueError("policy must be standard or fast")
 
 
 def policy_of(owner: Any) -> Policy:
     """The policy carried by a settings or config object (missing means standard)."""
 
+    if not hasattr(owner, "policy"):
+        log.warning(
+            "policy field is missing, standard policy is used owner=%s field=policy",
+            type(owner).__name__,
+        )
     return resolve_policy(getattr(owner, "policy", "standard"))
 
 

@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 
 from .config import WikiConfig
 from .pipeline import run_pipeline
+
+log = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -85,9 +88,18 @@ def main() -> None:
             flush=True,
         )
 
-    result = asyncio.run(run_pipeline(args.source, config=config, on_progress=progress))
+    try:
+        result = asyncio.run(run_pipeline(args.source, config=config, on_progress=progress))
+    except Exception as exc:  # noqa: BLE001 - the CLI has to name the run it failed on
+        log.error("wiki build failed source=%s kind=%s output=%s slug=%s error=%s: %s",
+                  args.source, config.source_kind, args.output, args.slug,
+                  type(exc).__name__, exc, exc_info=True)
+        raise
     print(json.dumps({"run": str(result), "wiki": str(result / "wiki")}, indent=2))
+    log.info("wiki build finished source=%s kind=%s output=%s run=%s wiki=%s",
+             args.source, config.source_kind, args.output, result, result / "wiki")
 
 
 if __name__ == "__main__":
-    main()
+    from runner.logging_support import run_standalone
+    raise SystemExit(run_standalone(main))

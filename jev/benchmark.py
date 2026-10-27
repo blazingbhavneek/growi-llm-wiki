@@ -1,8 +1,11 @@
 import argparse
 import concurrent.futures
 import json
+import logging
 import statistics
 import time
+
+log = logging.getLogger(__name__)
 
 PARAGRAPH = "これは日本語の技術文書です。対象のページには設計、手順、設定、用語の説明が含まれます。検索結果を評価するために使用します。"
 QUESTION = "このページには、対象の質問に対する答えが具体的に記載されていますか？"
@@ -25,8 +28,14 @@ def main():
                 t = time.perf_counter()
                 qs = [JevQuestion(QUESTION, key=str(j)) for j in range(count)]
                 sample = {"text": state, "sample": i}
-                result = engine.decide_many(sample, qs) if args.decide_many else engine.decide_batch([
-                    __import__("jev").JevRequest(sample, q) for q in qs])
+                try:
+                    result = engine.decide_many(sample, qs) if args.decide_many else engine.decide_batch([
+                        __import__("jev").JevRequest(sample, q) for q in qs])
+                except Exception as exc:
+                    # A MemoryError here is the host running out of memory inside this cell; a
+                    # kernel OOM kill (SIGKILL) cannot be logged from the dying process.
+                    log.error("Jev benchmark cell failed length=%d questions=%d sample=%d concurrency=%d error=%s: %s (the benchmark stops at this cell)", length, count, i, args.concurrency, type(exc).__name__, exc, exc_info=True)
+                    raise
                 latencies.append(time.perf_counter() - t)
                 return result
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
@@ -41,7 +50,9 @@ def main():
     try:
         import torch
         if torch.cuda.is_available(): peak_vram = torch.cuda.max_memory_allocated()
-    except ImportError: pass
+    except ImportError as exc:
+        # peak_vram_bytes stays 0, so the table must say "torch is missing" and not "there was no GPU".
+        log.error("Jev benchmark peak VRAM is unknown because torch is not installed, peak_vram_bytes stays 0 error=%s: %s", type(exc).__name__, exc, exc_info=True)
     for row in rows: row["peak_vram_bytes"] = peak_vram
     headers = ("length", "questions", "requests_s", "questions_s", "input_tokens_s", "p50", "p95", "p99", "peak_vram_bytes")
     print("| " + " | ".join(headers) + " |\n|" + "|".join("---" for _ in headers) + "|")
@@ -51,4 +62,6 @@ def main():
     engine.close()
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    from runner.logging_support import run_standalone
+    raise SystemExit(run_standalone(main))

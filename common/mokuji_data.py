@@ -32,11 +32,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from common.markdown import LINKS_FOOTER_END, LINKS_FOOTER_START
+
+log = logging.getLogger(__name__)
 
 FENCE_INFO = "llm-wiki-data"
 VERSION = 1
@@ -100,19 +103,27 @@ def parse(markdown: str) -> MokujiData | None:
     if not match:
         return None
     records: list[dict[str, Any]] = []
-    for line in match.group(1).splitlines():
+    for number, line in enumerate(match.group(1).splitlines(), start=1):
         line = line.strip()
         if not line:
             continue
         try:
             value = json.loads(line)
-        except ValueError:  # a hand edit broke one line: keep the rest
+        except ValueError as exc:  # a hand edit broke one line: keep the rest
+            log.error("mokuji data record is not valid json and was dropped line=%d record=%s error=%s: %s", number, line[:120], type(exc).__name__, exc)
             continue
         if isinstance(value, dict):
             records.append(value)
+        else:
+            log.error("mokuji data record is not an object and was dropped line=%d found=%s", number, type(value).__name__)
     head = next((record for record in records if record.get("type") == "block"), None)
     if head is None:
+        log.error("mokuji data block has no header record, records=%d; the block is corrupt, not absent, and its search data is unusable", len(records))
         return None
+    if head.get("version") != VERSION:
+        log.error("mokuji data block has an unknown version=%s expected=%s name=%s", head.get("version"), VERSION, head.get("name", ""))
+    if not head.get("hash"):
+        log.error("mokuji data header has no hash; the recomputed hash cannot detect a corrupt block name=%s", head.get("name", ""))
     body = [record for record in records if record.get("type") != "block"]
     return MokujiData(level=str(head.get("level") or ""), name=str(head.get("name") or ""),
                       hash=str(head.get("hash") or block_hash(body)), version=int(head.get("version") or 0),

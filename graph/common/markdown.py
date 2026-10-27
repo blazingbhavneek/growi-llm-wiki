@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import traceback
 from dataclasses import dataclass
 
 from .images import strip_images
+
+log = logging.getLogger(__name__)
 
 LINKS_FOOTER_START = "<!-- llm-wiki-links:start -->"
 LINKS_FOOTER_END = "<!-- llm-wiki-links:end -->"
@@ -87,6 +91,15 @@ def strip_big_tables(text: str, *, max_rows: int = 40) -> str:
 
 def chunk_text(text: str, size: int, overlap: int) -> list[tuple[int, int, str]]:
     if size <= 0:
+        caller = traceback.extract_stack()[-2]
+        log.error(
+            "chunk size must be positive size=%s overlap=%s characters=%d caller=%s:%d",
+            size,
+            overlap,
+            len(text),
+            caller.name,
+            caller.lineno,
+        )
         raise ValueError("size must be positive")
     overlap = max(0, min(overlap, size - 1))
     lines = text.splitlines()

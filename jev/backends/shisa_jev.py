@@ -1,11 +1,14 @@
 """Shisa DE-2 adapter for the existing Jev engine contract."""
 
 import json
+import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
 
 from ..types import JevResult, JevUnavailable
 from . import Prepared
+
+log = logging.getLogger(__name__)
 
 
 class ShisaJevBackend:
@@ -21,12 +24,15 @@ class ShisaJevBackend:
 
     def __init__(self, config):
         if not config.base_url:
+            log.error("Shisa Jev backend cannot start: WIKI_JEV_BASE_URL is not set model=%s", config.model)
             raise JevUnavailable("Shisa backend requires WIKI_JEV_BASE_URL")
         if not config.model:
+            log.error("Shisa Jev backend cannot start: WIKI_JEV_MODEL is not set")
             raise JevUnavailable("Shisa backend requires WIKI_JEV_MODEL")
         try:
             from shisa_de import DecisionModel, calibration_for
         except ImportError as exc:
+            log.error("Shisa Jev backend cannot start: the shisa-de package is missing error=%s: %s", type(exc).__name__, exc, exc_info=True)
             raise JevUnavailable(
                 "Shisa backend requires shisa-de (uv pip install --python .venv/bin/python shisa-de)"
             ) from exc
@@ -96,6 +102,7 @@ class ShisaJevBackend:
 
     def _score_one(self, prepared):
         request = prepared.request
+        stage = "decide"  # which phase failed, so a response-shape bug is not read as a network failure
         try:
             decision = self._client.decide(
                 request.state,
@@ -103,8 +110,17 @@ class ShisaJevBackend:
                 probability=True,
             )
             answer = decision.answers["answer"]
-            return self._result(request.question, answer, decision.usage)
+            stage = "parse"
+            result = self._result(request.question, answer, decision.usage)
+            if result.answer == "None":
+                # shortcut: the value is still returned unchanged (class B); this only makes it visible.
+                log.error("Shisa DE-2 returned no answer value state=%s question=%s kind=%s (the string \"None\" is flowing downstream as the answer)", request.state_id[:12], getattr(request.question, "key", ""), getattr(request.question, "kind", ""))
+            return result
         except Exception as exc:
+            if stage == "parse":
+                log.error("Shisa DE-2 answer could not be parsed state=%s question=%s kind=%s error=%s: %s (a response-shape bug, not a network failure)", request.state_id[:12], getattr(request.question, "key", ""), getattr(request.question, "kind", ""), type(exc).__name__, exc, exc_info=True)
+            else:
+                log.error("Shisa DE-2 decide request failed state=%s question=%s kind=%s error=%s: %s", request.state_id[:12], getattr(request.question, "key", ""), getattr(request.question, "kind", ""), type(exc).__name__, exc, exc_info=True)
             raise JevUnavailable(f"Shisa DE-2 request failed: {exc}") from exc
 
     @staticmethod

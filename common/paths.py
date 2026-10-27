@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+
+log = logging.getLogger(__name__)
 
 SUPPORTED_SOURCE_SUFFIXES = {".md", ".txt", ".docx", ".doc", ".pdf", ".pptx", ".xlsx", ".xlsm", ".xls", ".csv"}
 
@@ -118,7 +121,18 @@ class DataLayout:
 
     def ensure(self) -> "DataLayout":
         for path in (self.raw, self.metadata, self.wiki):
-            path.mkdir(parents=True, exist_ok=True)
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                log.error(
+                    "data folder could not be created path=%s root=%s error=%s: %s (disk full, read-only, or the data root is not mounted?)",
+                    path,
+                    self.root,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+                raise
         return self
 
 

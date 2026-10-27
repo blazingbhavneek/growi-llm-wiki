@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import posixpath
 import time
 from dataclasses import dataclass, field
@@ -13,6 +14,8 @@ from typing import Any
 
 from graph.growi.client import GrowiActivity, GrowiPage, _page_stamps
 from graph.wiki.storage import read_json, write_json_atomic
+
+log = logging.getLogger(__name__)
 
 CURSOR_VERSION = 1
 PAGE_ACTION_PARTS = ("page", "create", "update", "edit", "rename", "move", "delete")
@@ -80,9 +83,13 @@ class ActivityDetector:
 
         try:
             cursor = self.cursor()
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError) as exc:
+            log.error("activity cursor is unusable, detection restarts from nothing path=%s reason=malformed_cursor error=%s: %s",
+                      self.path, type(exc).__name__, exc, exc_info=True)
             return DetectionBatch(fallback_reason="malformed_cursor", metrics={"cursor_resets": 1})
         if cursor.get("endpoint_identity") != self.endpoint_identity:
+            log.error("activity cursor belongs to another endpoint, events across the change are unprocessed path=%s reason=endpoint_changed boundary=%s",
+                      self.path, self.boundary)
             return DetectionBatch(fallback_reason="endpoint_changed", metrics={"cursor_resets": 1})
         known_ids = set(cursor.get("recent_ids") or []) | set(cursor.get("ids_at_last_timestamp") or [])
         checkpoint = _parse_time(cursor["last_processed_at"]) if cursor.get("last_processed_at") else None
@@ -96,6 +103,8 @@ class ActivityDetector:
                 last_total = total
                 if not rows:
                     if offset < total:
+                        log.error("activity pages stopped before the reported total, events were missed path=%s reason=activity_pagination_gap offset=%d total=%d",
+                                  self.path, offset, total)
                         return DetectionBatch(fallback_reason="activity_pagination_gap",
                                               metrics={"cursor_resets": 1})
                     break
@@ -105,12 +114,18 @@ class ActivityDetector:
                 if (floor is not None and oldest < floor) or offset >= total:
                     break
         except ValueError as exc:
+            log.error("activity timestamps are unparsable, events may be missed path=%s reason=malformed_activity_response error=%s: %s",
+                      self.path, type(exc).__name__, exc, exc_info=True)
             return DetectionBatch(
                 fallback_reason="malformed_activity_response",
                 metrics={"cursor_resets": 1, "reason": type(exc).__name__},
             )
         except Exception as exc:
             status = getattr(exc, "status_code", None)
+            log.error("activity feed request failed, events may be missed path=%s reason=%s status=%s boundary=%s error=%s: %s",
+                      self.path,
+                      "activity_permission_gap" if status in {401, 403} else "activity_api_unavailable",
+                      status, self.boundary, type(exc).__name__, exc, exc_info=True)
             return DetectionBatch(
                 fallback_reason="activity_permission_gap" if status in {401, 403} else "activity_api_unavailable",
                 metrics={"cursor_resets": 1 if status in {401, 403} else 0, "reason": type(exc).__name__},
@@ -119,9 +134,13 @@ class ActivityDetector:
         if checkpoint and known_ids and unique and not (set(unique) & known_ids):
             oldest_seen = min(_parse_time(row.created_at) for row in unique.values())
             if offset >= last_total and oldest_seen > checkpoint:
+                log.error("activity cursor is older than the events GROWI still returns, missed events are possible path=%s reason=cursor_too_old oldest_seen=%s checkpoint=%s",
+                          self.path, oldest_seen.isoformat(), checkpoint.isoformat())
                 return DetectionBatch(fallback_reason="cursor_too_old", metrics={"cursor_resets": 1})
         if any(_parse_time(row.created_at) > datetime.now(timezone.utc) + timedelta(seconds=max(300, self.overlap_seconds))
                for row in unique.values()):
+            log.error("activity timestamps are in the future, this host or GROWI has a broken clock path=%s reason=clock_skew boundary=%s now=%s",
+                      self.path, self.boundary, datetime.now(timezone.utc).isoformat())
             return DetectionBatch(fallback_reason="clock_skew", metrics={"cursor_resets": 1})
         ordered = sorted(unique.values(), key=lambda row: (_parse_time(row.created_at), row.activity_id))
         events = [
@@ -133,6 +152,8 @@ class ActivityDetector:
         sequences = [row.sequence for row in events if row.sequence is not None]
         previous_sequence = cursor.get("last_sequence")
         if sequences and previous_sequence is not None and min(sequences) > int(previous_sequence) + 1:
+            log.error("activity sequence jumped, events were missed path=%s reason=sequence_gap last_sequence=%s first_seen=%s",
+                      self.path, previous_sequence, min(sequences))
             return DetectionBatch(fallback_reason="sequence_gap", metrics={"cursor_resets": 1})
         owned_ids = {str(row.get("page_id") or "") for row in owned_pages.values()}
         selected = {row.page_id for row in events if row.page_id in owned_ids}
@@ -176,14 +197,25 @@ class ActivityDetector:
     def commit(self, batch: DetectionBatch) -> None:
         if batch.fallback_reason or not batch.cursor:
             return
-        write_json_atomic(self.path, batch.cursor)
+        try:
+            write_json_atomic(self.path, batch.cursor)
+        except Exception as exc:  # noqa: BLE001 - the storage layer names the errno, only here knows the events at risk
+            log.error("activity cursor commit failed path=%s error=%s: %s; the next poll reprocesses these events or misses them",
+                      self.path, type(exc).__name__, exc, exc_info=True)
+            raise
 
     def inventory(self, client: Any, owned_pages: dict[str, dict[str, Any]]) -> InventoryResult:
         """Compare the complete managed boundary without mutating remote state."""
 
         started = time.monotonic()
-        remote = asyncio.run(client.list_all_pages(self.boundary))
+        try:
+            remote = asyncio.run(client.list_all_pages(self.boundary))
+        except Exception as exc:  # noqa: BLE001 - a partial listing cannot be mistaken for the whole boundary
+            log.error("GROWI inventory listing failed boundary=%s error=%s: %s", self.boundary, type(exc).__name__, exc, exc_info=True)
+            raise
         if any(not _inside(page.path, self.boundary) for page in remote):
+            log.error("GROWI inventory returned a page outside the configured boundary boundary=%s pages=%d",
+                      self.boundary, len(remote))
             raise ValueError("inventory returned a page outside the configured boundary")
         remote_by_id = {page.page_id: page for page in remote if page.page_id}
         owned_by_id = {str(row.get("page_id") or ""): (path, row) for path, row in owned_pages.items() if row.get("page_id")}
@@ -213,7 +245,12 @@ class ActivityDetector:
                 continue
             full = page
             if not full.body:
-                full = asyncio.run(client.get_page(page_id=page_id))
+                try:
+                    full = asyncio.run(client.get_page(page_id=page_id))
+                except Exception as exc:  # noqa: BLE001 - the ownership marker of this page stays unknown
+                    log.error("GROWI page fetch failed during inventory page_id=%s path=%s error=%s: %s",
+                              page_id, page.path, type(exc).__name__, exc, exc_info=True)
+                    raise
                 fetched += 1
             stamps = _page_stamps(full.body) if full else []
             if len(stamps) == 1:

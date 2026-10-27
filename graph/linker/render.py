@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import posixpath
 import re
 from dataclasses import dataclass, field
@@ -12,6 +13,8 @@ from graph.common.markdown import LINKS_FOOTER_END as FOOTER_END, LINKS_FOOTER_S
 from common.policy import policy_of
 from graph.wiki.page import link_entity_mentions, link_titles, strip_reader_references
 from graph.wiki.storage import write_text_atomic
+
+log = logging.getLogger(__name__)
 
 FOOTER_TITLE = "## 関連資料"
 MAX_FOOTER_ENTRIES = 20
@@ -118,8 +121,16 @@ def render_limits(mode: str, big_document: bool = False, settings: Any = None) -
                     else "wiki_linker_inline_max_big" if big_document else "wiki_linker_inline_max")
     inline_default = (MAX_NEO_BEHAVIOUR_INLINE_ENTRIES if mode == "neo"
                       else MAX_BIG_INLINE_ENTRIES if big_document else MAX_INLINE_ENTRIES)
-    return (int(getattr(settings, inline_field, inline_default)),
-            int(getattr(settings, "wiki_linker_footer_max", MAX_FOOTER_ENTRIES)))
+    limits: list[int] = []
+    for setting, default in ((inline_field, inline_default), ("wiki_linker_footer_max", MAX_FOOTER_ENTRIES)):
+        value = getattr(settings, setting, default)
+        try:
+            limits.append(int(value))
+        except (TypeError, ValueError) as exc:
+            log.error("link limit is not a number setting=%s value=%r mode=%s error=%s: %s (the page cannot be rendered)",
+                      setting, value, mode, type(exc).__name__, exc, exc_info=True)
+            raise
+    return limits[0], limits[1]
 
 
 def render_page(
@@ -180,6 +191,8 @@ def render_page(
         else:
             failed_inline.append((edge, summary))
     footer: list[tuple[RenderEdge, str]] = failed_inline
+    if failed_inline:
+        log.info("inline anchors moved to the footer page=%s count=%d inline_budget=%d", page_rel, len(failed_inline), inline_budget)
     footer.extend((edge, summary) for edge, placement, _anchor, summary in selected if placement != "inline")
     seen_paths: set[str] = set(inline_paths) | entity_paths
     unique_footer: list[tuple[RenderEdge, str]] = []
@@ -210,8 +223,12 @@ def parse_footer(text: str) -> list[FooterLink]:
     start = text.find(FOOTER_START)
     end = text.find(FOOTER_END, start + len(FOOTER_START)) if start >= 0 else -1
     if start < 0 or end < 0:
+        if start >= 0:
+            log.warning("managed links footer has no end marker, every existing reference is read as none text=%s",
+                        text[start:start + 120].replace("\n", " "))
         return []
     result: list[FooterLink] = []
+    unreadable = 0
     for line in text[start:end].splitlines():
         match = _FOOTER_LINE_RE.match(line.strip())
         if match:
@@ -220,6 +237,10 @@ def parse_footer(text: str) -> list[FooterLink]:
         match = _REFERENCE_LINE_RE.match(line.strip())
         if match:
             result.append(FooterLink(match["path"], "", (match["summary"] or "").strip()))
+        elif line.strip().startswith("- ["):
+            unreadable += 1
+    if unreadable:
+        log.warning("managed links footer lines are unreadable, their references are lost on the next render count=%d", unreadable)
     return result
 
 
@@ -228,6 +249,7 @@ def write_if_changed(path: Path, text: str) -> bool:
     if path.exists() and path.read_bytes() == text.encode("utf-8"):
         return False
     write_text_atomic(path, text)
+    log.info("wrote page path=%s", path)
     return True
 
 

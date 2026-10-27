@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import shutil
 import tempfile
@@ -71,6 +72,8 @@ from .wire import (
 )
 from .windows import observe_document
 
+
+log = logging.getLogger(__name__)
 
 Progress = Callable[[dict[str, Any]], None] | None
 StopCheck = Callable[[], bool] | None
@@ -559,7 +562,17 @@ async def _structured_with_artifacts(
                     last_error + "\n",
                 )
                 continue
-            write_json_atomic(output_dir / f"{stem}.json", result)
+            try:
+                write_json_atomic(output_dir / f"{stem}.json", result)
+            except OSError as exc:
+                log.error(
+                    "usable model answer could not be saved, the attempt is retried as if the model failed file=%s error=%s: %s",
+                    output_dir / f"{stem}.json",
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+                raise
             return result, attempt, ""
         except Exception as exc:  # noqa: BLE001 - bounded retry with evidence
             last_error = f"{type(exc).__name__}: {exc}"[:1000]
@@ -567,6 +580,13 @@ async def _structured_with_artifacts(
                 output_dir / f"{stem}-attempt-{attempt:02d}-error.txt",
                 last_error + "\n",
             )
+    log.error(
+        "structured model call gave up task=%s attempts=%d output_dir=%s last_error=%s",
+        stem,
+        max(1, attempts),
+        output_dir,
+        last_error or "no attempt returned an answer",
+    )
     return None, max(1, attempts), last_error
 
 
@@ -832,6 +852,15 @@ async def _research_references(
         if result is not None
         else f"調査呼び出し失敗: {error}"
     )
+    if result is None:
+        # document_slug is optional; the run directory is always <slug>-<source hash>.
+        log.error(
+            "cross-page research gave up, this page is written without a single fact from the reference pages document=%s page=%s references=%d attempts=%d",
+            work_root.parent.name,
+            page.title,
+            len(selected),
+            attempts,
+        )
     evidence: list[_ReferenceEvidence] = []
     for current, candidate in enumerate(selected, start=1):
         # _valid_reference_facts keeps only facts inside this candidate's range.
@@ -894,16 +923,21 @@ def _load_seed_plan(
     """Load the completed seed plan so a stopped run resumes at rewriting."""
 
     if not path.exists():
+        log.debug("no stored seed plan to resume file=%s", path)
         return None
     try:
         raw = read_json(path)
         if raw.get("source_sha256") != source_sha256:
+            log.debug("stored seed plan is for another source revision file=%s", path)
             return None
         if int(raw.get("source_line_count", 0)) != source_line_count:
+            log.debug("stored seed plan is for a %s-line source file=%s", raw.get("source_line_count", 0), path)
             return None
         if raw.get("prompt_version") != prompt_version:
+            log.debug("stored seed plan was made by an older prompt version file=%s", path)
             return None
         if bool(raw.get("single_page_rewrite", False)) != single_page_rewrite:
+            log.debug("stored seed plan was made in the other rewrite mode file=%s", path)
             return None
         pages = [
             SeedPage(
@@ -931,7 +965,23 @@ def _load_seed_plan(
             return None
         _verify_ranges(pages, source_line_count)
         return pages
-    except (KeyError, OSError, TypeError, ValueError, PipelineError):
+    except OSError as exc:
+        log.error(
+            "stored seed plan exists but could not be read, the document is re-planned from scratch file=%s error=%s: %s",
+            path,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        return None
+    except (KeyError, OSError, TypeError, ValueError, PipelineError) as exc:
+        log.error(
+            "stored seed plan is corrupt or unusable, the document is re-planned from scratch file=%s error=%s: %s",
+            path,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
         return None
 
 
@@ -978,7 +1028,11 @@ def _plan_cache_path(source_text: str, config: WikiConfig) -> Path | None:
 
 def _load_plan_cache(path: Path | None, source_text: str, lines: list[str], config: WikiConfig) -> CompiledSeedPlan | None:
     if path is None or not path.exists():
+        if path is not None:
+            log.debug("no planner cache entry to resume file=%s", path)
         return None
+    # document_slug is optional; the first hash bytes match the run directory name.
+    document = config.document_slug or sha256_text(source_text)[:12]
     try:
         payload = read_json(path)
         if payload.get("schema_version") != 1 or payload.get("cache_key") != _plan_cache_key(source_text, config):
@@ -993,8 +1047,34 @@ def _load_plan_cache(path: Path | None, source_text: str, lines: list[str], conf
             lines=lines,
             page_target_lines=config.page_target_lines,
         )
-        return checked if error is None else None
-    except (KeyError, OSError, TypeError, ValueError):
+        if error is not None:
+            log.error(
+                "planner cache entry is not a usable seed plan, the document is re-planned from scratch document=%s file=%s reason=%.300s",
+                document,
+                path,
+                error,
+            )
+            return None
+        return checked
+    except OSError as exc:
+        log.error(
+            "planner cache entry exists but could not be read, the document is re-planned from scratch document=%s file=%s error=%s: %s",
+            document,
+            path,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        return None
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        log.error(
+            "planner cache entry is corrupt or unusable, the document is re-planned from scratch document=%s file=%s error=%s: %s",
+            document,
+            path,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
         return None
 
 
@@ -1002,13 +1082,23 @@ def _store_plan_cache(path: Path | None, source_text: str, lines: list[str], con
                       plan: CompiledSeedPlan) -> None:
     if path is None:
         return
-    write_json_atomic(path, {
-        "schema_version": 1,
-        "cache_key": _plan_cache_key(source_text, config),
-        "source_sha256": sha256_text(source_text),
-        "source_line_count": len(lines),
-        "plan": plan,
-    })
+    try:
+        write_json_atomic(path, {
+            "schema_version": 1,
+            "cache_key": _plan_cache_key(source_text, config),
+            "source_sha256": sha256_text(source_text),
+            "source_line_count": len(lines),
+            "plan": plan,
+        })
+    except OSError as exc:
+        log.error(
+            "planner cache write failed, the whole document build stops for an optimization-only cache file=%s error=%s: %s",
+            path,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
 
 
 async def _compute_seed_plan(
@@ -1055,6 +1145,12 @@ async def _compute_seed_plan(
             page_target_lines=config.page_target_lines,
         )
         if seed_plan is None:
+            log.error(
+                "structural seed plan rejected, the expensive observation and planner path runs instead document=%s source_lines=%d reason=%.300s",
+                config.document_slug or sha256_text(source_text)[:12],
+                len(lines),
+                error,
+            )
             _emit(on_progress, "seed", "structural_rejected", reason=error)
     policy = policy_of(config)
     if seed_plan is None:
@@ -1107,11 +1203,25 @@ async def prepare_seed_plan_cache(
         else:
             leader = False
     if not leader:
+        # There is no timeout on this wait (audit 4.5); the line is the only
+        # evidence when the leader dies and the wait never ends.
+        log.info("waiting for the planner leader to finish this cache entry, no timeout file=%s", target)
         await asyncio.to_thread(running.wait)
         return _load_plan_cache(target, source_text, lines, config) is not None
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".planner-", dir=target.parent) as folder:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp_dir = tempfile.TemporaryDirectory(prefix=".planner-", dir=target.parent)
+        except OSError as exc:
+            log.error(
+                "planner workspace could not be created, the cache entry cannot be written dir=%s error=%s: %s",
+                target.parent,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
+        with temp_dir as folder:
             plan, _structural = await _compute_seed_plan(
                 source_text,
                 lines,
@@ -1135,6 +1245,8 @@ async def _wait_for_plan_ahead(path: Path | None) -> None:
     with _PLANNING_LOCK:
         running = _PLANNING.get(str(path.resolve()))
     if running is not None:
+        # No timeout on this wait (audit 4.5); this is the only trace of the hang.
+        log.info("waiting for the ahead planner to finish this cache entry, no timeout file=%s", path)
         await asyncio.to_thread(running.wait)
 
 
@@ -1190,6 +1302,7 @@ def _resume_rewritten_page(
     """Reuse a page whose sidecar state still matches the file on disk."""
 
     if not output_path.exists() or not state_path.exists():
+        log.debug("page is not built yet, nothing to resume page=%s file=%s", page.filename, state_path)
         return None
     try:
         markdown = output_path.read_text(encoding="utf-8")
@@ -1212,7 +1325,27 @@ def _resume_rewritten_page(
             defects=list(state.get("defects", [])),
             verbatim_sections=list(state.get("verbatim_sections", [])),
         )
-    except (OSError, TypeError, ValueError):
+    except OSError as exc:
+        log.error(
+            "published page or its state exists but could not be read, the page is rewritten from scratch page=%s path=%s file=%s error=%s: %s",
+            page.filename,
+            output_path,
+            state_path,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        return None
+    except (OSError, TypeError, ValueError) as exc:
+        log.error(
+            "published page or its state is corrupt or unusable, the page is rewritten from scratch page=%s path=%s file=%s error=%s: %s",
+            page.filename,
+            output_path,
+            state_path,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
         return None
 
 
@@ -1368,6 +1501,18 @@ async def _write_section(
                 prompt.messages(), max_output_tokens=config.write_max_output_tokens
             )
         except Exception as exc:  # noqa: BLE001 - bounded retry with evidence
+            log.error(
+                "section writer model call failed run=%s page=%s section=%d/%d attempt=%d/%d error=%s: %s",
+                task_dir.parent.parent,
+                page.filename,
+                index,
+                count,
+                attempt,
+                max(1, config.write_attempts),
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
             feedback = [f"前回の呼び出しが失敗した: {type(exc).__name__}: {exc}"[:500]]
             write_text_atomic(
                 task_dir / f"{stem}-attempt-{attempt:02d}-error.txt", feedback[0] + "\n"
@@ -1436,6 +1581,15 @@ async def _write_section(
             )
             _emit(on_progress, "write", "judge_unavailable",
                   page=page.title, section=index, attempt=attempt, error=judge_error)
+            log.error(
+                "section judge gave up, this section is published without any semantic review run=%s page=%s section=%d/%d attempt=%d strict_judge=%s",
+                task_dir.parent.parent,
+                page.filename,
+                index,
+                count,
+                attempt,
+                policy.strict_judge,
+            )
             break
         missing = _judge_feedback(judgment)
         defects = [item.strip() for item in judgment.defects if item and item.strip()]
@@ -1465,6 +1619,16 @@ async def _write_section(
             ),
         )
         if policy.strict_judge and (best.missing or best.defects):
+            log.error(
+                "judge reported missing information or defects, the section is published as the original source text run=%s page=%s section=%d/%d score=%s missing=%d defects=%d",
+                task_dir.parent.parent,
+                page.filename,
+                index,
+                count,
+                best.score,
+                len(best.missing),
+                len(best.defects),
+            )
             _emit(
                 on_progress,
                 "write",
@@ -1479,6 +1643,17 @@ async def _write_section(
                 errors=best.missing + best.defects,
                 verbatim=True,
             )
+        if not policy.strict_judge and (best.missing or best.defects):
+            log.error(
+                "judge reported missing information or defects, the rewritten section ships without review run=%s page=%s section=%d/%d score=%s missing=%d defects=%d",
+                task_dir.parent.parent,
+                page.filename,
+                index,
+                count,
+                best.score,
+                len(best.missing),
+                len(best.defects),
+            )
         return _SectionResult(
             markdown=best.markdown,
             attempts=len(candidates),
@@ -1487,6 +1662,15 @@ async def _write_section(
             defects=best.defects,
         )
     errors = candidates[-1].errors if candidates else list(feedback)
+    log.error(
+        "no writer attempt passed the lossless checks, the section is published as the original source text run=%s page=%s section=%d/%d attempts=%d reason=%.300s",
+        task_dir.parent.parent,
+        page.filename,
+        index,
+        count,
+        len(candidates),
+        "; ".join(errors),
+    )
     _emit(on_progress, "write", "section_verbatim",
           page=page.title, section=index, error="; ".join(errors)[:300])
     return _SectionResult(
@@ -1599,6 +1783,14 @@ async def _rewrite_page(
         sections = split_sections(
             lines, start, end,
             target=config.section_target_lines, min_lines=config.section_min_lines,
+        )
+    if not sections:
+        log.error(
+            "page has no writable section, the published page is only its title and intro page=%s filename=%s owner_ranges=%s-%s",
+            page.title,
+            page.filename,
+            start,
+            end,
         )
     buckets = assign_facts(facts, sections)
 
@@ -1749,13 +1941,24 @@ async def _rewrite_all(
     ):
         result = await task
         results.append(result)
-        write_text_atomic(wiki_root / result.page.filename, result.markdown)
-        _write_page_state(
-            _page_state_path(state_root, result.page), result,
-            rewrite_version=rewrite_version, pages=pages,
-            source_path=source_path, source_snapshot_path=source_snapshot_path,
-            source_sha256=source_sha256,
-        )
+        try:
+            write_text_atomic(wiki_root / result.page.filename, result.markdown)
+            _write_page_state(
+                _page_state_path(state_root, result.page), result,
+                rewrite_version=rewrite_version, pages=pages,
+                source_path=source_path, source_snapshot_path=source_snapshot_path,
+                source_sha256=source_sha256,
+            )
+        except OSError as exc:
+            log.error(
+                "rewritten page could not be published, the wiki stays incomplete page=%s path=%s error=%s: %s",
+                result.page.filename,
+                wiki_root / result.page.filename,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
         _emit(
             on_progress, "rewrite", "page_done",
             current=completed, total=len(pages), page=result.page.title,
@@ -1851,10 +2054,40 @@ async def run_pipeline(
     """Build seed pages, then independently plan and rewrite each page."""
 
     source_path = Path(source_path).resolve()
-    source_bytes = source_path.read_bytes()
-    source_text = source_bytes.decode("utf-8")
+    try:
+        source_bytes = source_path.read_bytes()
+        source_text = source_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        log.error(
+            "source document is not valid UTF-8 document=%s path=%s bytes=%d error=%s: %s",
+            source_path.name,
+            source_path,
+            len(source_bytes),
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
+    except OSError as exc:
+        log.error(
+            "source document could not be read document=%s path=%s error=%s: %s",
+            source_path.name,
+            source_path,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
     normalized = normalize_source(source_text)
     lines = split_source_lines(normalized)
+    # The whole source is held in memory (audit 4.5); record the size up front.
+    log.info(
+        "source document loaded document=%s path=%s bytes=%d lines=%d",
+        source_path.name,
+        source_path,
+        len(source_bytes),
+        len(lines),
+    )
     config = config or WikiConfig()
     single_page_rewrite = config.skip_excel_and_small and is_small_document(source_text)
     if single_page_rewrite and not config.document_slug:
@@ -1865,6 +2098,13 @@ async def run_pipeline(
     if not (model is None and policy.offline and not config.chat_base_url):
         if model is None:
             model = policy.model_port(config)
+    if model is None:
+        log.error(
+            "no model client, every section would be published as the original source text document=%s policy_offline=%s chat_base_url=%s",
+            source_path.name,
+            policy.offline,
+            config.chat_base_url or "(unset)",
+        )
     slug = slugify(config.document_slug or source_path.stem, fallback="document").casefold()
     _emit(on_progress, "planner", "start", source_lines=len(lines))
     run_root = (
@@ -1876,11 +2116,21 @@ async def run_pipeline(
     state_root = run_root / "state"
     work_root = run_root / "work"
     wiki_root = run_root / "wiki"
-    for directory in (source_root, state_root, work_root):
-        directory.mkdir(parents=True, exist_ok=True)
-    wiki_root.mkdir(parents=True, exist_ok=True)
-    source_snapshot_path = (source_root / "original.md").resolve()
-    write_text_atomic(source_snapshot_path, source_text)
+    try:
+        for directory in (source_root, state_root, work_root):
+            directory.mkdir(parents=True, exist_ok=True)
+        wiki_root.mkdir(parents=True, exist_ok=True)
+        source_snapshot_path = (source_root / "original.md").resolve()
+        write_text_atomic(source_snapshot_path, source_text)
+    except OSError as exc:
+        log.error(
+            "run directory or source snapshot could not be written, the build stops before any page is planned run=%s error=%s: %s",
+            run_root,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
 
     source_hash = sha256_text(source_text)
     plan_path = state_root / "plan.json"
@@ -1899,6 +2149,12 @@ async def run_pipeline(
         ):
             pages = None
     if pages is None and config.require_resume:
+        log.error(
+            "resume refused: the stored seed plan is stale, corrupt or unreadable document=%s file=%s source_lines=%d",
+            source_path.name,
+            plan_path,
+            len(lines),
+        )
         raise ResumeUnavailable(f"stored seed plan for {source_path.name} could not be resumed")
     resumed_seed_plan = pages is not None
     if pages is not None:
@@ -1927,7 +2183,17 @@ async def run_pipeline(
             plan_kind = "single_page" if single_page_rewrite else "structural" if structural else "llm"
         _emit(on_progress, "seed", plan_kind, pages=len(seed_plan.pages))
         pages = _plan_pages(seed_plan)
-        _verify_ranges(pages, len(lines))
+        try:
+            _verify_ranges(pages, len(lines))
+        except PipelineError as exc:
+            log.error(
+                "seed plan does not cover the source, no page can be written document=%s stage=seed error=%s: %s",
+                source_path.name,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
 
     for page in pages:
         page.title = policy.title(page.title)
@@ -2010,24 +2276,34 @@ async def run_pipeline(
     _emit(on_progress, "seed", "done", pages=len(pages), images=len(units))
     _emit(on_progress, "planner", "done", current=len(pages), total=len(pages), pages=len(pages))
 
-    results = await _rewrite_all(
-        pages,
-        lines=lines,
-        units=units,
-        model=model,
-        config=config,
-        work_root=work_root,
-        seed_root=seed_root,
-        wiki_root=wiki_root,
-        state_root=state_root,
-        source_path=source_path,
-        source_snapshot_path=source_snapshot_path,
-        source_sha256=source_hash,
-        source_line_count=len(lines),
-        stop_check=stop_check,
-        on_progress=on_progress,
-        parents=parents,
-    )
+    try:
+        results = await _rewrite_all(
+            pages,
+            lines=lines,
+            units=units,
+            model=model,
+            config=config,
+            work_root=work_root,
+            seed_root=seed_root,
+            wiki_root=wiki_root,
+            state_root=state_root,
+            source_path=source_path,
+            source_snapshot_path=source_snapshot_path,
+            source_sha256=source_hash,
+            source_line_count=len(lines),
+            stop_check=stop_check,
+            on_progress=on_progress,
+            parents=parents,
+        )
+    except PipelineError as exc:
+        log.error(
+            "wiki rewrite stopped, the run directory keeps a partial wiki document=%s stage=rewrite error=%s: %s",
+            source_path.name,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        raise
     for item, page in zip(plan_json["pages"], pages):
         previous_title = str(item.get("title") or "")
         item["title"] = page.title
@@ -2072,6 +2348,13 @@ async def run_pipeline(
     else:
         (wiki_root / "_review.md").unlink(missing_ok=True)
 
+    if not pages:
+        log.error(
+            "wiki build is published with zero pages document=%s run=%s source_lines=%d",
+            source_path.name,
+            run_root,
+            len(lines),
+        )
     write_json_atomic(
         state_root / "run.json",
         {

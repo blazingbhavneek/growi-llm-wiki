@@ -1,9 +1,12 @@
 import importlib.util
+import logging
 from pathlib import Path
 
 from ..types import JevInputTooLong, JevResult, JevUnavailable
 from . import Prepared
 from .torch import TorchBackend, _typed, cache_prefix_ids
+
+log = logging.getLogger(__name__)
 
 
 class GGUFBackend(TorchBackend):
@@ -24,19 +27,41 @@ class GGUFBackend(TorchBackend):
             if config.model_revision: kwargs["revision"] = config.model_revision
             if folder: kwargs["local_dir"] = str(folder)
             else: kwargs["local_files_only"] = True
-            try: folder = Path(snapshot_download(**kwargs))
-            except Exception:
-                kwargs.pop("local_files_only", None)
-                folder = Path(snapshot_download(**kwargs))
+            try:
+                try: folder = Path(snapshot_download(**kwargs))
+                except Exception as exc:
+                    # A cold HF cache and an unusable one raise the same way; a cold cache is a normal miss.
+                    if kwargs.get("local_files_only"):
+                        log.debug("Jev GGUF snapshot is not in the local cache repo=%s, downloading from the hub error=%s: %s", config.gguf_model, type(exc).__name__, exc, exc_info=True)
+                    else:
+                        log.error("Jev GGUF snapshot download failed, retrying once repo=%s path=%s error=%s: %s (check network, disk space, permissions and the Hugging Face token)", config.gguf_model, folder, type(exc).__name__, exc, exc_info=True)
+                    kwargs.pop("local_files_only", None)
+                    folder = Path(snapshot_download(**kwargs))
+            except Exception as exc:
+                log.error("Jev GGUF model download failed repo=%s path=%s error=%s: %s (there is no usable GGUF snapshot, so the second attempt failed too)", config.gguf_model, folder, type(exc).__name__, exc, exc_info=True)
+                raise
         if not all((folder / name).is_file() for name in files):
+            missing = [name for name in files if not (folder / name).is_file()]
+            log.error("incomplete GGUF snapshot path=%s missing=%s repo=%s", folder, ",".join(missing), config.gguf_model)
             raise JevUnavailable(f"incomplete GGUF snapshot: {folder}")
         spec = importlib.util.spec_from_file_location("jev_style_decision_gguf", folder / files[0])
-        if spec is None or spec.loader is None: raise JevUnavailable("cannot load GGUF runtime")
-        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        if spec is None or spec.loader is None:
+            log.error("Jev GGUF runtime script cannot be loaded file=%s repo=%s", folder / files[0], config.gguf_model)
+            raise JevUnavailable("cannot load GGUF runtime")
+        try: module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        except Exception as exc:
+            log.error("Jev GGUF runtime script could not be imported file=%s repo=%s error=%s: %s (a missing llama.cpp binding is reported here, not later)", folder / files[0], config.gguf_model, type(exc).__name__, exc, exc_info=True)
+            raise
         kw = {"quant": config.gguf_quant, "many_mode": config.gguf_many_mode}
         if config.gguf_binary: kw["binary"] = config.gguf_binary
-        try: runtime = module.JevStyleDecisionGGUF(str(folder), **kw)
-        except TypeError: runtime = module.JevStyleDecisionGGUF(str(folder))
+        try:
+            try: runtime = module.JevStyleDecisionGGUF(str(folder), **kw)
+            except TypeError as exc:
+                log.error("Jev GGUF runtime constructor rejected quant, many_mode and binary, retrying without them path=%s quant=%s error=%s: %s (a runtime API change; the model may load with different defaults)", folder, config.gguf_quant, type(exc).__name__, exc, exc_info=True)
+                runtime = module.JevStyleDecisionGGUF(str(folder))
+        except Exception as exc:
+            log.error("Jev GGUF model load failed path=%s quant=%s binary=%s error=%s: %s (check the model file, the runtime binary on PATH and free memory)", folder, config.gguf_quant, config.gguf_binary, type(exc).__name__, exc, exc_info=True)
+            raise
         backend = cls(module, runtime)
         backend.stats = {"token_cache_hits": 0, "token_cache_misses": 0}
         if getattr(runtime, "renderer", None) is not None and hasattr(module, "serialize_state"):

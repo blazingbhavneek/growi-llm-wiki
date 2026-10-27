@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
 
@@ -6,6 +7,8 @@ import httpx
 
 from ..types import JevResult, JevUnavailable
 from . import Prepared
+
+log = logging.getLogger(__name__)
 
 OPTIONS = {"yes": "はい", "no": "いいえ"}
 
@@ -66,12 +69,21 @@ class Llm2JevBackend:
         for attempt in range(2):
             try: response = self._client.post(self.url, json=payload, headers=headers)
             except httpx.HTTPError as exc:
-                if not attempt: continue
+                if not attempt:
+                    log.debug("jev llm2jev request retried url=%s attempt=%d error=%s: %s", self.url, attempt + 1, type(exc).__name__, exc)
+                    continue
+                log.error("Jev llm2jev endpoint unreachable backend=llm2jev url=%s error=%s: %s", self.url, type(exc).__name__, exc, exc_info=True)
                 raise JevUnavailable(f"llm2jev request failed: {exc}") from exc
-            if response.status_code >= 500 and not attempt: continue
-            if response.is_error: raise JevUnavailable(f"llm2jev endpoint HTTP {response.status_code}")
+            if response.status_code >= 500 and not attempt:
+                log.debug("jev llm2jev server error, retrying url=%s status=%d attempt=%d", self.url, response.status_code, attempt + 1)
+                continue
+            if response.is_error:
+                log.error("Jev llm2jev endpoint returned an error status backend=llm2jev url=%s status=%d state=%s questions=%d", self.url, response.status_code, req.state_id[:12], len(batch))
+                raise JevUnavailable(f"llm2jev endpoint HTTP {response.status_code}")
             try: values = self._parse(response.json(), batch)
-            except Exception as exc: raise JevUnavailable(f"invalid llm2jev response: {exc}") from exc
+            except Exception as exc:
+                log.error("Jev llm2jev response is unusable backend=llm2jev url=%s state=%s questions=%d error=%s: %s", self.url, req.state_id[:12], len(batch), type(exc).__name__, str(exc)[:120], exc_info=True)
+                raise JevUnavailable(f"invalid llm2jev response: {exc}") from exc
             return [self._result(p, value) for p, value in zip(batch, values)]
         raise JevUnavailable("llm2jev request failed after retry")
 

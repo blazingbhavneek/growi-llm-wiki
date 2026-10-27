@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -13,6 +14,8 @@ from graph.wiki.schemas import CompiledSeedPlan
 from graph.wiki.wire import SeedRange
 
 from .tree import lead
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -87,6 +90,8 @@ async def judge_sections(
     )
     numbers = {s.number for s in slides}
     feedback = ""
+    last_error = ""
+    deck = next((slide.title or slide.first_text for slide in slides), "")
     starts: list[tuple[int, str]] = []
     for _attempt in range(max(1, attempts)):
         if stop_check and stop_check():
@@ -118,7 +123,9 @@ async def judge_sections(
         except Exception as exc:
             starts = []
             feedback = f"{type(exc).__name__}: {exc}"
+            last_error = feedback
     if not starts or starts[0][0] != min(numbers):
+        log.error("slide section planning failed; the deck is cut at the heuristic divider slides instead deck=%s slides=%d attempts=%d fallback_sections=%d last_error=%s", deck, len(slides), max(1, attempts), len(candidates), last_error or feedback)
         starts = [(n, next(s.title or s.first_text for s in slides if s.number == n)) for n in (candidates or [min(numbers)])]
         if starts[0][0] != min(numbers):
             starts.insert(0, (min(numbers), slides[0].title or slides[0].first_text or "はじめに"))
@@ -129,6 +136,7 @@ async def plan(lines: Sequence[str], *, config: Any, model: Any, on_progress=Non
     slides = split_slides(lines, delimiter=config.slide_delimiter, title=config.slide_title)
     if len(slides) < 2:
         return None
+    log.info("slide deck plan started slides=%d", len(slides))
     sections = await judge_sections(
         slides,
         model=model,
@@ -137,6 +145,7 @@ async def plan(lines: Sequence[str], *, config: Any, model: Any, on_progress=Non
         retry_temperature=config.retry_temperature,
         stop_check=stop_check,
     )
+    log.info("slide deck sections chosen slides=%d sections=%d", len(slides), len(sections))
     starts = [s.start_slide for s in sections]
     groups = []
     for index, section in enumerate(sections):

@@ -6,6 +6,7 @@ this facade is the only entry point runner code needs for publish operations.
 
 from __future__ import annotations
 
+import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,8 @@ from common.context import Context
 from common.legacy import publish
 from common.paths import DataLayout
 from common.settings import settings_for_root
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -56,7 +59,11 @@ def assemble(root: Path, documents: tuple[str, ...] = ()) -> Result:
             continue
         generated = state.parent / "wiki"
         target = layout.wiki / document
-        if not generated.is_dir() or target.exists() and any(target.glob("*.md")):
+        if target.exists() and any(target.glob("*.md")):
+            continue
+        if not generated.is_dir():
+            log.warning("document has no generated state and was not assembled document=%s generated=%s",
+                        document, generated)
             continue
         target.mkdir(parents=True, exist_ok=True)
         for page in sorted(generated.glob("*.md")):

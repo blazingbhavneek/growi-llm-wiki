@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -18,6 +19,8 @@ from graph.wiki.storage import read_json, write_json_atomic
 from .chunks import Chunk, make_chunks, normalize_name
 from .prompts import CHUNK_META_VERSION, EDGE_VERSION_LEGACY, EDGE_VERSION_NEO
 
+log = logging.getLogger(__name__)
+
 EMBED_BATCH = 64
 EMBED_MAX_CHARS = 4000
 FTS_TOKENIZER = "trigram"
@@ -30,11 +33,21 @@ class LinkerModeMismatch(RuntimeError):
 class Catalog:
     def __init__(self, path: Path, *, mode: str, meta_version: str = CHUNK_META_VERSION, edge_version: str | None = None) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path, timeout=30)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.error("catalog folder could not be created path=%s error=%s: %s (disk full, read-only, or the volume is not mounted?)",
+                      self.path.parent, type(exc).__name__, exc, exc_info=True)
+            raise
+        try:
+            self.conn = sqlite3.connect(self.path, timeout=30)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+        except Exception as exc:
+            log.error("catalog database could not be opened path=%s error=%s: %s (corrupt, locked or unreadable catalog file)",
+                      self.path, type(exc).__name__, exc, exc_info=True)
+            raise
         self._has_sqlite_vec = False
         try:
             import sqlite_vec
@@ -42,11 +55,13 @@ class Catalog:
             sqlite_vec.load(self.conn)
             self.conn.enable_load_extension(False)
             self._has_sqlite_vec = True
-        except Exception:
+        except Exception as exc:
             try:
                 self.conn.enable_load_extension(False)
             except Exception:
                 pass
+            log.error("sqlite_vec unavailable, vector search falls back to a full python scan (~50x slower) path=%s error=%s: %s",
+                      self.path, type(exc).__name__, exc, exc_info=True)
         self._schema()
         stored = self.meta("mode")
         if stored and stored != mode:
@@ -55,18 +70,25 @@ class Catalog:
         self.put_meta("mode", mode)
         self.put_meta("meta_version", meta_version)
         self.put_meta("edge_version", edge_version or (EDGE_VERSION_NEO if mode == "neo" else EDGE_VERSION_LEGACY))
-        self.conn.commit()
+        self._commit("open")
 
     @staticmethod
     def stored_mode(path: Path) -> str | None:
         """The mode an existing catalog file was built with, without opening it for writing."""
         if not Path(path).exists():
             return None
-        with sqlite3.connect(Path(path), timeout=30) as conn:
-            try:
-                row = conn.execute("SELECT value FROM meta WHERE key='mode'").fetchone()
-            except sqlite3.OperationalError:
-                return None
+        try:
+            with sqlite3.connect(Path(path), timeout=30) as conn:
+                try:
+                    row = conn.execute("SELECT value FROM meta WHERE key='mode'").fetchone()
+                except sqlite3.OperationalError as exc:
+                    log.error("catalog has no mode stored, the file is an old or broken schema path=%s error=%s: %s",
+                              path, type(exc).__name__, exc, exc_info=True)
+                    return None
+        except Exception as exc:
+            log.error("catalog database could not be read path=%s error=%s: %s (corrupt or locked catalog file)",
+                      path, type(exc).__name__, exc, exc_info=True)
+            raise
         return str(row[0]) if row else None
 
     @classmethod
@@ -117,10 +139,19 @@ class Catalog:
                 title = f"{row['page_title']} › {row['heading']}".rstrip(" ›")
                 self.conn.execute("INSERT INTO chunks_fts(chunk_id,title,heading,summary,keywords,claims,body) VALUES(?,?,?,?,?,?,?)", (row["chunk_id"], title, row["heading"], row["summary"], " ".join(json.loads(row["keywords_json"] or "[]")), " ".join(json.loads(row["claims_json"] or "[]")), str(row["body"])[:8000]))
             self.put_meta("fts_tokenizer", FTS_TOKENIZER)
-        self.conn.commit()
+        self._commit("schema")
 
     def close(self) -> None:
         self.conn.close()
+
+    def _commit(self, stage: str) -> None:
+        """Commit with the stage named: a failed commit loses the catalog change."""
+        try:
+            self.conn.commit()
+        except Exception as exc:
+            log.error("catalog commit failed stage=%s path=%s error=%s: %s (the catalog change is not saved)",
+                      stage, self.path, type(exc).__name__, exc, exc_info=True)
+            raise
 
     def meta(self, key: str) -> str | None:
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -143,6 +174,8 @@ class Catalog:
         path = Path(project.metadata) / "wiki-linker.lock"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a+") as handle:
+            # A second linker run blocks here with no output at all, so say so before waiting.
+            log.info("waiting for the linker lock path=%s", path)
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 yield self
@@ -156,6 +189,7 @@ class Catalog:
     def sync_from_planning(self, project: Any, *, skip_document: str | None = None) -> None:
         plans = sorted(Path(project.wiki).rglob("_planning/chunks.json"))
         pending_edges: list[dict[str, Any]] = []
+        documents = 0
         project_team = Path(project.root).name
         for path in plans:
             data = read_json(path, default={})
@@ -184,9 +218,14 @@ class Catalog:
             )
             links = read_json(path.parent / "links.json", default={})
             pending_edges.extend(links.get("edges", []))
+            documents += 1
+        restored = 0
         for edge in pending_edges:
-            self.insert_edge(edge, commit=False)
-        self.conn.commit()
+            restored += int(self.insert_edge(edge, commit=False))
+        self._commit("sync-edges")
+        if pending_edges and restored < len(pending_edges):
+            log.warning("stored edges could not be restored during sync restored=%d/%d (their endpoints are missing or their text changed)", restored, len(pending_edges))
+        log.info("catalog synced stage=sync documents=%d edges=%d/%d", documents, restored, len(pending_edges))
 
     def upsert_document(self, document: str, team: str, raw_rel: str, chunks: list[Chunk], page_hashes: dict[str, str] | None = None) -> None:
         page_hashes = page_hashes or {}
@@ -227,7 +266,7 @@ class Catalog:
                 self.conn.execute("INSERT INTO behaviours(chunk_id,subject_norm,action,object_norm,team) VALUES(?,?,?,?,?)", (item.chunk_id, normalize_name(behaviour.subject), behaviour.action, normalize_name(behaviour.object), item.team))
             self._fts(item)
         if commit:
-            self.conn.commit()
+            self._commit("upsert-chunks")
 
     def _fts(self, item: Chunk) -> None:
         title = f"{item.title} › {item.heading}".rstrip(" ›")
@@ -250,7 +289,7 @@ class Catalog:
         for cid in removed:
             self.conn.execute("DELETE FROM chunks WHERE chunk_id=?", (cid,))
         self.upsert_document(document, team, raw_rel, chunks, page_hashes)
-        self.conn.commit()
+        self._commit("reconcile")
         return {"unchanged": unchanged, "changed": changed, "new": added, "removed": removed, "edges_removed": edges_removed, "peers_before": peer_ids}
 
     def chunk(self, chunk_id: str) -> sqlite3.Row | None:
@@ -346,12 +385,15 @@ class Catalog:
                             self.set_vector(channel, str(row["chunk_id"]), [float(v) for v in vector])
                 for row in batch:
                     self.conn.execute("UPDATE chunks SET vectors_ready=1 WHERE chunk_id=?", (row["chunk_id"],))
-                self.conn.commit()
+                self._commit("embed-batch")
                 done += len(batch)
-            except Exception:
+            except Exception as exc:
                 # Leave this batch pending (vectors_ready=0); the next run retries it and
                 # the FTS channels still work meanwhile.
                 self.conn.rollback()
+                log.error("embedding batch failed, vectors left pending stage=embeddings team=%s batch=%d-%d done=%d of %d error=%s: %s (this repeats every run until the endpoint works)",
+                          team, offset, offset + len(batch), done, len(rows), type(exc).__name__, exc, exc_info=True)
+        log.info("embeddings done stage=embeddings team=%s chunks=%d vectors=%d", team, len(rows), done * 3)
         return done * 3
 
     def chunks_with_entity(self, entity: str, team: str, exclude_page: str = "") -> list[str]:
@@ -438,16 +480,27 @@ class Catalog:
         edge_id = self.edge_id_for(edge)
         cursor = self.conn.execute("INSERT OR IGNORE INTO edges(edge_id,chunk_a,chunk_b,label,summary,source,via_json,created_at) VALUES(?,?,?,?,?,?,?,?)", (edge_id, a, b, str(edge.get("label") or "related"), str(edge.get("summary") or ""), source, json.dumps(via, ensure_ascii=False), str(edge.get("created_at") or "")))
         if commit:
-            self.conn.commit()
+            self._commit("insert-edge")
         return cursor.rowcount > 0
 
     def restore_edges(self, links_path: Path, *, commit: bool = True) -> int:
         """Re-insert the edges recorded in one ``links.json`` whose endpoints still match."""
+        try:
+            stored = read_json(links_path, default={}).get("edges", [])
+        except Exception as exc:
+            log.error("links.json could not be read, stored edges not restored path=%s error=%s: %s", links_path, type(exc).__name__, exc, exc_info=True)
+            raise
         restored = 0
-        for edge in read_json(links_path, default={}).get("edges", []):
+        for edge in stored:
             restored += int(self.insert_edge(edge, commit=False))
         if commit:
-            self.conn.commit()
+            self._commit("restore-edges")
+        if stored and restored < len(stored):
+            message = "stored edges could not be restored, related-page links are lost path=%s restored=%d/%d (their endpoints are missing or their text changed)"
+            if restored * 2 < len(stored):
+                log.error(message, links_path, restored, len(stored))
+            else:
+                log.warning(message, links_path, restored, len(stored))
         return restored
 
     def delete_edges_for(self, chunk_ids: Iterable[str], *, commit: bool = True) -> int:
@@ -457,7 +510,7 @@ class Catalog:
         marks = ",".join("?" for _ in ids)
         cur = self.conn.execute(f"DELETE FROM edges WHERE chunk_a IN ({marks}) OR chunk_b IN ({marks})", [*ids, *ids])
         if commit:
-            self.conn.commit()
+            self._commit("delete-edges")
         return cur.rowcount
 
     def edges_for_page(self, page_rel: str) -> list[sqlite3.Row]:
@@ -485,12 +538,19 @@ class Catalog:
             edges = []
             for row in rows:
                 edges.append({"edge_id": row["edge_id"], "a": {"document": row["a_document"], "filename": row["a_filename"], "chunk_id": row["chunk_a"], "text_sha256": row["a_hash"]}, "b": {"document": row["b_document"], "filename": row["b_filename"], "chunk_id": row["chunk_b"], "text_sha256": row["b_hash"]}, "label": row["label"], "summary": row["summary"], "source": row["source"], "via": json.loads(row["via_json"] or "[]"), "created_at": row["created_at"]})
-            write_json_atomic(folder / "_planning" / "links.json", {"schema_version": 1, "mode": self.meta("mode") or "legacy", "edges": edges})
+            target = folder / "_planning" / "links.json"
+            try:
+                write_json_atomic(target, {"schema_version": 1, "mode": self.meta("mode") or "legacy", "edges": edges})
+            except Exception as exc:
+                log.error("links.json write failed stage=links document=%s path=%s edges=%d error=%s: %s (the stored edges are not saved; the next render loses them)",
+                          document, target, len(edges), type(exc).__name__, exc, exc_info=True)
+                raise
+            log.info("links written stage=links document=%s edges=%d", document, len(edges))
 
     def delete_document(self, document: str) -> set[str]:
         peers = {str(row[0]) for row in self.conn.execute("SELECT DISTINCT CASE WHEN a.document=? THEN b.document ELSE a.document END FROM edges e JOIN chunks a ON a.chunk_id=e.chunk_a JOIN chunks b ON b.chunk_id=e.chunk_b WHERE a.document=? OR b.document=?", (document, document, document))}
         self.conn.execute("DELETE FROM documents WHERE document=?", (document,))
-        self.conn.commit()
+        self._commit("delete-document")
         return peers
 
 
