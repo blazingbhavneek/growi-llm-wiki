@@ -12,6 +12,14 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
 
+class StructuredOutputError(ValueError):
+    """A structured response failed parsing; retain its raw text for repair."""
+
+    def __init__(self, error: Exception, raw_response: str) -> None:
+        super().__init__(f"{type(error).__name__}: {error}")
+        self.raw_response = raw_response
+
+
 def make_llm(model: str, base_url: str, api_key: str, temperature: float = 0.7, timeout: int = 300) -> ChatOpenAI:
     return ChatOpenAI(
         model=model,
@@ -82,6 +90,10 @@ async def structured_ainvoke(
     full reasoning capability.
     """
 
+    from graph.config import sanitize_messages
+
+    messages = sanitize_messages(list(messages))
+
     request_timeout = getattr(llm, "request_timeout", None)
     try:
         hard_timeout = float(request_timeout) if request_timeout is not None else None
@@ -118,6 +130,7 @@ async def structured_ainvoke(
             raise
         schema_json = json.dumps(schema_cls.model_json_schema(), indent=2)
         last_error: Exception = structured_error
+        last_response = ""
         # A streaming model can still return malformed JSON after the
         # structured-output call fails. Give it two bounded, concise requests;
         # do not create an unbounded retry loop.
@@ -142,9 +155,12 @@ async def structured_ainvoke(
             try:
                 raw = await invoke(call_llm, fallback_messages)
                 text = raw.content if hasattr(raw, "content") else str(raw)
+                last_response = str(text)
                 return schema_cls.model_validate(extract_json_from_text(str(text)))
             except Exception as fallback_error:
                 last_error = fallback_error
+        if last_response:
+            raise StructuredOutputError(last_error, last_response) from last_error
         raise last_error from structured_error
 
 

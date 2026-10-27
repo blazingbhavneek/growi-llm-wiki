@@ -36,7 +36,7 @@ from graph import config
 from graph.config import Settings, resolve_project_path
 from graph.workspace.parser_client import parser_skip_scope
 from graph.workspace.project import open_project
-from publisher.failure_logs import capture_failure_logs
+from publisher.failure_logs import capture_failure_logs, capture_run_logs
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 config.PROJECT_ROOT = PROJECT_ROOT
@@ -308,8 +308,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     def on_event(event: dict[str, Any]) -> None:
         progress.on_event(event)
-        if args.verbose:
-            _progress(event)
+        _progress(event)
 
     try:
         stale = pipeline.republish_if_stale(settings)
@@ -366,8 +365,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             from publisher.index import build_index
 
             try:
-                index_callback = on_event if args.verbose or progress.has_documents else None
-                index = build_index(settings, on_progress=index_callback)
+                index = build_index(settings, on_progress=on_event)
             except Exception as exc:  # a stale table of contents must not fail a sync
                 log.exception("インデックス処理に失敗")
                 index = {"done": [], "failures": [f"index: {type(exc).__name__}: {exc}"]}
@@ -418,7 +416,7 @@ def _run_fast_link(
     from publisher.queue import _candidate_settings, _finish_transaction, _transaction, recover, worker_lock
 
     project = open_project(settings)
-    callback = on_progress if on_progress is not None else (_progress if args.verbose else None)
+    callback = on_progress if on_progress is not None else _progress
     resetting = bool(getattr(args, "fast_link_reset", False))
     result: dict[str, Any] = {"done": [], "failures": []}
     accepted = False
@@ -545,8 +543,7 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
 
         def on_event(event: dict[str, Any]) -> None:
             progress.on_event(event)
-            if args.verbose:
-                _progress(event)
+            _progress(event)
 
         try:
             repair = FastRepair(
@@ -668,17 +665,12 @@ def _cmd_fast_repair(args: argparse.Namespace) -> int:
 
 def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
     """One retry owner; each operation starts from the latest accepted main."""
-    import traceback
-    import uuid
-
     from publisher import pipeline
     from publisher.ahead import LinkAhead, ParseAhead, PlannerAhead
-    from publisher.failure_logs import save_failure
     from publisher.queue import queued_jobs, recover, retry_failed, scan, status, work_once, worker_lock
     from publisher.progress import SyncProgress
 
     project = open_project(settings)
-    run_id = "sync-" + uuid.uuid4().hex
     fast_linking = policy_of(settings).name == "fast"
     parse_ahead: ParseAhead | None = None
     planner_ahead: PlannerAhead | None = None
@@ -686,9 +678,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
     combined: dict[str, Any] = {"done": [], "failures": []}
     progress = SyncProgress()
     wanted = {item.strip().lstrip("/") for item in args.items or ()}
-    logs: dict[str, list[str]] = {}
     discovery: dict[str, str] = {}
-    recorded: set[tuple[int, str, str]] = set()
     recovered: list[str] = []
     skipped_versions: dict[str, int] = {}
     blocked = False
@@ -708,8 +698,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
         ):
             parse_ahead.advance()
         progress.on_event(event)
-        if args.verbose:
-            _progress(event)
+        _progress(event)
 
     try:
         with worker_lock(project):
@@ -750,19 +739,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 )
             }
             for rel, error in discovery.items():
-                key = (1, rel, error)
-                recorded.add(key)
-                path = save_failure(
-                    settings,
-                    project,
-                    run_id,
-                    1,
-                    rel,
-                    {"stage": "scan", "error": error},
-                    error,
-                )
-                logs.setdefault(rel, []).append(path)
-                log.error("source discovery failed: %s; log=%s", rel, path)
+                log.error("source discovery failed: %s: %s", rel, error)
             # Parse, plan and build form one bounded train; every ahead worker only
             # fills a content-addressed cache (publisher/ahead.py).
             settings.cache_dir = getattr(settings, "cache_dir", "") or str((project.metadata / "cache").resolve())
@@ -781,7 +758,7 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
             attempt = 1
             while True:
                 result = work_once(settings, on_event=on_event, isolated=True,
-                                   only=args.items or None, run_id=run_id, attempt=attempt,
+                                   only=args.items or None,
                                    exclude=list(discovery), defer_linker=True)
                 if result is None:
                     if attempt == 2:
@@ -800,19 +777,15 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 skipped_versions.update({row["rel"]: row["version"] for row in result.get("job_versions", [])
                                          if row["rel"] in skipped_paths})
                 progress.add_documents(paths)
-                evidence = result.get("failure_logs", [])
-                if evidence:
-                    for rel in paths:
-                        logs.setdefault(rel, []).extend(evidence)
                 if result.get("recovery_required") or result.get("cancelled"):
                     blocked = True
                     combined["failures"].extend(result.get("failures") or ["sync cancelled; pending jobs retained"])
                     break
                 if result.get("failures"):
                     if skipped_paths and set(paths) <= skipped_paths:
-                        log.warning("ドキュメントをスキップ: %s; ログ: %s", paths, evidence)
+                        log.warning("ドキュメントをスキップ: %s", paths)
                     else:
-                        log.warning("document attempt %d failed: %s; logs=%s", attempt, paths, result.get("failure_logs", []))
+                        log.warning("document attempt %d failed: %s", attempt, paths)
                     continue
                 combined["done"].extend(result.get("done", []))
                 progress.mark_completed(paths)
@@ -859,18 +832,14 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                 combined["failures"].extend(published.get("failures", []))
             pending = [row for row in status(project) if selected(row)]
             for row in pending:
-                evidence = ", ".join(logs.get(row["rel"], []))
-                combined["failures"].append(
-                    f"{row['rel']}: {row.get('error') or 'pending dependent work'}"
-                    + (f"; logs: {evidence}" if evidence else "")
-                )
+                combined["failures"].append(f"{row['rel']}: {row.get('error') or 'pending dependent work'}")
             for rel, error in discovery.items():
-                combined["failures"].append(f"scan {rel}: {error}; logs: {', '.join(logs.get(rel, []))}")
+                combined["failures"].append(f"scan {rel}: {error}")
             if not blocked:
                 from publisher.index import build_index
 
                 try:
-                    index = build_index(settings, on_progress=on_event if args.verbose or progress.has_documents else None)
+                    index = build_index(settings, on_progress=on_event)
                     combined["done"].extend(index.get("done", []))
                     combined["failures"].extend(index.get("failures", []))
                 except Exception as exc:
@@ -878,14 +847,10 @@ def _cmd_sync_isolated(args: argparse.Namespace, settings: Settings) -> int:
                     combined["failures"].append(f"index: {type(exc).__name__}: {exc}")
         if recovered:
             print(json.dumps({"recovered_on_final_retry": recovered}, ensure_ascii=False))
-        if logs:
-            print(json.dumps({"failure_logs": logs, "run_id": run_id}, ensure_ascii=False))
         return _report(combined, settings)
     except Exception as exc:
         log.exception("シンク処理に失敗")
-        evidence = save_failure(settings, project, run_id, 1, "<shared>",
-                                {"stage": "sync", "error": traceback.format_exc()}, traceback.format_exc())
-        combined["failures"].append(f"shared sync failure: {type(exc).__name__}: {exc}; log: {evidence}")
+        combined["failures"].append(f"shared sync failure: {type(exc).__name__}: {exc}")
         return _report(combined, settings)
     finally:
         if parse_ahead is not None:
@@ -958,7 +923,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             interval=args.interval,
             growi_interval=args.growi_interval,
             force=args.force,
-            on_event=_progress if args.verbose else None,
+            on_event=_progress,
             continue_run=bool(getattr(args, "continue_run", False)),
         )
     except KeyboardInterrupt:
@@ -1007,7 +972,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
     settings = _settings(args)
     from runner.steps import convert
 
-    result = convert(settings, on_progress=_progress if args.verbose else None)
+    result = convert(settings, on_progress=_progress)
     print(json.dumps({key: value for key, value in result.items() if key != "failures"}, ensure_ascii=False))
     _report({"failures": result.get("failures") or result["failed"]}, settings)
     return 1 if result["failed"] else 0
@@ -1025,7 +990,7 @@ def cmd_build(args: argparse.Namespace) -> int:
     settings = _settings(args)
     return _report(build(
         settings, phase=phase, only=rels or None, force=args.force,
-        on_progress=_progress if args.verbose else None,
+        on_progress=_progress,
     ), settings)
 
 
@@ -1052,8 +1017,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
             if step == "done":
                 stats["indexed"] = event.get("current", 0)
         progress.on_event(event)
-        if args.verbose:
-            _progress(event)
+        _progress(event)
 
     log.info("publish project=%s allow_unlinked=True; linking skipped", settings.target_name)
     with closing(SyncProgress()) as progress:
@@ -1090,7 +1054,7 @@ def cmd_index(args: argparse.Namespace) -> int:
 
     return _report(index(
         settings, only=args.items or None, publish=not args.no_publish,
-        on_progress=_progress if args.verbose else None,
+        on_progress=_progress,
     ), settings)
 
 
@@ -1105,8 +1069,7 @@ def cmd_reset(args: argparse.Namespace) -> int:
     with closing(SyncProgress()) as progress:
         def on_event(event: dict[str, Any]) -> None:
             progress.on_event(event)
-            if args.verbose:
-                _progress(event)
+            _progress(event)
 
         result = reset_growi(settings, on_progress=on_event)
     return _report(result, settings)
@@ -1120,7 +1083,7 @@ def cmd_link(args: argparse.Namespace) -> int:
     project = open_project(settings)
     if args.link_command is None:
         from publisher.pipeline import link_raw
-        return _report(link_raw(settings, force=args.force, on_progress=_progress if args.verbose else None), settings)
+        return _report(link_raw(settings, force=args.force, on_progress=_progress), settings)
     if args.link_command == "status":
         import sqlite3
 
@@ -1142,7 +1105,7 @@ def cmd_link(args: argparse.Namespace) -> int:
         elif not project.raw_file(rel).exists():
             raise SystemExit(f"unknown document: {args.document} (wiki folder or raw rel path)")
         model, embedder = linker_cli._model_and_embedder(settings, project, Path(rel).parent.as_posix())
-        result = run_async_blocking(link_document(project, rel, model=model, embedder=embedder, settings=settings, on_progress=_progress if args.verbose else None))
+        result = run_async_blocking(link_document(project, rel, model=model, embedder=embedder, settings=settings, on_progress=_progress))
         print(json.dumps({"touched": result.touched_documents}, ensure_ascii=False))
         if result.touched_documents:
             print("更新したドキュメントをGROWIへ反映するには `python main.py publish` を実行してください", file=sys.stderr)
@@ -1275,34 +1238,43 @@ def main() -> int:
     args = build_parser().parse_args()
     from publisher.progress import JapaneseFormatter, ShortNameFormatter, TqdmStreamHandler
 
-    handler = TqdmStreamHandler(sys.stderr)
-    handler.setFormatter(ShortNameFormatter(LOG_FORMAT) if args.verbose else JapaneseFormatter())
-    logging.basicConfig(
-        level="DEBUG" if getattr(args, "verbose", False) else os.environ.get("LOG_LEVEL", "INFO"),
-        handlers=[handler],
-    )
-    # -v means "show our debug", not third-party HTTP/client chatter.
-    # Keep client warnings out of the progress display as well; real errors
-    # from these clients remain visible.
-    for noisy in (
-        "asyncio",
-        "httpx",
-        "httpx2",
-        "httpcore",
-        "h11",
-        "urllib3",
-        "openai",
-        "langchain",
-        "langchain_openai",
-        "langchain-openai",
-        "anthropic",
-    ):
-        logging.getLogger(noisy).setLevel(logging.ERROR)
-    # Daemons have no final report; do not accumulate their diagnostics forever.
-    if args.command == "watch" or (args.command == "queue" and args.queue_command == "work" and not args.once):
-        return int(args.fn(args) or 0)
-    with capture_failure_logs():
-        return int(args.fn(args) or 0)
+    settings = _settings(args)
+    with capture_run_logs(settings) as log_dir:
+        handler = TqdmStreamHandler(sys.stderr)
+        handler.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+        handler.setFormatter(ShortNameFormatter(LOG_FORMAT) if args.verbose else JapaneseFormatter())
+        debug_handler = logging.FileHandler(log_dir / "debug.log", mode="w", encoding="utf-8")
+        debug_handler.setLevel(logging.DEBUG)
+        debug_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logging.basicConfig(level=logging.DEBUG, handlers=[handler, debug_handler], force=True)
+        # -v means "show our debug", not third-party HTTP/client chatter.
+        # Keep client warnings out of the progress display as well; real errors
+        # from these clients remain visible.
+        for noisy in (
+            "asyncio",
+            "httpx",
+            "httpx2",
+            "httpcore",
+            "h11",
+            "urllib3",
+            "openai",
+            "langchain",
+            "langchain_openai",
+            "langchain-openai",
+            "anthropic",
+        ):
+            logging.getLogger(noisy).setLevel(logging.ERROR)
+        try:
+            # Daemons have no final report; do not accumulate their diagnostics forever.
+            if args.command == "watch" or (args.command == "queue" and args.queue_command == "work" and not args.once):
+                return int(args.fn(args) or 0)
+            with capture_failure_logs():
+                return int(args.fn(args) or 0)
+        finally:
+            root = logging.getLogger()
+            for configured in (handler, debug_handler):
+                root.removeHandler(configured)
+                configured.close()
 
 
 if __name__ == "__main__":

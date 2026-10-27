@@ -1183,7 +1183,6 @@ def _work_once_locked(settings: Any, *, on_event: Any = None, continue_run: bool
 
 def work_once(settings: Any, *, on_event: Any = None, continue_run: bool = False,
               isolated: bool = False, only: list[str] | None = None,
-              run_id: str = "", attempt: int = 1,
               exclude: list[str] | None = None,
               defer_linker: bool = False) -> dict[str, Any] | None:
     """Promote one candidate, then reconcile derived indexes from live state."""
@@ -1191,18 +1190,9 @@ def work_once(settings: Any, *, on_event: Any = None, continue_run: bool = False
 
     with _lock(open_project(settings)):
         if isolated:
-            from .failure_logs import AttemptLog
-
-            with AttemptLog(settings, open_project(settings), run_id, attempt) as evidence:
-                def event(row: dict[str, Any]) -> None:
-                    evidence.event(row)
-                    if on_event:
-                        on_event(row)
-                result = _work_once_locked(settings, on_event=event, continue_run=continue_run,
-                                           isolated=True, only=only, exclude=exclude,
-                                           defer_linker=defer_linker)
-                if result and result.get("failures"):
-                    result["failure_logs"] = evidence.save(result)
+            result = _work_once_locked(settings, on_event=on_event, continue_run=continue_run,
+                                       isolated=True, only=only, exclude=exclude,
+                                       defer_linker=defer_linker)
         else:
             result = _work_once_locked(
                 settings,

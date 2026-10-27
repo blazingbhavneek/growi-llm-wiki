@@ -15,6 +15,8 @@ import json
 from pathlib import Path
 from typing import Callable, Sequence
 
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from common.policy import policy_of
 
 from .config import SEED_PLAN_COMPILE_VERSION, SEED_PLAN_VERSION, WikiConfig
@@ -37,6 +39,43 @@ class SeedPlanningError(RuntimeError):
 
 
 MIN_SEED_LINES = 1
+
+
+async def _judge_compile_failure(
+    model,
+    *,
+    error: str,
+    rejected: str,
+    source_line_count: int,
+) -> str:
+    """Ask the planning judge for concrete instructions after every failed compile."""
+
+    if not callable(getattr(model, "text", None)):
+        return "Rebuild and return one complete valid JSON object that fixes the reported error."
+    excerpt = rejected[-24_000:] if rejected else "(no raw response was returned)"
+    messages = [
+        SystemMessage(content=(
+            "You are the repair judge for a seed-plan JSON compiler. Do not write the repaired "
+            "plan. Give a short, concrete checklist for the next compiler attempt. For a "
+            "mechanical JSON error, identify the broken delimiter, quote, bracket, truncation, "
+            "or schema shape from the error and rejected output, and say exactly how to fix it. "
+            "For a range-validation error, state the exact boundary changes required."
+        )),
+        HumanMessage(content=(
+            f"Source lines: 1-{source_line_count}\n"
+            f"Failure: {error}\n\n"
+            f"SeedPlan JSON schema:\n{json.dumps(SeedPlan.model_json_schema(), ensure_ascii=False)}\n\n"
+            f"Rejected output (possibly only the final 24000 characters):\n{excerpt}"
+        )),
+    ]
+    try:
+        advice = await model.text(messages, max_output_tokens=2000)
+        return str(advice).strip()[:4000]
+    except Exception as exc:  # noqa: BLE001 - preserve the original compile failure
+        return (
+            "The repair judge failed, so rebuild one complete valid JSON object from scratch and "
+            f"fix the reported error exactly. Judge error: {type(exc).__name__}: {exc}"
+        )
 
 
 def _merge_seed_ranges(pages: Sequence[SeedRange]) -> SeedRange:
@@ -154,6 +193,7 @@ def validate_seed_plan(
     block_index: BlockIndex,
     lines: Sequence[str] = (),
     page_target_lines: int = 0,
+    drop_blank_pages: bool = False,
 ) -> tuple[CompiledSeedPlan | None, str | None]:
     """Require one ordered, contiguous, non-overlapping partition of ``1..N``."""
 
@@ -268,6 +308,34 @@ def validate_seed_plan(
                     "both neighbors, then return the complete plan. "
                     "Do not split an entity or move only filler lines to satisfy the limit."
                 )
+    if lines and any(line.strip() for line in lines):
+        # An empty page has nothing to rewrite, so the writer would abort the whole document.
+        for position, page in enumerate(repaired, start=1):
+            if "".join(lines[page.source_start - 1:page.source_end]).strip():
+                continue
+            if not drop_blank_pages or len(repaired) < 2:
+                return None, (
+                    f"page #{position} ({page.title}) owns only blank lines "
+                    f"({page.source_start}-{page.source_end}); merge this whole topic with the "
+                    "semantically closer previous or next topic so every page owns readable "
+                    "text, then return the complete plan. "
+                    "Do not move only blank lines to satisfy the check."
+                )
+            # Last attempt: fold the blank page into its previous page (or the next one when
+            # it is first), which keeps the 1..N tiling, and let the recheck renumber the rest.
+            fold = position - 2 if position > 1 else 0
+            merged = _merge_seed_ranges(repaired[fold:fold + 2])
+            return validate_seed_plan(
+                SeedPlan(
+                    summary=plan.summary,
+                    pages=[*repaired[:fold], merged, *repaired[fold + 2:]],
+                ),
+                source_line_count=source_line_count,
+                block_index=block_index,
+                lines=lines,
+                page_target_lines=page_target_lines,
+                drop_blank_pages=drop_blank_pages,
+            )
     if lines and page_target_lines > 0:
         # ponytail: the planner is only asked for ~target lines; Python cuts oversize
         # pages at headings. Ask the model to title the parts if "（i/n）" reads badly.
@@ -654,6 +722,7 @@ async def _compile_seed_plan(
         )
         prompt_path = ""
         response_path = ""
+        rejected_plan = ""
         if task_root:
             prompt_file = task_root / f"attempt-{attempt:04d}-prompt.md"
             write_text_atomic(prompt_file, prompt.render())
@@ -681,6 +750,7 @@ async def _compile_seed_plan(
                 block_index=block_index,
                 lines=lines,
                 page_target_lines=config.page_target_lines,
+                drop_blank_pages=attempt >= max(1, config.map_attempts),
             )
             if error is None and checked is not None:
                 repairs = _boundary_repairs(candidate, checked)
@@ -711,8 +781,26 @@ async def _compile_seed_plan(
                 )
             else:
                 repeated_invalid = 0
+            rejected_plan = candidate_plan
         except Exception as exc:  # noqa: BLE001 - retry feedback is the recovery path
             last_error = f"{type(exc).__name__}: {exc}"[:1500]
+            rejected_plan = str(getattr(exc, "raw_response", ""))
+            if rejected_plan:
+                previous_plan = rejected_plan[-24_000:]
+                if task_root:
+                    response_file = task_root / f"attempt-{attempt:04d}-response.txt"
+                    write_text_atomic(response_file, rejected_plan)
+                    response_path = str(response_file)
+        advice = await _judge_compile_failure(
+            model,
+            error=last_error,
+            rejected=rejected_plan or previous_plan,
+            source_line_count=source_line_count,
+        )
+        if advice:
+            last_error += f"\nJudge repair instructions:\n{advice}"
+            if task_root:
+                write_text_atomic(task_root / f"attempt-{attempt:04d}-judge.md", advice + "\n")
         if task_root:
             write_text_atomic(task_root / f"attempt-{attempt:04d}-error.txt", last_error + "\n")
         if on_progress:

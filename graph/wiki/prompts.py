@@ -558,6 +558,7 @@ def incremental_page_edit_prompt(
         system=(
             "あなたは既存の日本語技術Wikiを差分更新する編集者である。"
             "指定された構造化結果だけを返す。\n"
+            "- 先頭行のWikiタイトル（# ...）は見出しレベルも文言も一字も変更しない。\n"
             "- EDITのADD、UPDATE、DELETEを一件も漏らさず厳密に反映する。\n"
             "- DELETEは、表現が言い換えられていても対応する内容を完全に削除し、別表現で復活させない。\n"
             "- UPDATEは旧内容を残さず新内容へ置き換え、ADDは適切な位置へ追加する。\n"
@@ -572,6 +573,8 @@ def incremental_page_edit_prompt(
             "このページが述べていない内容）はunchanged_edit_idsに入れ、patchを作らない。"
             "ページが述べている事実を変えるEDITをunchanged_edit_idsに入れてはならない。\n"
             "- 削除対象が見出し、表、画像の場合は対象そのものを削除する。削除対象でない構造物は保持する。\n"
+            "- 編集に不要な見出しの追加、表の分割、全角・半角の統一は行わない。\n"
+            "- 手順を編集する場合は現行原文の順序と番号をともに反映し、番号だけを欠落させない。\n"
             "- 現行原文にない事実を追加しない。\n\n"
             "JSON形式:\n" + _schema_hint(IncrementalPageEditResult)
         ),

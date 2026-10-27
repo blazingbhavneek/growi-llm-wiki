@@ -49,6 +49,8 @@ def _apply_model_patches(current: str, result: Any, expected: set[int]) -> str:
     updated = current
     for start, end, after in reversed(replacements):
         updated = updated[:start] + after + updated[end:]
+    if current.startswith("# ") and updated.split("\n", 1)[0] != current.split("\n", 1)[0]:
+        raise ValueError("keep the first-line Wiki title unchanged, including its '# ' heading level")
     return updated.rstrip() + "\n"
 def _edit_blocks(
     old_lines: list[str],

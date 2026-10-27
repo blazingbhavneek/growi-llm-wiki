@@ -131,9 +131,9 @@ class JapaneseFormatter(logging.Formatter):
         "fast repair progress callback failed: %s": "ファストリペアのプログレス更新に失敗: %s",
         "fast repair checkpoint failed for %s page %s": "ファストリペアのチェックポイント保存に失敗: %s、ページ=%s",
         "fast repair initial judge failed for page %s": "ファストリペアの初回チェックに失敗: ページ=%s",
-        "source discovery failed: %s; log=%s": "ソースのスキャンに失敗: %s、ログ=%s",
+        "source discovery failed: %s: %s": "ソースのスキャンに失敗: %s、%s",
         "first pass complete; final retry documents=%d discovery=%d": "初回パス完了。最終リトライ: ドキュメント=%d、スキャンエラー=%d",
-        "document attempt %d failed: %s; logs=%s": "ドキュメントの処理に失敗: トライ=%d、パス=%s、ログ=%s",
+        "document attempt %d failed: %s": "ドキュメントの処理に失敗: トライ=%d、パス=%s",
         "publish project=%s allow_unlinked=True; linking skipped": "パブリッシュ: プロジェクト=%s、リンク処理をスキップ",
         "publish project=%s allow_unlinked=False; pending links will be checked": "パブリッシュ: プロジェクト=%s、未処理リンクをチェック",
         "publish completed documents=%s pages=%s indexes=%s failures=%d": "パブリッシュ完了: ドキュメント=%s、ページ=%s、インデックス=%s、エラー=%d",
@@ -200,7 +200,8 @@ class TqdmStreamHandler(logging.StreamHandler):
         if tqdm is None:  # pragma: no cover - tqdm is an optional terminal aid
             super().emit(record)
             return
-        with tqdm.external_write_mode(file=self.stream):
+        progress_stream = getattr(self.stream, "terminal_stream", self.stream)
+        with tqdm.external_write_mode(file=progress_stream):
             super().emit(record)
 
 
@@ -239,7 +240,9 @@ class SyncProgress:
 
     def __init__(self, *, stream: Any = None) -> None:
         self.stream = stream or sys.stderr
-        self._tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self._progress_stream = getattr(self.stream, "terminal_stream", self.stream)
+        self._write_transcript = getattr(self.stream, "write_transcript", None)
+        self._tty = bool(getattr(self._progress_stream, "isatty", lambda: False)())
         self._bars_enabled = tqdm is not None and self._tty
         self._documents: set[str] = set()
         self._completed: set[str] = set()
@@ -256,7 +259,7 @@ class SyncProgress:
                 leave=True,
                 dynamic_ncols=True,
                 disable=not self._bars_enabled,
-                file=self.stream,
+                file=self._progress_stream,
             )
 
     def add_documents(self, paths: Iterable[Any]) -> None:
@@ -322,9 +325,11 @@ class SyncProgress:
 
     def _write(self, message: str) -> None:
         if tqdm is not None:
-            tqdm.write(message, file=self.stream)
+            tqdm.write(message, file=self._progress_stream)
         else:
-            print(message, file=self.stream, flush=True)
+            print(message, file=self._progress_stream, flush=True)
+        if callable(self._write_transcript):
+            self._write_transcript(message + "\n")
 
     def _close_visible(self) -> None:
         if self._stage_bar is not None:
@@ -344,6 +349,10 @@ class SyncProgress:
             self._phases[key] = phase
         if phase.started is None:
             phase.started = time.monotonic()
+            if callable(self._write_transcript):
+                self._write_transcript(
+                    f"[{key[0].replace('<batch>', '<バッチ>')}] {phase.label}: 開始\n"
+                )
         if total is not None and total > 0:
             phase.total = total
         if self._active_key != key:
@@ -358,7 +367,7 @@ class SyncProgress:
                     leave=False,
                     dynamic_ncols=True,
                     disable=not self._bars_enabled,
-                    file=self.stream,
+                    file=self._progress_stream,
                 )
         elif self._stage_bar is not None and phase.total != self._stage_bar.total:
             self._stage_bar.total = phase.total
@@ -397,9 +406,8 @@ class SyncProgress:
         if self._active_key == key:
             self._update_bar(phase, step=status)
             self._close_visible()
-        label = {"failed": "エラー", "review": "レビュー", "pending": "保留", "cancelled": "キャンセル"}.get(status, status)
-        suffix = "" if status == "done" else f" ({label})"
-        self._write(f"[{key[0].replace('<batch>', '<バッチ>')}] {phase.label}: {elapsed:.1f}秒{suffix}")
+        label = {"done": "完了", "failed": "エラー", "review": "レビュー", "pending": "保留", "cancelled": "キャンセル"}.get(status, status)
+        self._write(f"[{key[0].replace('<batch>', '<バッチ>')}] {phase.label}: {elapsed:.1f}秒 ({label})")
 
     def on_event(self, event: dict[str, Any]) -> None:
         event = dict(event)

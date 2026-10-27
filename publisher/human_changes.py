@@ -243,13 +243,18 @@ _MERGE = (
     "- Only what differs between OLD and HUMAN is the human's change. Text that is the same in OLD and HUMAN"
     " is old source text: NEW's version of it wins, with no note.\n"
     f"- If the human changed a fact and NEW changed the same fact differently, keep the human's version and"
-    f" add NEW's value as `（{NOTE}: …）` (always exactly this text) on its own line after it.\n"
+    f" add NEW's value as `（{NOTE}: …）` on its own line after it, outside tables.\n"
+    " The parentheses form must be single-line with a meaningful source value, never empty or markup such as '---'."
+    f" For longer passages use `> **{NOTE}:**` followed by lines each prefixed with `> `.\n"
     "- If the human's changed text and NEW differ only in wording or formatting, keep the human's form and"
     " add no note.\n"
-    f"- If HUMAN already has a `（{NOTE}: …）` note for the same fact, replace it; never add a second.\n"
-    "- Text the human added goes into NEW where it belongs. Only if NEW no longer contains the text the"
-    " human modified, put the human's changed lines (not the unchanged ones) in appendix and leave the page"
-    " text alone.\n"
+    f"- If HUMAN already has a {NOTE} note for the same fact (either form), replace it; never add a second.\n"
+    "- Text the human added goes into NEW where it belongs. If the source deleted a block containing human-added"
+    " or modified text, put only the human's changed lines in appendix; do not restore the block or add a note"
+    " for its deletion. A separator or footer remaining in NEW does not mean the block survived; reworded or"
+    " moved content does.\n"
+    "- Keep human deletions deleted; NEW's differing version belongs only in a source-update note. If both"
+    " sides deleted the content, leave it absent with no note or appendix entry.\n"
     "- GUIDANCE says how the human wants this page to look; follow it.\n"
     "- FAILURE, when present, says why your previous answer was rejected; fix it." + _DATA
 )
@@ -257,8 +262,13 @@ _VERIFY = (
     "Check a merge. OLD -> HUMAN is a human edit, NEW is the source's version of the same passage,"
     " RESULT (plus APPENDIX) is the merge. Return {\"human_kept\": bool, \"source_kept\": bool}."
     " human_kept: every piece of information the human added or changed is in RESULT or APPENDIX."
-    f" source_kept: every fact in NEW is in RESULT, as text or inside a `（{NOTE}: …）` note, and a fact the"
+    " Return human_kept=false if a human deletion was restored outside a source-update note, or if the source"
+    " deleted a block containing human-added/modified text and those changed lines are not in APPENDIX."
+    " A remaining separator/footer does not count as the block surviving; reworded or moved content does."
+    f" source_kept: every fact in NEW is in RESULT, as text or inside a {NOTE} note (parentheses or blockquote), and a fact the"
     " human did not change (the same in OLD and HUMAN) appears with NEW's value as text, not only in a note."
+    " Return source_kept=false for notes with empty/markup-only payloads (such as '---'), multiline parentheses"
+    f" notes, or notes inside tables. Long notes must use `> **{NOTE}:**` and `> `-prefixed lines."
     " Be strict." + _DATA
 )
 

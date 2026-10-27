@@ -106,6 +106,18 @@ class JevEngine:
     def _prepare(self, req):
         if self._closed:
             raise JevUnavailable("engine is closed")
+        from graph.config import sanitize_model_input, sanitize_text
+
+        req = JevRequest(
+            sanitize_model_input(req.state),
+            JevQuestion(
+                sanitize_text(req.question.text),
+                req.question.kind,
+                sanitize_model_input(req.question.options),
+                req.question.key,
+            ),
+            req.state_id,
+        )
         if not req.state_id:
             raw = req.state if isinstance(req.state, str) else json.dumps(req.state, ensure_ascii=False, sort_keys=True)
             req = JevRequest(req.state, req.question, hashlib.sha256(raw.encode()).hexdigest())

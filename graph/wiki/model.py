@@ -105,6 +105,8 @@ class ChatModelPort:
         """One bounded plain-text completion; the caller validates the content."""
 
         async def call() -> str:
+            from graph.config import sanitize_messages
+
             kwargs: dict[str, Any] = {}
             # Standard calls intentionally leave max_tokens unset; fast writer
             # opts in through _enforce_max_output_tokens.
@@ -116,7 +118,8 @@ class ChatModelPort:
             }
             llm = self.llm.bind(**kwargs)
             reply = await asyncio.wait_for(
-                llm.ainvoke(list(messages)), timeout=self.config.request_timeout
+                llm.ainvoke(sanitize_messages(list(messages))),
+                timeout=self.config.request_timeout,
             )
             content = getattr(reply, "content", reply)
             if isinstance(content, list):

@@ -1000,6 +1000,9 @@ async def structured_ainvoke(
     *,
     temperature: float | None = None,
 ) -> BaseModel:
+    from graph.config import sanitize_messages
+
+    messages = sanitize_messages(list(messages))
     # New wiki model ports provide the same structured seam while also
     # serializing fast writer calls on a shared GPU. Keep raw ChatOpenAI
     # support below for older callers.

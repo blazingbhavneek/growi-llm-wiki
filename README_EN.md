@@ -433,6 +433,6 @@ Set them in the root `.env`. The top block of `.env` holds the settings you chan
 - `<data_root>/<name>/raw/`: converted text
 - `<data_root>/<name>/wiki/`: generated pages
 - `<data_root>/<name>/metadata/`: publish state, watch queue
-- `logs/<name>_failed_docs.log`: record of failed documents (tokens and URLs redacted)
+- `logs/<name>/`: per-run `live.log` / `debug.log` output and the token/URL-redacted `failed_docs.md` summary
 
 Deleting `<data_root>/<name>/` removes the local publish state while the GROWI pages stay (use `reset` to delete them). Logs and generated content contain internal documents; set access rights and retention to match your operational policy.

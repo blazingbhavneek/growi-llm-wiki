@@ -371,6 +371,8 @@ def _clean_existing(project: Any) -> tuple[dict[str, str], list[str]]:
 
 
 def _inventory(project: Any, cleaned: dict[str, str]) -> list[Page]:
+    from graph.config import sanitize_text
+
     pages: list[Page] = []
     wiki = Path(project.wiki)
     for originals in sorted(wiki.rglob("_planning/pages")):
@@ -383,7 +385,18 @@ def _inventory(project: Any, cleaned: dict[str, str]) -> list[Page]:
                 continue
             rel = live.relative_to(wiki).as_posix()
             text = cleaned.get(rel, live.read_text(encoding="utf-8"))
-            pages.append(Page(rel, document, folder, _title(text, live.stem), live, text, _segments(text)))
+            prompt_text = sanitize_text(text)
+            pages.append(
+                Page(
+                    rel,
+                    document,
+                    folder,
+                    _title(prompt_text, live.stem),
+                    live,
+                    text,
+                    _segments(prompt_text),
+                )
+            )
     return pages
 
 
@@ -474,8 +487,11 @@ async def _extract(
     on_progress: Any = None,
     refresh_documents: set[str] | None = None,
 ) -> Extraction:
+    from graph.wiki.model import writer_model
+
     jobs: list[tuple[Page, list[Segment], str, Path]] = []
     facts_by_job: dict[str, FastPageFacts] = {}
+    extractor = writer_model(model)
     for page in pages:
         for group in _groups(page):
             identity = VERSION + "\0" + page.document + "\0" + "\0".join(
@@ -512,7 +528,7 @@ async def _extract(
             )
             try:
                 async with semaphore:
-                    raw = await model.text(
+                    raw = await extractor.text(
                         messages,
                         max_output_tokens=8000,
                         temperature=0.5,
@@ -1033,12 +1049,13 @@ async def _link_async(
         if completed != manifest.get("documents", {}):
             write_json_atomic(_manifest_path(output_project or project), {**manifest, "documents": completed})
         return {"done": [{"status": "up-to-date"}], "failures": [], "linked_documents": sorted(scope)}
-    refresh = pending if not continue_run else set()
+    # Cache keys include the passage text, so normal runs only analyse changed inputs.
+    # Explicit --force still refreshes extraction, roles, and link decisions.
     _checkpoint(project, "extracting", continued=resumed, pages=len(pages),
                 failures=[],
                 documents={doc: {"base_sha256": fingerprints[doc], "status": "pending"} for doc in pending})
     extraction = await _extract(project, pages, model, settings, force=force,
-                                refresh_documents=refresh, on_progress=on_progress)
+                                on_progress=on_progress)
     skipped_extractions = len(extraction.failures)
     if extraction.failures:
         _checkpoint(project, "failed", failures=extraction.failures)
@@ -1051,7 +1068,6 @@ async def _link_async(
         project, engine, extraction.entities,
         float(getattr(settings, "wiki_linker_role_threshold", 0.5)),
         force=force, on_progress=on_progress,
-        refresh_documents=refresh,
     )
     if role_failures:
         failures = [f"ファストリンク: エンティティのチェックに失敗（{role_failures}件）"]
@@ -1063,7 +1079,7 @@ async def _link_async(
     plans, judge_failures, judge_calls = await _judge_candidates(
         project, engine, candidates,
         float(getattr(settings, "wiki_linker_verify_threshold", 0.7)),
-        force=force or not continue_run, on_progress=on_progress,
+        force=force, on_progress=on_progress,
     )
     if judge_failures:
         failures = [f"ファストリンク: リンク候補のチェックに失敗（{judge_failures}件）"]
@@ -1125,7 +1141,7 @@ def link_project(
                          for doc in documents):
         return {"done": [{"status": "up-to-date"}], "failures": [], "linked_documents": sorted(documents)}
     config = wiki_config(settings, run_dir=_root(project) / "work").model_copy(
-        update={"text_thinking": True, "temperature": 0.5},
+        update={"text_thinking": False, "temperature": 0.5},
     )
     model = policy_of(config).model_port(config)
     try:

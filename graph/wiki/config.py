@@ -11,7 +11,7 @@ from graph.config import app_concurrency
 PROMPT_VERSION = "wiki-overlap-plan-ja-6"
 SEED_PLAN_VERSION = "wiki-seed-plan-ja-11"
 SEED_PLAN_COMPILE_VERSION = "wiki-seed-compile-ja-12"
-REWRITE_PROMPT_VERSION = "wiki-sections-ja-5"
+REWRITE_PROMPT_VERSION = "wiki-sections-ja-6"
 
 class WikiConfig(BaseModel):
     # Policy name (common/policy.py); its hooks key caches apart, so an existing

@@ -1672,15 +1672,31 @@ _IMAGE_KEYS = {
     "b64_json",
 }
 
+_INLINE_IMAGE_DATA_RE = re.compile(
+    r"data:(?:image/[a-z0-9.+-]+|application/octet-stream);base64,"
+    r"[a-z0-9+/]+={0,2}",
+    re.IGNORECASE,
+)
+_LONG_BASE64_RE = re.compile(
+    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{200,}={0,2}(?![A-Za-z0-9+/=])"
+)
+
 
 def sanitize_text(value: str) -> str:
     """Apply shared image/base64 stripping before text reaches an LLM."""
-    return strip_image_media(value)
+    sanitized = strip_image_media(value)
+    sanitized = _INLINE_IMAGE_DATA_RE.sub("[image omitted]", sanitized)
+    return _LONG_BASE64_RE.sub("[base64 omitted]", sanitized)
 
 
 def sanitize_messages(messages: list[Any]) -> list[Any]:
     """Sanitize LangChain/OpenAI-style messages before model calls."""
     return [_sanitize_message(message) for message in messages]
+
+
+def sanitize_model_input(value: Any) -> Any:
+    """Sanitize arbitrary nested input before it reaches a model backend."""
+    return _sanitize_content(value)
 
 
 def sanitize_tool_output(text: Any) -> str:
@@ -1747,22 +1763,23 @@ def _sanitize_content(content: Any) -> Any:
 
 def _sanitize_message(message: Any) -> Any:
     if isinstance(message, dict):
-        entry = dict(message)
-        if "content" in entry:
-            entry["content"] = _sanitize_content(entry.get("content"))
-        return entry
+        return _sanitize_content(message)
 
     content = getattr(message, "content", None)
     if content is None:
         return message
 
-    sanitized_content = _sanitize_content(content)
+    updates = {"content": _sanitize_content(content)}
+    additional_kwargs = getattr(message, "additional_kwargs", None)
+    if isinstance(additional_kwargs, dict):
+        updates["additional_kwargs"] = _sanitize_content(additional_kwargs)
     if hasattr(message, "model_copy"):
-        return message.model_copy(update={"content": sanitized_content})
+        return message.model_copy(update=updates)
 
     try:
         cloned = copy.copy(message)
-        cloned.content = sanitized_content
+        for key, value in updates.items():
+            setattr(cloned, key, value)
         return cloned
     except Exception:
         return message
